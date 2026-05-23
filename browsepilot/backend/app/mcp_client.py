@@ -75,20 +75,6 @@ class MCPClient:
         data = result.data if isinstance(result.data, dict) else {}
         return {"status": "success", **data}
 
-    async def get_tools_schema(self) -> list[dict]:
-        """Return tools in OpenAI function-calling format."""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t["name"],
-                    "description": t["description"],
-                    "parameters": t["parameters"] if t["parameters"] else {"type": "object", "properties": {}},
-                },
-            }
-            for t in self._tools
-        ]
-
     async def close(self) -> None:
         if self._client:
             await self._client.__aexit__(None, None, None)

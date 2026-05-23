@@ -406,10 +406,9 @@ async def plan_node(state: AgentState, mcp_client) -> dict:
     logger.info("[plan_node] Generating plan for task: {}", state["task"][:80])
     llm = get_llm()
 
-    tools_schema = await mcp_client.get_tools_schema()
     tools_desc = "\n".join(
-        f"- {t['function']['name']}: {t['function']['description']}"
-        for t in tools_schema
+        f"- {t['name']}: {t.get('description', '')}"
+        for t in mcp_client.tools
     )
 
     current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -645,8 +644,7 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
 
     if not classified_tool:
         # Path C: full LLM tool selection with bind_tools() for native function calling
-        tools_for_bind = await mcp_client.get_tools_schema()
-        llm_with_tools = llm.bind_tools(tools_for_bind)
+        llm_with_tools = llm.bind_tools(tools)
 
         try:
             response = await llm_with_tools.ainvoke([
@@ -1088,10 +1086,9 @@ async def replan_node(state: AgentState, mcp_client) -> dict:
     logger.info("[replan_node] Regenerating plan...")
     llm = get_llm()
 
-    tools_schema = await mcp_client.get_tools_schema()
     tools_desc = "\n".join(
-        f"- {t['function']['name']}: {t['function']['description']}"
-        for t in tools_schema
+        f"- {t['name']}: {t.get('description', '')}"
+        for t in mcp_client.tools
     )
 
     # Build context (with or without vision)

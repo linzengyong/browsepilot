@@ -12,14 +12,11 @@ from backend.app.agent.nodes import (
     classify_node, pre_observe_node,
 )
 from backend.app.mcp_client import MCPClient
-from backend.app.agent.tools import build_tools_from_mcp
 
 
 def build_graph(mcp_client: MCPClient, lazy_mcp: bool = False):
     """Build and compile the BrowsePilot agent StateGraph."""
     workflow = StateGraph(AgentState)
-
-    tools_holder = {"tools": None}
 
     async def classify(state: AgentState) -> dict:
         return await classify_node(state)
@@ -35,9 +32,7 @@ def build_graph(mcp_client: MCPClient, lazy_mcp: bool = False):
         return await plan_node(state, mcp_client)
 
     async def execute(state: AgentState) -> dict:
-        if tools_holder["tools"] is None:
-            tools_holder["tools"] = await build_tools_from_mcp(mcp_client)
-        return await execute_node(state, mcp_client, tools_holder["tools"])
+        return await execute_node(state, mcp_client, mcp_client.tools)
 
     async def reflect(state: AgentState) -> dict:
         return await reflect_node(state)
