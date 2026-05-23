@@ -42,4 +42,8 @@ pool = bp_module.pool = BrowserPool(
 )
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=os.getenv("MCP_SERVER_HOST", "127.0.0.1"),
+        port=int(os.getenv("MCP_SERVER_PORT", "8090")),
+    )

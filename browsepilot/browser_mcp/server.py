@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 _env_path = Path(__file__).resolve().parent.parent / ".env"
 load_dotenv(_env_path)
@@ -24,8 +24,5 @@ async def browser_lifespan(server):
 
 mcp = FastMCP(
     "browser-mcp",
-    json_response=True,
     lifespan=browser_lifespan,
-    host=os.getenv("MCP_SERVER_HOST", "127.0.0.1"),
-    port=int(os.getenv("MCP_SERVER_PORT", "8090")),
 )

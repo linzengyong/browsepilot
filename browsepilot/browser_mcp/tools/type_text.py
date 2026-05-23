@@ -1,6 +1,6 @@
 """Type text tool — type into an input element."""
 
-from mcp.server.fastmcp import Context
+from fastmcp.server.context import Context
 from browser_mcp.server import mcp
 
 

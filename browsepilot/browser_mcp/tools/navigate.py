@@ -2,7 +2,7 @@
 
 import asyncio
 
-from mcp.server.fastmcp import Context
+from fastmcp.server.context import Context
 from browser_mcp.server import mcp
 from browser_mcp.tools import validate_url
 
