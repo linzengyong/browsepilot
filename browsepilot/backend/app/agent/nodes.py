@@ -332,15 +332,16 @@ async def pre_observe_node(state: AgentState, mcp_client) -> dict:
     page_structure = {}
     page_screenshot = ""
 
+    pre_meta = {"session_id": state.get("session_id", ""), "step_index": -1}
     try:
-        nav_result = await mcp_client.call_tool("navigate", {"url": url})
+        nav_result = await mcp_client.call_tool("navigate", {"url": url}, meta=pre_meta)
         if isinstance(nav_result, dict) and nav_result.get("status") == "error":
             logger.warning("[pre_observe] Navigate failed: {}", nav_result.get("error", ""))
     except Exception as e:
         logger.warning("[pre_observe] Navigate exception: {}", e)
 
     try:
-        struct_result = await mcp_client.call_tool("get_page_structure", {})
+        struct_result = await mcp_client.call_tool("get_page_structure", {}, meta=pre_meta)
         if isinstance(struct_result, dict):
             page_structure = struct_result
             s = struct_result.get("structure", struct_result)
@@ -377,7 +378,7 @@ async def pre_observe_node(state: AgentState, mcp_client) -> dict:
 
     if settings.llm_vision_enabled:
         try:
-            img_result = await mcp_client.call_tool("screenshot", {})
+            img_result = await mcp_client.call_tool("screenshot", {}, meta=pre_meta)
             if isinstance(img_result, dict) and img_result.get("screenshot_base64"):
                 page_screenshot = img_result["screenshot_base64"]
                 logger.info("[pre_observe] Screenshot captured ({} chars)", len(page_screenshot))
