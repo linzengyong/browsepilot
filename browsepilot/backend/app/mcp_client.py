@@ -1,98 +1,60 @@
-"""MCP client — connects to browser-mcp and discovers tools using transport abstraction."""
+"""MCP client — thin wrapper around fastmcp.Client for agent use.
 
-import asyncio
-import json
+Note: This wrapper explicitly calls __aenter__/__aexit__ (the protocol methods
+underlying `async with Client(...) as c:`) rather than using the context manager
+syntax. This is intentional — the agent code uses connect()/close() lifecycle
+methods, and fastmcp.Client supports direct __aenter__/__aexit__ calls in v3.3.1.
+"""
+
 from typing import Any
-
 from loguru import logger
-from mcp import ClientSession
-
-from backend.app.mcp_transport import create_transport
+from fastmcp import Client
 
 
 class MCPClient:
+    """Thin wrapper around fastmcp.Client for agent compatibility."""
+
     def __init__(self, server_config: dict | None = None):
         self.server_config = server_config or {
             "type": "streamable-http",
             "url": "http://localhost:8090/mcp",
         }
-        self._transport = None
-        self._session: ClientSession | None = None
+        self._client: Client | None = None
         self._tools: list[dict] = []
 
     @property
     def is_connected(self) -> bool:
-        return self._session is not None
+        return self._client is not None
 
-    async def connect(self, max_retries: int = 3) -> list[dict]:
-        """Connect to MCP server via transport abstraction and discover available tools."""
-        last_error = None
-        for attempt in range(max_retries):
-            # Create fresh transport per attempt to avoid anyio cancel scope conflicts
-            transport = create_transport(self.server_config)
-            try:
-                logger.info(
-                    "Connecting to MCP server via {} transport (attempt {}/{})",
-                    self.server_config.get("type", "unknown"),
-                    attempt + 1,
-                    max_retries,
-                )
-                read, write = await transport.connect()
-                try:
-                    self._session = ClientSession(read, write)
-                    await self._session.__aenter__()
-                    await self._session.initialize()
-                    tools_result = await self._session.list_tools()
-                    self._tools = [
-                        {
-                            "name": t.name,
-                            "description": t.description or "",
-                            "parameters": t.inputSchema if hasattr(t, "inputSchema") else {},
-                        }
-                        for t in tools_result.tools
-                    ]
-                except Exception:
-                    await transport.close()
-                    self._session = None
-                    raise
-                self._transport = transport
-                logger.info("Discovered {} tools: {}", len(self._tools), [t["name"] for t in self._tools])
-                return self._tools
-            except Exception as e:
-                last_error = e
-                if attempt < max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.warning(
-                        "MCP connection attempt {} failed, retrying in {}s: {}",
-                        attempt + 1,
-                        wait,
-                        e,
-                    )
-                    await asyncio.sleep(wait)
-        raise RuntimeError(f"MCP connection failed after {max_retries} attempts: {last_error}")
+    @property
+    def tools(self) -> list[dict]:
+        return self._tools
+
+    async def connect(self) -> list[dict]:
+        """Connect to MCP server via fastmcp.Client."""
+        url = self.server_config.get("url", "http://localhost:8090/mcp")
+        logger.info("Connecting to MCP server at {}", url)
+        self._client = Client(url)
+        await self._client.__aenter__()
+        self._tools = await self._client.list_tools()
+        self._tools = [
+            {"name": t.name, "description": t.description or "", "parameters": getattr(t, "inputSchema", {})}
+            for t in self._tools
+        ]
+        logger.info("Discovered {} tools: {}", len(self._tools), [t["name"] for t in self._tools])
+        return self._tools
 
     async def call_tool(self, tool_name: str, arguments: dict, timeout: float = 30.0) -> dict:
-        """Call a tool on the MCP server and return parsed result."""
-        if not self._session:
+        """Call a tool and return structured result."""
+        if not self._client:
             raise RuntimeError("MCP client not connected")
-        try:
-            result = await asyncio.wait_for(
-                self._session.call_tool(tool_name, arguments),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.warning("Tool call '{}' timed out after {}s", tool_name, timeout)
-            return {"status": "error", "error": "timeout", "message": f"Tool '{tool_name}' timed out"}
-        if hasattr(result, "content") and result.content:
-            text = result.content[0].text if hasattr(result.content[0], "text") else str(result.content[0])
-            try:
-                return json.loads(text)
-            except json.JSONDecodeError:
-                return {"status": "success", "result": text}
-        return {"status": "success", "result": str(result)}
+        result = await self._client.call_tool(tool_name, arguments, timeout=timeout, raise_on_error=False)
+        if result.is_error:
+            return {"status": "error", "error_type": "tool_error", "message": str(result.content), **result.data}
+        return {"status": "success", **result.data} if isinstance(result.data, dict) else {"status": "success", "result": result.data}
 
     async def get_tools_schema(self) -> list[dict]:
-        """Return tools in OpenAI function-calling format for LangChain."""
+        """Return tools in OpenAI function-calling format."""
         return [
             {
                 "type": "function",
@@ -105,16 +67,8 @@ class MCPClient:
             for t in self._tools
         ]
 
-    @property
-    def tools(self) -> list[dict]:
-        """Return raw tool metadata list."""
-        return self._tools
-
     async def close(self) -> None:
-        """Cleanly disconnect from MCP server."""
-        if self._session:
-            await self._session.__aexit__(None, None, None)
-            self._session = None
-        if self._transport:
-            await self._transport.close()
+        if self._client:
+            await self._client.__aexit__(None, None, None)
+            self._client = None
         logger.info("MCP client disconnected")
