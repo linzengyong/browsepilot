@@ -4,7 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import ToolError
+from browser_mcp.tools import ToolError, _save_screenshot
 
 
 @mcp.tool()
@@ -87,11 +87,11 @@ async def get_page_structure(ctx: Context) -> dict:
             }
         """), timeout=15.0)
 
-        # Build element map with labels
+        # Single-pass build: elements dict + element_map, with shared dedup logic
         elements: dict[str, dict] = {}
         name_counter: dict[str, int] = {}
 
-        def add_element(tag_type: str, item: dict) -> None:
+        def _register(tag_type: str, item: dict) -> str:
             base_name = item.get("semantic", tag_type) or tag_type
             if not base_name:
                 base_name = tag_type
@@ -107,42 +107,17 @@ async def get_page_structure(ctx: Context) -> dict:
                 "placeholder": item.get("placeholder", ""),
                 "text": item.get("text", ""),
             }
+            return label
 
-        for inp in structure.get("inputs", []):
-            add_element("input", inp)
-        for btn in structure.get("buttons", []):
-            add_element("btn", btn)
-        for link in structure.get("links", []):
-            add_element("link", link)
-
-        # Update session element map (label -> selector) — not returned to LLM
         element_map.clear()
         for inp in structure.get("inputs", []):
-            base = inp.get("semantic", "input")
-            label = f"[input:{base}]"
-            if label in element_map:
-                cnt = 1
-                while f"[input:{base}_{cnt}]" in element_map:
-                    cnt += 1
-                label = f"[input:{base}_{cnt}]"
+            label = _register("input", inp)
             element_map[label] = inp["selector"]
         for btn in structure.get("buttons", []):
-            base = btn.get("semantic", "btn")
-            label = f"[btn:{base}]"
-            if label in element_map:
-                cnt = 1
-                while f"[btn:{base}_{cnt}]" in element_map:
-                    cnt += 1
-                label = f"[btn:{base}_{cnt}]"
+            label = _register("btn", btn)
             element_map[label] = btn["selector"]
         for link in structure.get("links", []):
-            base = link.get("semantic", "link")
-            label = f"[link:{base}]"
-            if label in element_map:
-                cnt = 1
-                while f"[link:{base}_{cnt}]" in element_map:
-                    cnt += 1
-                label = f"[link:{base}_{cnt}]"
+            label = _register("link", link)
             element_map[label] = link["selector"]
 
         total = len(elements)
@@ -151,7 +126,6 @@ async def get_page_structure(ctx: Context) -> dict:
         link_count = sum(1 for k in elements if k.startswith("[link:"))
 
         screenshot = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
-        from browser_mcp.tools import _save_screenshot
         path = _save_screenshot(screenshot)
 
         return {

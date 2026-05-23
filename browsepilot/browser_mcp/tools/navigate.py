@@ -19,10 +19,9 @@ async def navigate(url: str, ctx: Context) -> dict:
         await asyncio.wait_for(page.goto(url, wait_until="domcontentloaded"), timeout=15)
         title = await page.title()
 
-        # Extract visible text preview
+        # Extract visible text preview (browser-side truncation to avoid full DOM serialization)
         try:
-            visible_text = await page.inner_text("body")
-            visible_text_preview = visible_text[:200] if visible_text else ""
+            visible_text_preview = await page.evaluate("document.body.innerText.slice(0, 200)") or ""
         except Exception:
             visible_text_preview = ""
 

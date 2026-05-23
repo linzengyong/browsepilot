@@ -1084,17 +1084,10 @@ async def replan_node(state: AgentState, mcp_client) -> dict:
 
     replan_prompt = REPLAN_PROMPT.format(tools_desc=tools_desc)
 
-    # Build messages — HumanMessage accepts both string and list content
-    if isinstance(context_content, list):
-        messages = [
-            SystemMessage(content=replan_prompt),
-            HumanMessage(content=context_content),
-        ]
-    else:
-        messages = [
-            SystemMessage(content=replan_prompt),
-            HumanMessage(content=context_content),
-        ]
+    messages = [
+        SystemMessage(content=replan_prompt),
+        HumanMessage(content=context_content),
+    ]
 
     new_plan, usage = await parse_llm_json(
         llm=llm,
