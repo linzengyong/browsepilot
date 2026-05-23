@@ -19,7 +19,7 @@ async def get_content(ctx: Context, format: str = "text", max_chars: int = 10000
             content = await asyncio.wait_for(page.inner_text("body"), timeout=15.0)
         screenshot = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
         session_id, step_index = _get_screenshot_meta(ctx)
-        return {"status": "success", "content": content[:max_chars], "screenshot_path": _save_screenshot(screenshot, session_id=session_id, step_index=step_index)}
+        return {"status": "success", "content": content[:max_chars], "screenshot_path": await _save_screenshot(screenshot, session_id=session_id, step_index=step_index)}
     except asyncio.TimeoutError:
         raise ToolError("timeout", "get_content timed out")
     except Exception as e:

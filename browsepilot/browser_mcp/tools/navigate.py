@@ -41,7 +41,7 @@ async def navigate(url: str, ctx: Context) -> dict:
         session_id, step_index = _get_screenshot_meta(ctx)
         return {
             "status": "success",
-            "screenshot_path": _save_screenshot(screenshot, session_id=session_id, step_index=step_index),
+            "screenshot_path": await _save_screenshot(screenshot, session_id=session_id, step_index=step_index),
             "title": title,
             "visible_text_preview": visible_text_preview,
             "detected_issues": detected_issues,

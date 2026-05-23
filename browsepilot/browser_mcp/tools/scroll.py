@@ -17,7 +17,7 @@ async def scroll(ctx: Context, direction: str = "down", amount: int = 500) -> di
         await asyncio.wait_for(page.evaluate(f"window.scrollBy(0, {pixels})"), timeout=15.0)
         screenshot_data = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
         session_id, step_index = _get_screenshot_meta(ctx)
-        return {"status": "success", "screenshot_path": _save_screenshot(screenshot_data, session_id=session_id, step_index=step_index)}
+        return {"status": "success", "screenshot_path": await _save_screenshot(screenshot_data, session_id=session_id, step_index=step_index)}
     except asyncio.TimeoutError:
         raise ToolError("timeout", "scroll timed out")
     except Exception as e:

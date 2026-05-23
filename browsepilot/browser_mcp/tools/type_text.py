@@ -45,5 +45,5 @@ async def type_text(element_ref: str, text: str, ctx: Context) -> dict:
 
     screenshot = await browser.screenshot()
     session_id, step_index = _get_screenshot_meta(ctx)
-    path = _save_screenshot(screenshot, session_id=session_id, step_index=step_index)
+    path = await _save_screenshot(screenshot, session_id=session_id, step_index=step_index)
     return {"status": "success", "screenshot_path": path}
