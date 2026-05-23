@@ -238,8 +238,15 @@ def accumulate_tokens(current: dict, usage, node_name: str = "") -> dict:
         usage = usage.usage_metadata
     if not usage:
         return dict(current)
-    add_prompt = usage.get("input_tokens", 0)
-    add_completion = usage.get("output_tokens", 0)
+    if "input_tokens" in usage:
+        add_prompt = usage["input_tokens"]
+    else:
+        add_prompt = usage.get("prompt_tokens", 0)
+
+    if "output_tokens" in usage:
+        add_completion = usage["output_tokens"]
+    else:
+        add_completion = usage.get("completion_tokens", 0)
     return {
         "prompt": current.get("prompt", 0) + add_prompt,
         "completion": current.get("completion", 0) + add_completion,
