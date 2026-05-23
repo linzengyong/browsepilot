@@ -4,6 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
+from browser_mcp.tools import _save_screenshot
 
 
 @mcp.tool()
@@ -37,10 +38,10 @@ async def click(selector: str, ctx: Context) -> dict:
         screenshot = await browser.screenshot()
         return {
             "status": "success",
-            "screenshot_base64": screenshot,
+            "screenshot_path": _save_screenshot(screenshot),
             "url_before": url_before,
             "url_after": url_after,
         }
     except Exception as e:
         screenshot = await browser.screenshot()
-        return {"status": "error", "error": "selector_not_found", "detail": str(e), "screenshot_base64": screenshot}
+        return {"status": "error", "error": "selector_not_found", "detail": str(e), "screenshot_path": _save_screenshot(screenshot)}

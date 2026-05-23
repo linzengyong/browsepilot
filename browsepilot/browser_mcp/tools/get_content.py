@@ -4,6 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
+from browser_mcp.tools import _save_screenshot
 
 
 @mcp.tool()
@@ -17,7 +18,7 @@ async def get_content(ctx: Context, format: str = "text") -> dict:
         else:
             content = await asyncio.wait_for(page.inner_text("body"), timeout=15.0)
         screenshot = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
-        return {"status": "success", "content": content[:10000], "screenshot_base64": screenshot}
+        return {"status": "success", "content": content[:10000], "screenshot_path": _save_screenshot(screenshot)}
     except asyncio.TimeoutError:
         return {"status": "error", "error": "timeout", "message": "get_content timed out"}
     except Exception as e:

@@ -634,31 +634,8 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
     else:
         result = {"status": "skipped", "reason": "no_tool_needed"}
 
-    # Save screenshot if available
-    screenshot_path = ""
-    if isinstance(result, dict) and result.get("screenshot_base64"):
-        # Check storage before saving screenshot (deferred to avoid circular import)
-        skip_screenshot = False
-        try:
-            from backend.app.main import session_manager
-            if not session_manager.check_storage_before_write():
-                logger.warning("Skipping screenshot due to storage limit")
-                skip_screenshot = True
-        except ImportError:
-            pass  # Continue with screenshot save
-
-        if not skip_screenshot:
-            step_index = state.get("total_steps", 0)
-            session_id = state.get("session_id", "unknown")
-            screenshots_dir = f"{settings.data_dir}/screenshots/{session_id}"
-            os.makedirs(screenshots_dir, exist_ok=True)
-            screenshot_path = f"{screenshots_dir}/step_{step_index}.png"
-            try:
-                with open(screenshot_path, "wb") as f:
-                    f.write(base64.b64decode(result["screenshot_base64"]))
-            except Exception as e:
-                logger.warning("[execute_node] Failed to save screenshot: {}", e)
-                screenshot_path = ""
+    # Use screenshot path from tool result (tool already saved to disk)
+    screenshot_path = result.get("screenshot_path", "") if isinstance(result, dict) else ""
 
     new_log = state["execution_log"] + [{
         "step": current_step,

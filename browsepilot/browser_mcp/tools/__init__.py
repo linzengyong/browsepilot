@@ -1,5 +1,7 @@
 """MCP tool implementations for browser automation."""
 
+import base64
+import os
 import re
 from fnmatch import fnmatch
 from urllib.parse import urlparse
@@ -58,4 +60,16 @@ def filter_js_script(script: str) -> tuple:
     if m:
         return False, f"script_blocked: '{m.group(1)}' is not allowed"
     return True, ""
+
+
+def _save_screenshot(screenshot_base64: str, session_id: str = "", step_index: int = 0, data_dir: str = "data") -> str:
+    """Save base64 screenshot to disk, return file path."""
+    if not screenshot_base64:
+        return ""
+    screenshots_dir = os.path.join(data_dir, "screenshots", session_id) if session_id else os.path.join(data_dir, "screenshots")
+    os.makedirs(screenshots_dir, exist_ok=True)
+    path = os.path.join(screenshots_dir, f"step_{step_index}.png")
+    with open(path, "wb") as f:
+        f.write(base64.b64decode(screenshot_base64))
+    return path
 

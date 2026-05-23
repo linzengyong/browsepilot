@@ -3,8 +3,10 @@
 import uuid
 import json
 import asyncio
+import base64
 import re
 import time
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -228,9 +230,20 @@ async def chat_stream(request: Request):
                             )
                             yield SSEData.step_start(last_log["step"], step_index)
                             result = last_log.get("result", {})
-                            if isinstance(result, dict) and result.get("screenshot_base64"):
+                            screenshot_b64 = ""
+                            if isinstance(result, dict):
+                                screenshot_path = result.get("screenshot_path", "")
+                                if screenshot_path and os.path.exists(screenshot_path):
+                                    try:
+                                        with open(screenshot_path, "rb") as f:
+                                            screenshot_b64 = base64.b64encode(f.read()).decode("utf-8")
+                                    except Exception:
+                                        pass
+                                elif result.get("screenshot_base64"):
+                                    screenshot_b64 = result["screenshot_base64"]
+                            if screenshot_b64:
                                 yield SSEData.screenshot(
-                                    result["screenshot_base64"],
+                                    screenshot_b64,
                                     last_log.get("timestamp", ""),
                                 )
                             yield SSEData.step_end(last_log["step"], result)
