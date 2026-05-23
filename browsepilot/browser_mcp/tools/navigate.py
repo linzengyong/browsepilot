@@ -18,8 +18,34 @@ async def navigate(url: str, ctx: Context) -> dict:
     try:
         await asyncio.wait_for(page.goto(url, wait_until="domcontentloaded"), timeout=15)
         title = await page.title()
+
+        # Extract visible text preview
+        try:
+            visible_text = await page.inner_text("body")
+            visible_text_preview = visible_text[:200] if visible_text else ""
+        except Exception:
+            visible_text_preview = ""
+
+        # Detect common issues
+        detected_issues = []
+        page_text = (visible_text_preview + title).lower()
+        if any(kw in page_text for kw in ["验证", "captcha", "人机验证"]):
+            detected_issues.append("captcha")
+        if any(kw in page_text for kw in ["登录", "login", "sign in"]):
+            detected_issues.append("login_wall")
+        if any(kw in page_text for kw in ["弹出", "popup"]):
+            detected_issues.append("popup")
+        if "challenge" in page.url.lower() or "cf-browser-verify" in page_text:
+            detected_issues.append("cloudflare")
+
         screenshot = await browser.screenshot()
-        return {"status": "success", "screenshot_path": _save_screenshot(screenshot), "title": title}
+        return {
+            "status": "success",
+            "screenshot_path": _save_screenshot(screenshot),
+            "title": title,
+            "visible_text_preview": visible_text_preview,
+            "detected_issues": detected_issues,
+        }
     except asyncio.TimeoutError:
         screenshot = await browser.screenshot()
         raise ToolError("timeout", f"导航到 {url} 超时")
