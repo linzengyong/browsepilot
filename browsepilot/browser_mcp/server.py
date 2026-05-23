@@ -16,8 +16,9 @@ async def browser_lifespan(server):
     """Acquire a browser instance from the shared pool for each MCP session."""
     import browser_mcp.browser_pool as bp_module
     pooled = await bp_module.pool.acquire()
+    element_map: dict[str, str] = {}
     try:
-        yield {"browser": pooled.browser_manager}
+        yield {"browser": pooled.browser_manager, "element_map": element_map}
     finally:
         await bp_module.pool.release(pooled)
 

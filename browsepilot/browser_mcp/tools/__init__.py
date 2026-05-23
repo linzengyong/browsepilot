@@ -74,6 +74,14 @@ def _save_screenshot(screenshot_base64: str, session_id: str = "", step_index: i
     return path
 
 
+def _get_selector_map(ctx) -> dict:
+    """Get element ref -> CSS selector from session context."""
+    try:
+        return ctx.request_context.lifespan_context.get("element_map", {})
+    except Exception:
+        return {}
+
+
 class ToolError(Exception):
     """Structured error for LLM-friendly MCP tool failures."""
 
