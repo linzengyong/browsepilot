@@ -321,11 +321,21 @@ async def pre_observe_node(state: AgentState, mcp_client) -> dict:
     """Navigate to target page and capture structure so plan_node knows the real DOM."""
     task = state["task"]
     url = settings.default_search_url
-    # Match URL, strip trailing Chinese punctuation
+
+    # 1. Try direct URL match: https://xxx
     m = re.search(r"https?://\S+", task)
     if m:
         raw = m.group(0)
         url = re.sub(r"[，。！？；：\"\"''（）【】、《》…—]+$", "", raw)
+    else:
+        # 2. Try "去XXX上搜索/找/看" pattern
+        m = re.search(r"去\s*(\S+?)\s*上", task)
+        if m:
+            site = m.group(1).strip()
+            if "." in site:
+                url = "https://" + site if not site.startswith("http") else site
+            else:
+                url = f"https://www.{site}.com"
 
     logger.info("[pre_observe] Navigating to {} for page observation", url)
 
@@ -1235,7 +1245,7 @@ async def answer_node(state: AgentState) -> dict:
         # No execution happened: chitchat or knowledge_qa direct path
         recent_messages = (state.get("messages") or [])[-10:]
         answer_messages = [
-            SystemMessage(content=f"Today's date is {datetime.now(timezone.utc).strftime('%Y-%m-%d')} (UTC). You are BrowsePilot, a helpful AI assistant skilled in browser automation. Answer the user's question directly and concisely."),
+            SystemMessage(content=f"今天是 {datetime.now(timezone.utc).strftime('%Y-%m-%d')}（UTC）。你是 BrowsePilot，一个擅长浏览器自动化的 AI 助手。请直接简洁地回答用户的问题。"),
             *recent_messages,
             HumanMessage(content=state["task"]),
         ]
@@ -1245,8 +1255,8 @@ async def answer_node(state: AgentState) -> dict:
 
         current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         system_prompt = (
-            f"Today's date is {current_date} (UTC). "
-            "You are BrowsePilot. Based on the browser execution results below, answer the user's question."
+            f"今天是 {current_date}（UTC）。"
+            "你是 BrowsePilot，一个浏览器自动化助手。请根据下面的浏览器执行结果回答用户的问题。"
         )
         stop_reason = state.get("stop_reason", "")
         if stop_reason:

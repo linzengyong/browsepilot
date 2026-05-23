@@ -1,121 +1,123 @@
 # backend/app/agent/prompts.py
-"""Prompt templates for all agent nodes. Version-controlled, not runtime-configurable."""
+"""Agent 节点 prompt 模板，由版本控制管理，不作为运行时配置。"""
 
-# --- Classify Node ---
+# --- 意图分类节点 ---
 
-CLASSIFY_PROMPT = """You are an intent classifier. Analyze the user's input and determine which category it belongs to:
+CLASSIFY_PROMPT = """你是一个意图分类器。分析用户输入，判定其属于以下哪个类别：
 
-1. chitchat — Casual conversation, greetings, small talk unrelated to browser operations
-   Examples:
-   - "Hello" / "Who are you" / "How's the weather"
-   - "Thank you" / "Goodbye"
+1. chitchat — 闲聊、问候、与浏览器操作无关的日常对话
+   示例：
+   - "你好" / "你是谁" / "今天天气怎么样"
+   - "谢谢" / "再见"
 
-2. knowledge_qa — Questions that need knowledge/explanation, no browser operations needed
-   Examples:
-   - "Explain machine learning classification methods"
-   - "What is Python's GIL"
-   - "Compare React vs Vue"
+2. knowledge_qa — 需要知识解答的问题，无需浏览器操作
+   示例：
+   - "解释机器学习的分类方法"
+   - "Python 的 GIL 是什么"
+   - "比较 React 和 Vue"
 
-3. browser_task — Tasks that need to open a browser and perform specific operations
-   Examples:
-   - "Open Baidu and search for LangChain"
-   - "Find Python web scraping projects on GitHub"
-   - "Show me what's on the Baidu homepage"
+3. browser_task — 需要打开浏览器并执行具体操作的任务
+   示例：
+   - "打开百度搜索 LangChain"
+   - "去 GitHub 上找 Python 爬虫项目"
+   - "给我看看百度首页长什么样"
+   - "去京东搜机械键盘，对比前三款"
 
-Rules:
-- Casual chat, greetings, asking who you are -> chitchat
-- Knowledge questions that DON'T need a browser -> knowledge_qa
-- Tasks requiring opening web pages, clicking, typing, screenshots -> browser_task
+规则：
+- 闲聊、问候 -> chitchat
+- 无需浏览器的知识问答 -> knowledge_qa
+- 需要打开网页、点击、输入、截图等操作 -> browser_task
 
-Return JSON: {"intent": "chitchat|knowledge_qa|browser_task"}
-Return ONLY JSON, nothing else."""
+返回 JSON：{"intent": "chitchat|knowledge_qa|browser_task"}
+只返回 JSON，不要包含其他内容。"""
 
 
-# --- Plan Node ---
+# --- 规划节点 ---
 
 PLAN_SYSTEM_PROMPT = """你是一个浏览器自动化规划专家。你可以使用以下工具：
 {tools_desc}
 
-重要：get_page_structure 工具可以提取页面上所有输入框、按钮、链接及其引用标签，在执行任何点击或输入操作前，必须先用它获取元素引用标签。
+重要：get_page_structure 工具可以提取页面上所有输入框、按钮、链接及其引用标签。在执行任何点击或输入操作前，必须先用它获取元素的引用标签。
 
-搜索引擎选择：
-- 默认使用 Bing (https://www.bing.com) 进行搜索
+导航决策：
+- 从用户任务中识别目标网站——用户说"去XX上搜索/找/看"，则直接导航到 XX，不要在搜索引擎中绕路
+- 用户要求搜索但未指定平台时，使用 Bing（https://www.bing.com）搜索
 - 避免使用百度——百度有严格的反爬验证，访问经常失败
-- 仅当用户明确要求使用特定搜索引擎时才使用其他引擎
+- 始终使用 https:// 完整 URL 格式
 
-请根据用户任务，生成一个JSON格式的执行步骤列表。每个步骤是一个自然语言描述的简单操作。
+请根据用户任务，生成一个 JSON 格式的执行步骤列表。每个步骤是一个自然语言描述的简单操作。
 规则：
 1. 一次 get_page_structure 调用应同时获取所有需要的元素标签（搜索框+搜索按钮），不要分两次获取
 2. 步骤总数控制在 5-7 步以内
-3. 不要猜测元素引用标签，应从页面结构（get_page_structure）中获取
-4. 搜索类任务默认访问 https://www.bing.com，不要使用百度
+3. 不要凭空编造元素引用标签，必须从 get_page_structure 的结果中获取
+4. 搜索类任务如未指定目标网站，默认使用 https://www.bing.com
 5. 输入和点击必须分开为两步，每步只调用一个工具
 
-格式示例（紧凑版）：["导航到 https://github.com", "获取页面结构，找到搜索框和搜索按钮的元素标签", "在搜索框中输入关键字", "点击搜索按钮", "获取搜索结果页面内容", "回答用户"]
-只返回JSON数组，不要包含其他内容。步骤要具体、可执行。"""
+格式示例（紧凑版）：["导航到 https://www.bing.com", "获取页面结构，找到搜索框和搜索按钮的元素标签", "在搜索框中输入关键字", "点击搜索按钮", "获取搜索结果页面内容", "回答用户"]
+只返回 JSON 数组，不要包含其他内容。步骤要具体、可执行。"""
 
 
-# --- Execute Node ---
+# --- 执行节点 ---
 
-EXECUTE_SYSTEM_PROMPT = """You are a browser automation execution expert.
-Available tools:
+EXECUTE_SYSTEM_PROMPT = """你是一个浏览器自动化执行专家。
+可用工具：
 {tools_desc}
 
-Core rules:
-1. If the previous step already used get_page_structure and returned selectors,
-   reuse those selectors. Only call get_page_structure again when:
-   - The page has navigated to a new URL, OR
-   - The previous structure did not contain the element you need
-2. ONLY use selectors returned by get_page_structure...
-3. Execute ONE operation at a time
+核心规则：
+1. 如果之前的步骤已经使用了 get_page_structure 并返回了元素引用标签，直接复用这些标签。只有以下情况才重新调用 get_page_structure：
+   - 页面已经导航到了新的 URL，或者
+   - 之前的页面结构中没有包含你需要的元素
+2. 只能使用 get_page_structure 返回的元素引用标签（如 [input:搜索框]、[btn:搜索]），禁止凭空编造
+3. 每次只执行一个操作
 
-Recent execution context:
+最近的执行上下文：
 {recent_context}
 
-Select the next tool to execute based on the user's task and current context.
-Return JSON: {{"tool": "tool_name", "arguments": {{...}}, "step": "brief step description"}}
-Return ONLY JSON."""
+根据用户任务和当前上下文，选择下一个要执行的工具。
+返回 JSON：{{"tool": "工具名", "arguments": {{...}}, "step": "步骤简述"}}
+只返回 JSON。"""
 
 
-# --- Reflect Node ---
+# --- 反思节点 ---
 
-REFLECT_SYSTEM_PROMPT = """You are a browser automation reflection expert. Analyze the execution result and decide the next action.
+REFLECT_SYSTEM_PROMPT = """你是一个浏览器自动化反思专家。分析执行结果，决定下一步行动。
 
-Decision guidelines:
-- If the step succeeded and produced useful information: continue with the next plan step
-- If the step failed due to a wrong selector: retry with a different selector from available_refs
-- If the step failed and there are no alternative approaches: replan
-- If enough information has been gathered to answer: answer
-- If stagnation warning is present: You MUST try a fundamentally different approach
+决策指南：
+- 步骤成功且产生了有用信息：继续执行下一个计划步骤
+- 步骤失败因为元素引用错误：从 available_refs 中重新选择标签重试
+- 步骤失败且没有替代方案：重新规划
+- 已收集到足够信息可以回答用户：回答
+- 如果存在停滞警告：必须尝试与之前完全不同的方法
 
-Return JSON: {{"action": "retry|replan|answer", "reason": "brief explanation"}}
-Return ONLY JSON."""
+返回 JSON：{{"action": "retry|replan|answer", "reason": "简要说明"}}
+只返回 JSON。"""
 
 
-# --- Completion Check ---
+# --- 完成检查 ---
 
-COMPLETION_CHECK_PROMPT = """User's original task: {task}
+COMPLETION_CHECK_PROMPT = """用户原始任务：{task}
 
-Execution log summary:
+执行日志摘要：
 {execution_summary}
 
 判断标准：已收集的信息是否足以给用户一个有用的回答？
 
 如果足够：{{"action": "answer"}}
-如果不够：{{"action": "continue", "extra_steps": ["步骤1", "步骤2", ...]}}（最多3步）
-只返回JSON。"""
+如果不够：{{"action": "continue", "extra_steps": ["步骤1", "步骤2", ...]}}（最多 3 步）
+只返回 JSON。"""
 
 
-# --- Replan Node ---
+# --- 重新规划节点 ---
 
-REPLAN_PROMPT = """You are a browser automation planning expert. Available tools:
+REPLAN_PROMPT = """你是一个浏览器自动化规划专家。可用工具：
 {tools_desc}
 
-The previous execution plan failed. Analyze the failure context (and any screenshots provided) to create a new, better plan.
+之前的执行计划失败了。分析失败上下文（以及提供的截图），制定一个新的、更好的计划。
 
-Important:
-- Generate a DIFFERENT plan from the failed one. Try alternative approaches.
-- Use Bing (https://www.bing.com) for searches. Avoid Baidu — it has strict anti-bot verification.
+重要：
+- 必须生成一个与失败计划不同的新计划，尝试替代方案
+- 一般搜索使用 Bing（https://www.bing.com），避免使用百度
+- 如果失败原因是某个网站无法访问或反爬严重，换一个同类型的网站
 
-Generate a JSON array of execution steps. Format: ["step 1", "step 2", ...]
-Return ONLY the JSON array, nothing else."""
+生成 JSON 数组格式的执行步骤：["步骤1", "步骤2", ...]
+只返回 JSON 数组，不要包含其他内容。"""
