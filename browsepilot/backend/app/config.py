@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from loguru import logger
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 # Explicit .env loading
@@ -60,6 +60,13 @@ class Settings(BaseSettings):
     recursion_warning_threshold: int = 10
     max_context_tokens: int = 8000
     max_messages_count: int = 50
+
+    # Tool classification
+    tool_classify_threshold: int = Field(default=2, ge=1)
+
+    # Step limits (dual-layer)
+    plan_step_limit: int = Field(default=15, ge=1)
+    total_step_limit: int = Field(default=30, ge=1)
 
     @model_validator(mode="after")
     def check_critical(self):

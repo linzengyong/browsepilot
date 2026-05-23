@@ -6,6 +6,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from backend.app.agent.state import AgentState
+from backend.app.config import settings
 from backend.app.agent.nodes import (
     plan_node, execute_node, reflect_node, replan_node, answer_node,
     classify_node, pre_observe_node,
@@ -100,13 +101,13 @@ def _route_classify(state: AgentState) -> str:
 def _route_reflect(state: AgentState) -> str:
     """Route after reflection: circuit breaker checks, then retry/continue/replan/done."""
     # Circuit breaker checks
-    if state.get("consecutive_failures", 0) >= 3:
+    if state.get("consecutive_failures", 0) >= settings.consecutive_failures_threshold:
         logger.warning("Circuit breaker: {} consecutive failures, forcing answer", state["consecutive_failures"])
         return "answer"
-    if state.get("replan_count", 0) >= 2:
+    if state.get("replan_count", 0) >= settings.replan_max_count:
         logger.warning("Too many replans ({}), forcing answer", state["replan_count"])
         return "answer"
-    if state.get("stagnation_count", 0) >= 3:
+    if state.get("stagnation_count", 0) >= settings.stagnation_threshold:
         logger.warning("Stagnation detected (count={}), forcing answer", state["stagnation_count"])
         return "answer"
 

@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from backend.app.config import settings
 
-from backend.app.agent.nodes import classify_tool, TOOL_RULES, THRESHOLD
+from backend.app.agent.nodes import classify_tool, TOOL_RULES
 
 
 # ── R1: Tool Selection Classifier ──────────────────────────────────────
@@ -53,7 +53,7 @@ def test_all_tools_in_rules():
 
 
 def test_threshold_value():
-    assert THRESHOLD == 2
+    assert settings.tool_classify_threshold == 2
 
 
 def test_classifier_navigate_needs_url():

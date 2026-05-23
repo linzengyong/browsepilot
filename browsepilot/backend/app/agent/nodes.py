@@ -6,11 +6,21 @@ import os
 import base64
 from datetime import datetime, timezone
 
+import jieba
+
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from loguru import logger
 
 from backend.app.agent.state import AgentState
+from backend.app.agent.prompts import (
+    CLASSIFY_PROMPT,
+    PLAN_SYSTEM_PROMPT,
+    EXECUTE_SYSTEM_PROMPT,
+    REFLECT_SYSTEM_PROMPT,
+    COMPLETION_CHECK_PROMPT,
+    REPLAN_PROMPT,
+)
 from backend.app.config import settings
 from browser_mcp.tools.search_engines import match_search_engine, SEARCH_ENGINES
 
@@ -87,12 +97,9 @@ TOOL_RULES = {
     },
 }
 
-THRESHOLD = 2  # minimum score to trust classifier over LLM
-
-
 def classify_tool(step: str) -> str | None:
     """Score all tools against the step description. Returns tool name
-    if best score >= THRESHOLD, else None (LLM fallback)."""
+    if best score >= threshold, else None (LLM fallback)."""
     best_tool = None
     best_score = 0
     for tool_name, rules in TOOL_RULES.items():
@@ -106,7 +113,7 @@ def classify_tool(step: str) -> str | None:
         if score > best_score:
             best_score = score
             best_tool = tool_name
-    return best_tool if best_score >= THRESHOLD else None
+    return best_tool if best_score >= settings.tool_classify_threshold else None
 
 
 def extract_args(tool: str, step: str) -> tuple[dict | None, bool]:
@@ -168,13 +175,16 @@ def extract_args(tool: str, step: str) -> tuple[dict | None, bool]:
 
 
 def compute_plan_similarity(old_plan: list[str], new_plan: list[str]) -> float:
-    """Jaccard similarity on character-level tokens. No LLM."""
+    """Jaccard similarity on word-level tokens using jieba."""
     def tokenize(steps):
         tokens = set()
         for s in steps:
-            for ch in s.replace(" ", ""):
-                tokens.add(ch)
+            for word in jieba.lcut(s):
+                word = word.strip()
+                if word:
+                    tokens.add(word)
         return tokens
+
     old_tokens = tokenize(old_plan)
     new_tokens = tokenize(new_plan)
     if not old_tokens or not new_tokens:
@@ -280,34 +290,6 @@ def get_small_llm():
     )
 
 
-CLASSIFY_PROMPT = """You are an intent classifier. Analyze the user's input and determine which category it belongs to:
-
-1. chitchat — Casual conversation, greetings, small talk unrelated to browser operations
-   Examples:
-   - "Hello" / "Who are you" / "How's the weather"
-   - "Thank you" / "Goodbye"
-
-2. knowledge_qa — Questions that need knowledge/explanation, no browser operations needed
-   Examples:
-   - "Explain machine learning classification methods"
-   - "What is Python's GIL"
-   - "Compare React vs Vue"
-
-3. browser_task — Tasks that need to open a browser and perform specific operations
-   Examples:
-   - "Open Baidu and search for LangChain"
-   - "Find Python web scraping projects on GitHub"
-   - "Show me what's on the Baidu homepage"
-
-Rules:
-- Casual chat, greetings, asking who you are -> chitchat
-- Knowledge questions that DON'T need a browser -> knowledge_qa
-- Tasks requiring opening web pages, clicking, typing, screenshots -> browser_task
-
-Return JSON: {"intent": "chitchat|knowledge_qa|browser_task"}
-Return ONLY JSON, nothing else."""
-
-
 async def classify_node(state: AgentState) -> dict:
     """Classify user intent using the small model."""
     logger.info("[classify_node] Classifying: {}", state["task"][:80])
@@ -411,26 +393,7 @@ async def plan_node(state: AgentState, mcp_client) -> dict:
         for t in tools_schema
     )
 
-    system_prompt = f"""你是一个浏览器自动化规划专家。你可以使用以下工具：
-{tools_desc}
-
-重要：get_page_structure 工具可以提取页面上所有输入框、按钮、链接及其 CSS 选择器，在执行任何点击或输入操作前，必须先用它获取选择器。
-
-搜索引擎选择：
-- 默认使用 Bing (https://www.bing.com) 进行搜索
-- 避免使用百度——百度有严格的反爬验证，访问经常失败
-- 仅当用户明确要求使用特定搜索引擎时才使用其他引擎
-
-请根据用户任务，生成一个JSON格式的执行步骤列表。每个步骤是一个自然语言描述的简单操作。
-规则：
-1. 一次 get_page_structure 调用应同时获取所有需要的选择器（搜索框+搜索按钮），不要分两次获取
-2. 步骤总数控制在 5-7 步以内
-3. 不要猜测选择器（如 input[type='text']），应从页面结构中获取
-4. 搜索类任务默认访问 https://www.bing.com，不要使用百度
-5. 输入和点击必须分开为两步，每步只调用一个工具
-
-格式示例（紧凑版）：["导航到 https://github.com", "获取页面结构，找到搜索框和搜索按钮的选择器", "在搜索框中输入关键字", "点击搜索按钮", "获取搜索结果页面内容", "回答用户"]
-只返回JSON数组，不要包含其他内容。步骤要具体、可执行。"""
+    system_prompt = PLAN_SYSTEM_PROMPT.format(tools_desc=tools_desc)
 
     # Inject turn history context at the beginning for multi-turn memory
     turn_history = ""
@@ -530,26 +493,6 @@ Return ONLY JSON."""
     }
 
 
-EXECUTE_SYSTEM_PROMPT = """You are a browser automation execution expert.
-Available tools:
-{tools_desc}
-
-Core rules:
-1. If the previous step already used get_page_structure and returned selectors,
-   reuse those selectors. Only call get_page_structure again when:
-   - The page has navigated to a new URL, OR
-   - The previous structure did not contain the element you need
-2. ONLY use selectors returned by get_page_structure — never invent or guess selectors
-3. Execute ONE operation at a time
-
-Recent execution context:
-{recent_context}
-
-Select the next tool to execute based on the user's task and current context.
-Return JSON: {{"tool": "tool_name", "arguments": {{...}}, "step": "brief step description"}}
-Return ONLY JSON."""
-
-
 async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
     """Execute the first step in the plan using the appropriate MCP tool."""
     if not state["plan"]:
@@ -602,7 +545,7 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
     classified_tool = classify_tool(current_step)
     usage = None
     if classified_tool:
-        logger.info("[execute_node] Classifier selected: {} (score >= {})", classified_tool, THRESHOLD)
+        logger.info("[execute_node] Classifier selected: {} (score >= {})", classified_tool, settings.tool_classify_threshold)
         extracted_args, is_complete = extract_args(classified_tool, current_step)
 
         # Known search engine optimization: inject verified selectors for type_text,
@@ -847,53 +790,6 @@ def _run_heuristic_checks(state: AgentState) -> dict:
     return {"has_issue": False, "issue_type": None, "detail": ""}
 
 
-COMPLETION_CHECK_PROMPT = """User's original task: {task}
-
-Summary of executed steps and collected information:
-{execution_summary}
-
-Key page contents collected:
-{page_contents_summary}
-
-判断标准：已收集的信息是否足以给用户一个有用的回答？
-- "足够"不代表必须从页面抓取到每一个细节。模型可以结合自身知识补充。
-- 只要搜索结果或页面内容提供了事实依据（如产品名称、价格区间、文章标题），就视为足够。
-- 仅在页面内容完全为空、或用户明确要求从特定页面提取数据但未成功时，才判定为不够。
-
-示例1 — 足够：
-  任务："推荐三款100元以内的机械键盘"
-  已收集：Bing搜索结果页内容，包含多款键盘名称和价格提及
-  → {{"action": "answer"}}
-
-示例2 — 足够：
-  任务："总结这篇新闻的要点"
-  已收集：新闻页面正文内容（get_content返回约800字）
-  → {{"action": "answer"}}
-
-示例3 — 不够：
-  任务："查询我信用卡的当前余额"
-  已收集：银行首页内容（未登录，看不到余额）
-  → {{"action": "continue", "extra_steps": ["点击'登录'按钮", "输入用户名", "输入密码并提交"]}}
-
-示例4 — 不够：
-  任务："下载这个页面上的PDF报告"
-  已收集：页面结构中有3个链接，但不清楚哪个指向PDF
-  → {{"action": "continue", "extra_steps": ["逐个检查链接，找到.pdf结尾的URL"]}}
-
-现在判断：
-- 如果足够：{{"action": "answer"}}
-- 如果不够：{{"action": "continue", "extra_steps": ["步骤1", "步骤2", ...]}}（最多3步）
-只返回JSON。"""
-
-
-REFLECT_SYSTEM_PROMPT = """You are a browser automation reflection expert. Analyze the execution result and decide the next action.
-
-If stagnation warning is present: the previous replan produced a highly similar plan. You MUST try a fundamentally different approach — change operation order, try a different navigation path, or fall back to a search engine. If no viable alternative exists, choose answer.
-
-Return JSON: {{"action": "retry|replan|answer", "reason": "brief explanation"}}
-Return ONLY JSON."""
-
-
 def _last_step_failed(state: AgentState) -> bool:
     """Check if the last execution step resulted in an error."""
     if not state.get("execution_log"):
@@ -1024,25 +920,25 @@ async def reflect_node(state: AgentState) -> dict:
     logger.info("[reflect_node] Reflecting on execution...")
 
     # Circuit breaker checks — force answer with reason
-    if state.get("consecutive_failures", 0) >= 3:
+    if state.get("consecutive_failures", 0) >= settings.consecutive_failures_threshold:
         logger.warning("[reflect_node] Circuit breaker: {} consecutive failures", state["consecutive_failures"])
         return {"plan": [], "need_replan": False,
                 "stop_reason": f"连续 {state['consecutive_failures']} 步执行失败，为避免无限重试，按照现有搜集到的材料组织回答"}
-    if state.get("replan_count", 0) >= 2:
+    if state.get("replan_count", 0) >= settings.replan_max_count:
         logger.warning("[reflect_node] Too many replans: {}", state["replan_count"])
         return {"plan": [], "need_replan": False,
                 "stop_reason": f"已进行 {state['replan_count']} 次重新规划，当前任务可能无法通过浏览器自动化完成，按照现有搜集到的材料组织回答"}
-    if state.get("stagnation_count", 0) >= 3:
+    if state.get("stagnation_count", 0) >= settings.stagnation_threshold:
         logger.warning("[reflect_node] Stagnation detected: {}", state["stagnation_count"])
         return {"plan": [], "need_replan": False,
                 "stop_reason": "连续多步结果高度相似，判断陷入死循环，按照现有搜集到的材料组织回答"}
     plan_steps = state.get("plan_step_count", 0)
     total_steps_all = state.get("total_steps", len(state.get("execution_log", [])))
-    if plan_steps >= 15:
+    if plan_steps >= settings.plan_step_limit:
         logger.warning("[reflect_node] Plan step limit reached: {} steps in current plan", plan_steps)
         return {"plan": [], "need_replan": False,
                 "stop_reason": f"当前计划已执行 {plan_steps} 步，达到单轮上限，按照现有搜集到的材料组织回答"}
-    if total_steps_all >= 30:
+    if total_steps_all >= settings.total_step_limit:
         logger.warning("[reflect_node] Total step limit reached: {} total steps", total_steps_all)
         return {"plan": [], "need_replan": False,
                 "stop_reason": f"总计已执行 {total_steps_all} 步，达到全局上限，按照现有搜集到的材料组织回答"}
@@ -1150,27 +1046,17 @@ async def replan_node(state: AgentState, mcp_client) -> dict:
     # Build context (with or without vision)
     context_content = _build_replan_context(state)
 
-    REPLAN_PROMPT = f"""You are a browser automation planning expert. Available tools:
-{tools_desc}
-
-The previous execution plan failed. Analyze the failure context (and any screenshots provided) to create a new, better plan.
-
-Important:
-- Generate a DIFFERENT plan from the failed one. Try alternative approaches.
-- Use Bing (https://www.bing.com) for searches. Avoid Baidu — it has strict anti-bot verification.
-
-Generate a JSON array of execution steps. Format: ["step 1", "step 2", ...]
-Return ONLY the JSON array, nothing else."""
+    replan_prompt = REPLAN_PROMPT.format(tools_desc=tools_desc)
 
     # Build messages — HumanMessage accepts both string and list content
     if isinstance(context_content, list):
         messages = [
-            SystemMessage(content=REPLAN_PROMPT),
+            SystemMessage(content=replan_prompt),
             HumanMessage(content=context_content),
         ]
     else:
         messages = [
-            SystemMessage(content=REPLAN_PROMPT),
+            SystemMessage(content=replan_prompt),
             HumanMessage(content=context_content),
         ]
 
