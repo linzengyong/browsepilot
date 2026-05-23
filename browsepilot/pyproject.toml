@@ -18,6 +18,9 @@ dependencies = [
     "pydantic-settings>=2.0",
     "httpx>=0.27",
     "python-dotenv>=1.0",
+    "fastmcp>=3.3",
+    "jieba>=0.42",
+    "aiofiles>=25.0",
 ]
 
 [project.optional-dependencies]

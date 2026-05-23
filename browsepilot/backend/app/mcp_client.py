@@ -70,8 +70,10 @@ class MCPClient:
             kwargs["meta"] = meta
         result = await self._client.call_tool(tool_name, arguments, **kwargs)
         if result.is_error:
-            return {"status": "error", "error_type": "tool_error", "message": str(result.content), **result.data}
-        return {"status": "success", **result.data} if isinstance(result.data, dict) else {"status": "success", "result": result.data}
+            data = result.data if isinstance(result.data, dict) else {}
+            return {"status": "error", "error_type": "tool_error", "message": str(result.content), **data}
+        data = result.data if isinstance(result.data, dict) else {}
+        return {"status": "success", **data}
 
     async def get_tools_schema(self) -> list[dict]:
         """Return tools in OpenAI function-calling format."""
