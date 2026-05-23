@@ -4,7 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import ToolError, _get_selector_map, _save_screenshot
+from browser_mcp.tools import ToolError, _get_selector_map, _save_screenshot, _get_screenshot_meta
 
 
 @mcp.tool()
@@ -59,7 +59,8 @@ async def click(element_ref: str, ctx: Context) -> dict:
             pass
 
     screenshot = await browser.screenshot()
-    path = _save_screenshot(screenshot)
+    session_id, step_index = _get_screenshot_meta(ctx)
+    path = _save_screenshot(screenshot, session_id=session_id, step_index=step_index)
     return {
         "status": "success",
         "screenshot_path": path,

@@ -671,7 +671,10 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
         arguments = tool_selection.get("arguments", {}) if isinstance(tool_selection, dict) else {}
         logger.info("[execute_node] Calling tool {} with args {}", tool_used, arguments)
         try:
-            result = await mcp_client.call_tool(tool_used, arguments)
+            result = await mcp_client.call_tool(
+                tool_used, arguments,
+                meta={"session_id": state.get("session_id", ""), "step_index": state.get("total_steps", 0)},
+            )
         except Exception as e:
             logger.warning("[execute_node] Tool call failed: {}", e)
             result = {"status": "error", "error": f"tool_call_failed: {str(e)}"}

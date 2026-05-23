@@ -4,7 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import ToolError, _save_screenshot
+from browser_mcp.tools import ToolError, _save_screenshot, _get_screenshot_meta
 
 
 @mcp.tool()
@@ -126,7 +126,8 @@ async def get_page_structure(ctx: Context) -> dict:
         link_count = sum(1 for k in elements if k.startswith("[link:"))
 
         screenshot = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
-        path = _save_screenshot(screenshot)
+        session_id, step_index = _get_screenshot_meta(ctx)
+        path = _save_screenshot(screenshot, session_id=session_id, step_index=step_index)
 
         return {
             "status": "success",

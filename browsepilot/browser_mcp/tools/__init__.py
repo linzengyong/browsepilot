@@ -82,6 +82,15 @@ def _get_selector_map(ctx) -> dict:
         return {}
 
 
+def _get_screenshot_meta(ctx) -> tuple[str, int]:
+    """Extract (session_id, step_index) from request meta for screenshot naming."""
+    try:
+        meta = getattr(ctx.request_context, "meta", None) or {}
+        return meta.get("session_id", ""), meta.get("step_index", 0)
+    except Exception:
+        return "", 0
+
+
 class ToolError(Exception):
     """Structured error for LLM-friendly MCP tool failures."""
 

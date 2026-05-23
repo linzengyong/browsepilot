@@ -44,11 +44,14 @@ class MCPClient:
         logger.info("Discovered {} tools: {}", len(self._tools), [t["name"] for t in self._tools])
         return self._tools
 
-    async def call_tool(self, tool_name: str, arguments: dict, timeout: float = 30.0) -> dict:
-        """Call a tool and return structured result."""
+    async def call_tool(self, tool_name: str, arguments: dict, timeout: float = 30.0, meta: dict | None = None) -> dict:
+        """Call a tool and return structured result. meta is passed through to the MCP server for observability and context injection (session_id, step_index)."""
         if not self._client:
             raise RuntimeError("MCP client not connected")
-        result = await self._client.call_tool(tool_name, arguments, timeout=timeout, raise_on_error=False)
+        kwargs = {"timeout": timeout, "raise_on_error": False}
+        if meta:
+            kwargs["meta"] = meta
+        result = await self._client.call_tool(tool_name, arguments, **kwargs)
         if result.is_error:
             return {"status": "error", "error_type": "tool_error", "message": str(result.content), **result.data}
         return {"status": "success", **result.data} if isinstance(result.data, dict) else {"status": "success", "result": result.data}
