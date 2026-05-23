@@ -9,7 +9,7 @@ from browser_mcp.tools import _save_screenshot, validate_url
 
 @mcp.tool()
 async def navigate(url: str, ctx: Context) -> dict:
-    """Navigate the browser to a URL."""
+    """导航到指定 URL。URL 必须包含完整协议（https://），或使用最近一次 get_page_structure 中链接的完整 href。"""
     browser = ctx.request_context.lifespan_context["browser"]
     is_valid, error = validate_url(url)
     if not is_valid:

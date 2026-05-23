@@ -9,7 +9,7 @@ from browser_mcp.tools import _save_screenshot
 
 @mcp.tool()
 async def get_page_structure(ctx: Context) -> dict:
-    """Extract all visible inputs, buttons, and links with their CSS selectors from the current page. Call this before any click/type operation."""
+    """获取当前页面所有可交互元素（输入框、按钮、链接）及对应的引用标签。在执行任何 click 或 type_text 前必须调用此工具，以获取有效的元素引用标签。"""
     browser = ctx.request_context.lifespan_context["browser"]
     page = await browser.get_page()
     try:

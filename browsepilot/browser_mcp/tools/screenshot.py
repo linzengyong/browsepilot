@@ -8,7 +8,7 @@ from browser_mcp.server import mcp
 
 @mcp.tool()
 async def screenshot(ctx: Context, full_page: bool = True) -> dict:
-    """Take a screenshot of the current page."""
+    """截取当前页面截图。仅当需要视觉信息辅助判断时使用，非必要不调用。"""
     browser = ctx.request_context.lifespan_context["browser"]
     try:
         data = await asyncio.wait_for(browser.screenshot(full_page=full_page), timeout=15.0)

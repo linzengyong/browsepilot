@@ -9,7 +9,7 @@ from browser_mcp.tools import _save_screenshot
 
 @mcp.tool()
 async def click(selector: str, ctx: Context) -> dict:
-    """Click an element identified by a CSS selector."""
+    """点击页面元素。element_ref 必须从最近一次 get_page_structure 返回的元素列表中获取，禁止凭空编造。"""
     browser = ctx.request_context.lifespan_context["browser"]
     page = await browser.get_page()
     await browser.dismiss_dialogs()

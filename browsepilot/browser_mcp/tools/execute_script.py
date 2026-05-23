@@ -7,7 +7,7 @@ from browser_mcp.tools import filter_js_script
 
 @mcp.tool()
 async def execute_script(script: str, ctx: Context) -> dict:
-    """Execute a safe JavaScript script on the page."""
+    """在页面执行安全的 JavaScript 脚本。仅在其它 7 个工具均无法完成任务时作为最后手段使用。脚本会受到安全过滤。"""
     browser = ctx.request_context.lifespan_context["browser"]
     is_safe, error = filter_js_script(script)
     if not is_safe:

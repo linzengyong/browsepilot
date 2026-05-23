@@ -9,7 +9,7 @@ from browser_mcp.tools import _save_screenshot
 
 @mcp.tool()
 async def scroll(ctx: Context, direction: str = "down", amount: int = 500) -> dict:
-    """Scroll the page up or down by a given pixel amount."""
+    """滚动页面。默认向下滚动 500 像素。搜索结果页面请先滚动跳过顶部广告区域，再使用 get_content 获取有效信息。"""
     browser = ctx.request_context.lifespan_context["browser"]
     page = await browser.get_page()
     try:

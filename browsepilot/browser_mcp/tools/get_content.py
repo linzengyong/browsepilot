@@ -9,7 +9,7 @@ from browser_mcp.tools import _save_screenshot
 
 @mcp.tool()
 async def get_content(ctx: Context, format: str = "text") -> dict:
-    """Extract page content as text or HTML."""
+    """提取当前页面可见文本内容。建议先使用 scroll 滚动到目标区域后再调用。format 参数可选 "text"（默认）或 "html"。max_chars 控制最大返回字符数（默认 10000）。"""
     browser = ctx.request_context.lifespan_context["browser"]
     page = await browser.get_page()
     try:

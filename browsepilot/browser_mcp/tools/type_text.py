@@ -7,7 +7,7 @@ from browser_mcp.tools import _save_screenshot
 
 @mcp.tool()
 async def type_text(selector: str, text: str, ctx: Context) -> dict:
-    """Type text into an input element identified by a CSS selector."""
+    """向输入框输入文本。element_ref 必须从最近一次 get_page_structure 返回的输入框列表中获取。text 为要输入的纯文本内容，无需添加 Enter 或特殊字符。"""
     browser = ctx.request_context.lifespan_context["browser"]
     page = await browser.get_page()
     await browser.dismiss_dialogs()
