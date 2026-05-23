@@ -73,3 +73,13 @@ def _save_screenshot(screenshot_base64: str, session_id: str = "", step_index: i
         f.write(base64.b64decode(screenshot_base64))
     return path
 
+
+class ToolError(Exception):
+    """Structured error for LLM-friendly MCP tool failures."""
+
+    def __init__(self, error_type: str, message: str, available_refs: list[str] | None = None):
+        self.error_type = error_type
+        self.message = message
+        self.available_refs = available_refs or []
+        super().__init__(message)
+

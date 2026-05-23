@@ -4,7 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import _save_screenshot, validate_url
+from browser_mcp.tools import ToolError, _save_screenshot, validate_url
 
 
 @mcp.tool()
@@ -13,7 +13,7 @@ async def navigate(url: str, ctx: Context) -> dict:
     browser = ctx.request_context.lifespan_context["browser"]
     is_valid, error = validate_url(url)
     if not is_valid:
-        return {"status": "error", "error": error}
+        raise ToolError("invalid_input", error)
     page = await browser.get_page()
     try:
         await asyncio.wait_for(page.goto(url, wait_until="domcontentloaded"), timeout=15)
@@ -22,7 +22,7 @@ async def navigate(url: str, ctx: Context) -> dict:
         return {"status": "success", "screenshot_path": _save_screenshot(screenshot), "title": title}
     except asyncio.TimeoutError:
         screenshot = await browser.screenshot()
-        return {"status": "error", "error": "timeout", "screenshot_path": _save_screenshot(screenshot)}
+        raise ToolError("timeout", f"导航到 {url} 超时")
     except Exception as e:
         screenshot = await browser.screenshot()
-        return {"status": "error", "error": str(e), "screenshot_path": _save_screenshot(screenshot)}
+        raise ToolError("navigation_failed", str(e))

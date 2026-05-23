@@ -2,7 +2,7 @@
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import _save_screenshot
+from browser_mcp.tools import ToolError, _save_screenshot
 
 
 @mcp.tool()
@@ -18,4 +18,4 @@ async def type_text(selector: str, text: str, ctx: Context) -> dict:
         return {"status": "success", "screenshot_path": _save_screenshot(screenshot)}
     except Exception as e:
         screenshot = await browser.screenshot()
-        return {"status": "error", "error": "selector_not_found", "detail": str(e), "screenshot_path": _save_screenshot(screenshot)}
+        raise ToolError("selector_not_found", f"输入框填充失败: {e}", available_refs=None)

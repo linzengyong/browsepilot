@@ -4,7 +4,7 @@ import asyncio
 
 from fastmcp.server.context import Context
 from browser_mcp.server import mcp
-from browser_mcp.tools import _save_screenshot
+from browser_mcp.tools import ToolError, _save_screenshot
 
 
 @mcp.tool()
@@ -18,6 +18,6 @@ async def scroll(ctx: Context, direction: str = "down", amount: int = 500) -> di
         screenshot_data = await asyncio.wait_for(browser.screenshot(), timeout=15.0)
         return {"status": "success", "screenshot_path": _save_screenshot(screenshot_data)}
     except asyncio.TimeoutError:
-        return {"status": "error", "error": "timeout", "message": "scroll timed out"}
+        raise ToolError("timeout", "scroll timed out")
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        raise ToolError("scroll_failed", str(e))
