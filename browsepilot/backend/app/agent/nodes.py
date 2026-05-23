@@ -402,7 +402,8 @@ async def plan_node(state: AgentState, mcp_client) -> dict:
         for t in tools_schema
     )
 
-    system_prompt = PLAN_SYSTEM_PROMPT.format(tools_desc=tools_desc)
+    current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    system_prompt = f"Today's date is {current_date} (UTC).\n\n" + PLAN_SYSTEM_PROMPT.format(tools_desc=tools_desc)
 
     # Inject turn history context at the beginning for multi-turn memory
     turn_history = ""
@@ -1234,7 +1235,7 @@ async def answer_node(state: AgentState) -> dict:
         # No execution happened: chitchat or knowledge_qa direct path
         recent_messages = (state.get("messages") or [])[-10:]
         answer_messages = [
-            SystemMessage(content="You are BrowsePilot, a helpful AI assistant skilled in browser automation. Answer the user's question directly and concisely."),
+            SystemMessage(content=f"Today's date is {datetime.now(timezone.utc).strftime('%Y-%m-%d')} (UTC). You are BrowsePilot, a helpful AI assistant skilled in browser automation. Answer the user's question directly and concisely."),
             *recent_messages,
             HumanMessage(content=state["task"]),
         ]
@@ -1242,7 +1243,11 @@ async def answer_node(state: AgentState) -> dict:
         # browser_task path: use compressed execution context
         page_contents = _extract_page_contents(state["execution_log"])
 
-        system_prompt = "You are BrowsePilot. Based on the browser execution results below, answer the user's question."
+        current_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        system_prompt = (
+            f"Today's date is {current_date} (UTC). "
+            "You are BrowsePilot. Based on the browser execution results below, answer the user's question."
+        )
         stop_reason = state.get("stop_reason", "")
         if stop_reason:
             system_prompt += (
