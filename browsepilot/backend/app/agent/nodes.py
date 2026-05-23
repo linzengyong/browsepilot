@@ -632,12 +632,35 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
                 classified_tool = None  # trigger full LLM path below
 
     if not classified_tool:
-        tool_selection, usage = await parse_llm_json(
-            llm=llm,
-            messages=[SystemMessage(content=prompt), HumanMessage(content=current_step)],
-            node_name="execute",
-            fallback={"tool": "get_content", "arguments": {}, "step": current_step},
-        )
+        # Path C: full LLM tool selection with bind_tools() for native function calling
+        tools_for_bind = await mcp_client.get_tools_schema()
+        llm_with_tools = llm.bind_tools(tools_for_bind)
+
+        try:
+            response = await llm_with_tools.ainvoke([
+                SystemMessage(content=prompt),
+                HumanMessage(content=current_step),
+            ])
+
+            if hasattr(response, "tool_calls") and response.tool_calls:
+                tc = response.tool_calls[0]
+                tool_selection = {
+                    "tool": tc["name"],
+                    "arguments": tc.get("args", {}),
+                    "step": current_step,
+                }
+                usage = response.usage_metadata
+            else:
+                # No tool_calls — fall back to text-based parsing
+                raise ValueError("No tool_calls in response")
+        except Exception:
+            logger.warning("[execute_node] bind_tools path failed, using text fallback")
+            tool_selection, usage = await parse_llm_json(
+                llm=llm,
+                messages=[SystemMessage(content=prompt), HumanMessage(content=current_step)],
+                node_name="execute",
+                fallback={"tool": "get_content", "arguments": {}, "step": current_step},
+            )
 
     token_usage = accumulate_tokens(state.get("token_usage", {}), usage, "execute")
 
