@@ -15,11 +15,15 @@ async def type_text(element_ref: str, text: str, ctx: Context) -> dict:
     selector_map = _get_selector_map(ctx)
     selector = selector_map.get(element_ref)
     if not selector:
-        raise ToolError(
-            error_type="element_not_found",
-            message=f"元素引用 '{element_ref}' 未在映射表中找到，请先调用 get_page_structure",
-            available_refs=list(selector_map.keys()),
-        )
+        # Fallback: treat element_ref as a raw CSS selector
+        if element_ref and (element_ref.startswith("#") or element_ref.startswith(".") or element_ref.startswith("[")):
+            selector = element_ref
+        else:
+            raise ToolError(
+                error_type="element_not_found",
+                message=f"元素引用 '{element_ref}' 未在映射表中找到，请先调用 get_page_structure",
+                available_refs=list(selector_map.keys()),
+            )
 
     try:
         await page.wait_for_selector(selector, timeout=5000)

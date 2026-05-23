@@ -358,12 +358,20 @@ async def pre_observe_node(state: AgentState, mcp_client) -> dict:
             engine_name = match_search_engine(url)
             if engine_name:
                 engine = SEARCH_ENGINES[engine_name]
+                known_selector = engine["input_selector"]
+                # Find label for known CSS selector via reverse lookup in element_map
+                element_map = page_structure.get("element_map", {})
+                input_label = known_selector  # fallback: use raw selector if label not found
+                for label, selector in element_map.items():
+                    if selector == known_selector and label.startswith("[input:"):
+                        input_label = label
+                        break
                 page_structure["_known_selectors"] = {
-                    "input": engine["input_selector"],
+                    "input": input_label,
                     "search_url_template": engine["search_url_template"],
                 }
-                logger.info("[pre_observe] Known search engine detected: {} (input={})",
-                    engine_name, engine["input_selector"])
+                logger.info("[pre_observe] Known search engine detected: {} (input_ref={})",
+                    engine_name, input_label)
         except Exception as e:
             logger.warning("[pre_observe] Search engine detection failed: {}", e)
 
@@ -415,17 +423,24 @@ async def plan_node(state: AgentState, mcp_client) -> dict:
     page_context = ""
     struct = state.get("page_structure", {})
     if isinstance(struct, dict):
-        s = struct.get("structure", struct) if struct else {}
-        has_elements = s.get("inputs") or s.get("buttons") or s.get("links")
-        if has_elements:
-            page_context = "\n\n=== 当前页面真实结构（基于此生成计划，禁止编造选择器） ===\n"
+        elements = struct.get("elements")
+        if elements:
+            page_context = "\n\n=== 当前页面可用元素（基于此生成计划） ===\n"
             page_context += "页面结构已获取，无需在计划中再次调用 get_page_structure。\n"
-            if s.get("inputs"):
-                page_context += f"输入框: {json.dumps(s['inputs'][:5], ensure_ascii=False)}\n"
-            if s.get("buttons"):
-                page_context += f"按钮: {json.dumps(s['buttons'][:5], ensure_ascii=False)}\n"
-            if s.get("links"):
-                page_context += f"链接: {json.dumps(s['links'][:5], ensure_ascii=False)}\n"
+            page_context += f"元素列表: {json.dumps(elements, ensure_ascii=False)}\n"
+        elif struct.get("structure"):
+            # Legacy format (old session)
+            s = struct["structure"]
+            has_elements = s.get("inputs") or s.get("buttons") or s.get("links")
+            if has_elements:
+                page_context = "\n\n=== 当前页面真实结构（基于此生成计划，禁止编造选择器） ===\n"
+                page_context += "页面结构已获取，无需在计划中再次调用 get_page_structure。\n"
+                if s.get("inputs"):
+                    page_context += f"输入框: {json.dumps(s['inputs'][:5], ensure_ascii=False)}\n"
+                if s.get("buttons"):
+                    page_context += f"按钮: {json.dumps(s['buttons'][:5], ensure_ascii=False)}\n"
+                if s.get("links"):
+                    page_context += f"链接: {json.dumps(s['links'][:5], ensure_ascii=False)}\n"
 
     system_prompt += page_context
 
@@ -514,10 +529,16 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
     recent_context = ""
     for i, entry in enumerate(state["execution_log"]):
         result = entry.get("result", {})
-        if isinstance(result, dict) and result.get("structure"):
-            # Found page structure — extract selectors for the LLM
-            s = result["structure"]
+        if isinstance(result, dict) and result.get("elements"):
+            # New label format
             recent_context += f"\n页面可用元素（来自之前的get_page_structure）：\n"
+            recent_context += f"元素列表: {json.dumps(result['elements'], ensure_ascii=False)}\n"
+            if result.get("summary"):
+                recent_context += f"摘要: {result['summary']}\n"
+        elif isinstance(result, dict) and result.get("structure"):
+            # Legacy format (old session with "structure" field)
+            s = result["structure"]
+            recent_context += f"\n页面可用元素（旧格式）：\n"
             if s.get("inputs"):
                 recent_context += "输入框: " + json.dumps(s["inputs"][:10], ensure_ascii=False) + "\n"
             if s.get("buttons"):
@@ -555,9 +576,9 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
             if classified_tool == "type_text" and known.get("input"):
                 if extracted_args is None:
                     extracted_args = {}
-                extracted_args["selector"] = known["input"]
+                extracted_args["element_ref"] = known["input"]
                 is_complete = True
-                logger.info("[execute_node] Injected known input selector: {}", known["input"])
+                logger.info("[execute_node] Injected known input ref: {}", known["input"])
             elif classified_tool == "click" and known.get("search_url_template"):
                 # Find the search query from the previous type_text step
                 query = ""
@@ -730,16 +751,25 @@ def _run_heuristic_checks(state: AgentState) -> dict:
             }
 
     # Check 4: No interactive elements (page likely broken or blank)
-    structure = last_result.get("structure", {})
-    if isinstance(structure, dict):
-        input_count = len(structure.get("inputs", []))
-        button_count = len(structure.get("buttons", []))
-        if input_count == 0 and button_count == 0 and "get_page_structure" in last_entry.get("tool", ""):
+    elements = last_result.get("elements")
+    if isinstance(elements, dict):
+        if len(elements) == 0 and "get_page_structure" in last_entry.get("tool", ""):
             return {
                 "has_issue": True,
                 "issue_type": "few_elements",
                 "detail": "No interactive elements found — page may be blank or broken",
             }
+    elif last_result.get("structure") is not None:
+        structure = last_result["structure"]
+        if isinstance(structure, dict):
+            input_count = len(structure.get("inputs", []))
+            button_count = len(structure.get("buttons", []))
+            if input_count == 0 and button_count == 0 and "get_page_structure" in last_entry.get("tool", ""):
+                return {
+                    "has_issue": True,
+                    "issue_type": "few_elements",
+                    "detail": "No interactive elements found — page may be blank or broken",
+                }
 
     # Check 5: Click that should trigger navigation but URL didn't change
     if last_entry.get("tool") == "click" and last_entry.get("result", {}).get("status") == "success":
@@ -978,6 +1008,12 @@ def _build_replan_context(state: AgentState):
                 for field in ("inputs", "buttons", "links"):
                     if field in r["structure"] and isinstance(r["structure"][field], list):
                         r["structure"][field] = r["structure"][field][:3]
+            # Truncate elements dict to avoid large label lists in replan
+            if "elements" in r and isinstance(r["elements"], dict):
+                truncated = {}
+                for k, v in list(r["elements"].items())[:10]:
+                    truncated[k] = v
+                r["elements"] = truncated
             e["result"] = r
         truncated_log.append(e)
     text += f"{json.dumps(truncated_log, ensure_ascii=False, indent=2)}\n"

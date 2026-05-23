@@ -157,6 +157,7 @@ async def get_page_structure(ctx: Context) -> dict:
         return {
             "status": "success",
             "elements": elements,
+            "element_map": dict(element_map),
             "summary": f"页面包含 {input_count} 个输入框、{btn_count} 个按钮、{link_count} 个链接",
             "screenshot_path": path,
         }
