@@ -557,6 +557,8 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
                 "Only return the arguments for this tool. "
                 "Return JSON: {\"arguments\": {...}, \"step\": \"...\"}"
             )
+            if classified_tool in ("browser_click", "browser_type") and recent_context:
+                arg_prompt += "\n\nUse the ref values (e.g. e12) from the '页面元素引用' above as the 'target' argument."
             if extracted_args:
                 arg_prompt += f"\nAlready known arguments (do not change): {json.dumps(extracted_args, ensure_ascii=False)}"
             try:
@@ -565,7 +567,7 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
                     messages=[SystemMessage(content=arg_prompt), HumanMessage(content=current_step)],
                     node_name="execute",
                     fallback=None,
-                    max_retries=0,
+                    max_retries=1,
                 )
                 if llm_result and isinstance(llm_result.get("arguments"), dict):
                     if extracted_args:
