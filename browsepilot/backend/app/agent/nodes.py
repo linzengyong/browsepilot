@@ -628,6 +628,22 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
         except Exception as e:
             logger.warning("[execute_node] Tool call failed: {}", e)
             result = {"status": "error", "error": f"tool_call_failed: {str(e)}"}
+
+        # Auto-capture screenshot after page-modifying operations
+        if isinstance(result, dict) and result.get("status") != "error":
+            page_modifying = USE_PLAYWRIGHT_MCP and tool_used in (
+                "browser_navigate", "browser_click", "browser_type", "browser_press_key",
+            )
+            if not USE_PLAYWRIGHT_MCP:
+                page_modifying = tool_used in ("navigate", "click", "type_text", "scroll")
+            if page_modifying:
+                try:
+                    ss_tool = "browser_take_screenshot" if USE_PLAYWRIGHT_MCP else "screenshot"
+                    ss_result = await mcp_client.call_tool(ss_tool, {}, timeout=10.0)
+                    if isinstance(ss_result, dict) and ss_result.get("screenshot_base64"):
+                        result["screenshot_base64"] = ss_result["screenshot_base64"]
+                except Exception:
+                    pass
     else:
         result = {"status": "skipped", "reason": "no_tool_needed"}
 
