@@ -1,6 +1,7 @@
 // frontend-vue/src/stores/chat.ts
 import { defineStore } from 'pinia'
 import type { ChatMessage, AgentPhase, ChatState, SSEEvent } from '@/types'
+import { resumeSession } from '@/api/chat'
 
 export const useChatStore = defineStore('chat', {
   state: (): ChatState => ({
@@ -20,6 +21,7 @@ export const useChatStore = defineStore('chat', {
     isViewingHistory: false,
     turns: [] as Array<{ turn_index: number; task: string }>,
     currentTurnIndex: 0,
+    humanPrompt: '',
   }),
 
   getters: {
@@ -41,6 +43,7 @@ export const useChatStore = defineStore('chat', {
       this.isViewingHistory = false
       this.turns = []
       this.currentTurnIndex = 0
+      this.humanPrompt = ''
     },
 
     dispatchEvent(event: SSEEvent) {
@@ -142,6 +145,11 @@ export const useChatStore = defineStore('chat', {
           this.messages.push({ role: 'assistant', content: `❌ 错误: ${d.message || '未知错误'}` })
           break
 
+        case 'human_intervention_needed':
+          this.phase = 'waiting_human'
+          this.humanPrompt = d.prompt || ''
+          break
+
         default:
           break
       }
@@ -174,6 +182,27 @@ export const useChatStore = defineStore('chat', {
       this.currentStepIndex = 0
       this.totalSteps = 0
       this.isViewingHistory = true
+    },
+
+    setWaitingHuman(prompt: string) {
+      this.phase = 'waiting_human'
+      this.humanPrompt = prompt
+    },
+
+    async resumeChat() {
+      if (!this.sessionId) return
+      this.phase = 'executing'
+      this.processing = true
+
+      try {
+        await resumeSession(this.sessionId, (eventType, data) => {
+          this.dispatchEvent({ event: eventType, data })
+        })
+      } catch (e: any) {
+        this.error = '恢复失败: ' + (e.message || '未知错误')
+      } finally {
+        this.processing = false
+      }
     },
   },
 })

@@ -27,6 +27,9 @@ venv/
 data/
 docs/
 
+# Playwright MCP generated files
+.playwright-mcp/
+
 # Worktrees
 .worktrees/
 

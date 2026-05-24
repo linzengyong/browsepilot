@@ -58,3 +58,8 @@ class SSEData:
     @staticmethod
     def turn_started(turn_index: int) -> dict:
         return {"event": "turn_started", "data": {"turn_index": turn_index}}
+
+    @staticmethod
+    def human_intervention_needed(prompt: str) -> dict:
+        """SSE event: agent needs human help (login, captcha, etc.)."""
+        return {"event": "human_intervention_needed", "data": {"prompt": prompt}}

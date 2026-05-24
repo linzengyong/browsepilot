@@ -1,11 +1,4 @@
-"""MCP client — thin wrapper around fastmcp.Client for agent use.
-
-Note: This wrapper explicitly calls __aenter__/__aexit__ (the protocol methods
-underlying `async with Client(...) as c:`) rather than using the context manager
-syntax. This is intentional — the agent code uses connect()/close() lifecycle
-methods, and fastmcp.Client supports direct __aenter__/__aexit__ calls in v3.3.1.
-"""
-
+"""MCP client — thin wrapper around fastmcp.Client for agent use."""
 import asyncio
 from typing import Any
 from loguru import logger
@@ -13,13 +6,17 @@ from fastmcp import Client
 
 
 class MCPClient:
-    """Thin wrapper around fastmcp.Client for agent compatibility."""
+    """Thin wrapper around fastmcp.Client for agent compatibility.
 
-    def __init__(self, server_config: dict | None = None):
-        self.server_config = server_config or {
-            "type": "streamable-http",
-            "url": "http://localhost:8090/mcp",
-        }
+    server_config must be a dict with at least 'url', e.g.
+    {"type": "streamable-http", "url": "http://localhost:8100/mcp"}.
+    Use config.get_mcp_server_config() to load from mcp_settings.json.
+    """
+
+    def __init__(self, server_config: dict):
+        if not server_config or "url" not in server_config:
+            raise ValueError("server_config must contain 'url'")
+        self.server_config = server_config
         self._client: Client | None = None
         self._tools: list[dict] = []
 
@@ -33,7 +30,7 @@ class MCPClient:
 
     async def connect(self, max_retries: int = 3) -> list[dict]:
         """Connect to MCP server via fastmcp.Client with retry."""
-        url = self.server_config.get("url", "http://localhost:8090/mcp")
+        url = self.server_config["url"]
         last_error = None
         for attempt in range(max_retries):
             try:
@@ -62,17 +59,44 @@ class MCPClient:
         raise RuntimeError(f"MCP connection failed after {max_retries} attempts: {last_error}")
 
     async def call_tool(self, tool_name: str, arguments: dict, timeout: float = 30.0, meta: dict | None = None) -> dict:
-        """Call a tool and return structured result. meta is passed through to the MCP server for observability and context injection (session_id, step_index)."""
+        """Call a tool and return structured result. meta is passed through to the MCP server."""
         if not self._client:
             raise RuntimeError("MCP client not connected")
         kwargs = {"timeout": timeout, "raise_on_error": False}
         if meta:
             kwargs["meta"] = meta
         result = await self._client.call_tool(tool_name, arguments, **kwargs)
+
         if result.is_error:
-            data = result.data if isinstance(result.data, dict) else {}
-            return {"status": "error", "error_type": "tool_error", "message": str(result.content), **data}
-        data = result.data if isinstance(result.data, dict) else {}
+            return {"status": "error", "error_type": "tool_error", "message": str(result.content)}
+
+        # Extract structured data from MCP content items
+        data: dict = {}
+        for item in result.content:
+            item_type = getattr(item, "type", "text")
+            if item_type == "text" and item.text:
+                text = item.text
+                if "```yaml" in text:
+                    parts = text.split("```yaml", 1)
+                    if len(parts) > 1:
+                        yaml_part = parts[1].split("```", 1)[0]
+                        # Only keep ref lines to avoid blowing up context
+                        ref_lines = [l for l in yaml_part.split("\n") if "ref=e" in l]
+                        data["snapshot"] = "\n".join(ref_lines[:30])
+                        data["content"] = parts[0].strip()
+                elif "```" in text:
+                    data["content"] = (data.get("content", "") + "\n" + text).strip()
+                else:
+                    data["content"] = (data.get("content", "") + "\n" + text).strip()
+            elif item_type == "image":
+                img_data = getattr(item, "data", None)
+                if img_data:
+                    data["screenshot_base64"] = img_data
+            elif item_type == "resource":
+                resource_text = getattr(item, "resource", None)
+                if resource_text:
+                    data["content"] = (data.get("content", "") + "\n" + str(resource_text)).strip()
+
         return {"status": "success", **data}
 
     async def close(self) -> None:

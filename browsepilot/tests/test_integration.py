@@ -26,16 +26,16 @@ from backend.app.agent.nodes import classify_tool, TOOL_RULES
 
 CLASSIFIER_CASES = [
     # (step_description, expected_tool_or_None)
-    ("导航到 https://www.bing.com", "navigate"),
-    ("获取页面结构，找到搜索框的选择器", "get_page_structure"),
-    ("在搜索框中输入 2000元手机 推荐", "type_text"),
-    ("点击搜索按钮", "click"),  # regex matches
-    ("获取搜索结果页面内容", "get_content"),
+    ("导航到 https://www.bing.com", "browser_navigate"),
+    ("获取页面结构，找到搜索框的选择器", "browser_snapshot"),
+    ("在搜索框中输入 2000元手机 推荐", "browser_type"),
+    ("点击搜索按钮", "browser_click"),
+    ("获取搜索结果页面内容", "browser_snapshot"),
     ("回到搜索页面重新开始", None),
-    ("截图保存当前页面", "screenshot"),
+    ("截图保存当前页面", "browser_take_screenshot"),
     ("", None),
-    ("Open bing.com and search", "navigate"),
-    ("获取搜索结果结构，提取前3条标题和链接", "get_page_structure"),
+    ("Open bing.com and search", "browser_navigate"),
+    ("获取搜索结果结构，提取前3条标题和链接", "browser_snapshot"),
 ]
 
 @pytest.mark.parametrize("step,expected", CLASSIFIER_CASES)
@@ -47,8 +47,9 @@ def test_classify_tool_boundary(step, expected):
 def test_all_tools_in_rules():
     """Verify all 8 tools are defined."""
     assert set(TOOL_RULES.keys()) == {
-        "navigate", "get_page_structure", "type_text", "click",
-        "get_content", "screenshot", "scroll", "execute_script",
+        "browser_navigate", "browser_snapshot", "browser_type", "browser_click",
+        "browser_wait_for", "browser_take_screenshot", "browser_press_key",
+        "browser_fill_form", "browser_evaluate",
     }
 
 
@@ -64,7 +65,7 @@ def test_classifier_navigate_needs_url():
     the LLM to fill in arguments when the classifier hits.
     """
     result = classify_tool("导航到 https://www.bing.com")
-    assert result == "navigate"
+    assert result == "browser_navigate"
     # classifier itself should NOT return arguments — just the tool name (or None)
 
 

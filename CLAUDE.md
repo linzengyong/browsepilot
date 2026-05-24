@@ -100,3 +100,72 @@ Prefer built-in tools over `python -c "..."` for ad-hoc data exploration — bui
 - When receiving a request, first discuss the solution plan, rather than immediately starting to code.
 - When debugging CSS layout issues (overflow, scrolling, element sizing), always trace the full parent grid/flex height chain from the root container through every intermediate wrapper before changing any single component. Check for auto-sized rows/columns that break height inheritance down the chain.
 - Before pushing to GitHub, verify: (1) README.md is at repository root, (2) stale .md files and doc folders are cleaned, (3) .gitignore excludes data directories, environment files, and generated outputs.
+
+## Lessons Learned (2025-05-25 Playwright MCP Migration)
+
+These are hard-won lessons from a migration that went badly wrong. Re-read before any infrastructure-level change.
+
+### 1. Unit tests ≠ working system
+
+Every test used `AsyncMock` for the MCP client. No test ever connected to a real MCP server, real browser, or verified end-to-end data flow. When the migration broke `call_tool` (reading `result.data` instead of `result.content`), all 66 tests still passed.
+
+**Rule**: After any change to the MCP layer, data format, or tool interface, run a **manual E2E smoke test** — send a real task through the system and verify the browser performs the action. A 30-second manual test would have caught every issue that took 6 hours to debug.
+
+### 2. External service return formats: verify at the boundary, not downstream
+
+Playwright MCP returns data in `result.content` (a list of `TextContent`/`ImageContent` objects), NOT in `result.data` (which is always `None`). The old self-built tools returned data in `result.data`. `MCPClient.call_tool()` was never updated for this difference, so every tool call returned empty data to the agent.
+
+**Rule**: When replacing a service layer, the FIRST thing to check is the return format at the point where your code touches the external service. Read the actual response objects, don't assume they match the old format.
+
+### 3. Proxy/mount patterns break session state
+
+`fastmcp`'s `create_proxy` + `mount` creates a proxy that isolates browser sessions — `browser_navigate` and `browser_snapshot` calls ended up in different browser contexts (snapshot returned `about:blank` after a successful navigate). The only working architecture was backend → direct pool instance, no proxy layer.
+
+**Rule**: If a proxy/mount pattern is used, the FIRST test is: navigate to a page, then snapshot, verify the snapshot shows the same page. Don't proceed until this works.
+
+### 4. Truncate data entering the agent state
+
+Playwright MCP's `browser_snapshot` returns YAML accessibility trees. A search results page produces 71KB of YAML. When stored in `execution_log` (the LangGraph agent state), and the agent calls snapshot 5 times, that's 355KB of state — all serialized between nodes and sent as LLM prompt context. Token usage hit 206K for a single search task.
+
+**Rule**: At the `call_tool` boundary, truncate snapshot data to only what the LLM needs (ref lines, max 30). Never store raw external service output in agent state without trimming.
+
+### 5. One config file per responsibility — no cross-file defaults
+
+Before the cleanup: `mcp_settings.json` had port 8090, `.env` had `MCP_SERVER_PORT=8100`, `mcp_client.py` had a hardcoded `localhost:8090/mcp` fallback, `main.py` had a hardcoded `8090` default, and `vite.config.ts` pointed to `8000`/`8001`/`8002` at various times. Every file had a different idea of what port to use.
+
+**After cleanup**: `mcp_settings.json` is the single source of truth for all MCP client connections. `.env` is for operational config (LLM keys, browser settings, pool sizes). No hardcoded URLs or ports in any Python/TypeScript file.
+
+### 6. Don't change ports to fix problems — kill the process holding the port
+
+During debugging, ports were changed 6+ times (8090→8100→8091→9400→8100...) instead of identifying and killing the process holding the port. On Windows, `taskkill /F /PID <pid>` via `cmd //c` works when bash's `taskkill` doesn't. Port 8090 was permanently unavailable due to a Windows system process using it as an ephemeral source port.
+
+### 7. Browser visibility is a config issue, not a hardcoded flag
+
+The Playwright MCP pool hardcoded `--headless` in the npx args, ignoring `BROWSER_HEADLESS=false` from `.env`. The user expected to see a browser window but got a headless instance. Always wire such flags through the pool constructor and check the env var.
+
+### 8. E2E smoke test checklist for MCP/browser changes
+
+Before declaring any MCP-related change "done", run this:
+
+```bash
+# 1. Start services, send a simple task
+curl -X POST http://localhost:8000/chat/stream \
+  -H "Content-Type: application/json" \
+  -d '{"task":"open bing.com and search test"}'
+
+# 2. Verify from the SSE stream that:
+#    - plan_generated has reasonable steps
+#    - browser_navigate completes (Page URL is correct)
+#    - browser_snapshot returns refs (>0)
+#    - browser_type/browser_click use ref targets (not CSS selectors or descriptions)
+#    - No "error" status in step_end events
+
+# 3. Check backend log:
+#    - "Discovered 23 tools" (correct tool count)
+#    - "Snapshot: N refs" with N>0
+#    - "Screenshot captured" with >0 chars
+#    - No "tool_error" or "error" messages
+
+# 4. Check session file is small (<50KB, not hundreds of KB)
+ls -la browsepilot/data/sessions/ | tail -1
+```

@@ -88,7 +88,8 @@ class SessionManager:
         turns = session.get("turns", [])
         if not turns:
             return
-        turn_fields = {"execution_log", "final_answer", "token_usage", "status"}
+        turn_fields = {"execution_log", "final_answer", "token_usage", "status",
+                        "pending_human_action", "human_prompt", "hitl_triggered_count"}
         turn_update = {k: v for k, v in kwargs.items() if k in turn_fields}
         turns[-1].update(turn_update)
 

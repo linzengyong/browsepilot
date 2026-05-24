@@ -29,3 +29,6 @@ class AgentState(TypedDict):
     page_screenshot: str
     turn_index: int
     session_turns: list[dict]  # past turn summaries, injected by main.py, not persisted
+    pending_human_action: bool         # 是否需要人工干预
+    human_prompt: str                   # 显示给用户的提示信息
+    hitl_triggered_count: int          # 已触发 HITL 次数（resume 后不清零，防止重复触发）

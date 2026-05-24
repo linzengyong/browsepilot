@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BrowsePilot — 一键启动所有服务 (MCP + Backend + Frontend)
+# BrowsePilot — 一键启动所有服务 (MCP Pool + Backend + Frontend)
 # Usage: bash start.sh
 
 set -e
@@ -28,12 +28,12 @@ echo "=========================================="
 echo "  BrowsePilot — 启动所有服务"
 echo "=========================================="
 
-# ---- MCP Server (Port 8090) ----
-echo "[1/3] 启动 MCP Server (port 8090)..."
+# ---- MCP Pool (Playwright MCP on port 9400) ----
+echo "[1/3] 启动 MCP Pool (Playwright MCP)..."
 python -m browser_mcp.main &
 MCP_PID=$!
-sleep 2
-echo "  MCP Server PID: $MCP_PID"
+sleep 3
+echo "  MCP Pool PID: $MCP_PID"
 
 # ---- Backend (Port 8000) ----
 echo "[2/3] 启动 Backend (port 8000)..."
@@ -42,9 +42,9 @@ BACKEND_PID=$!
 sleep 2
 echo "  Backend PID: $BACKEND_PID"
 
-# ---- Frontend (Port 8501) ----
-echo "[3/3] 启动 Frontend (port 8501)..."
-streamlit run frontend/streamlit_app.py --server.port 8501 --server.headless true &
+# ---- Vue3 Frontend (Port 5173) ----
+echo "[3/3] 启动 Frontend (port 5173)..."
+cd frontend-vue && npm run dev &
 FRONTEND_PID=$!
 sleep 3
 echo "  Frontend PID: $FRONTEND_PID"
@@ -52,9 +52,9 @@ echo "  Frontend PID: $FRONTEND_PID"
 echo ""
 echo "=========================================="
 echo "  所有服务已启动"
-echo "  MCP:      http://localhost:8090/sse"
 echo "  Backend:  http://localhost:8000"
-echo "  Frontend: http://localhost:8501"
+echo "  Frontend: http://localhost:5173"
+echo "  (MCP pool on port 9400, no HTTP UI)"
 echo "=========================================="
 echo ""
 echo "按 Ctrl+C 停止所有服务"

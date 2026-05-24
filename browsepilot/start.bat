@@ -26,17 +26,17 @@ if not exist "frontend-vue\node_modules" (
 
 :: ---- Clean ports ----
 echo Cleaning up old processes...
-for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":8090 :8000 :5173" ^| findstr "LISTENING"') do (
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":9400 :8000 :5173" ^| findstr "LISTENING"') do (
     taskkill /pid %%a /f >nul 2>&1
 )
 echo.
 
-:: ---- MCP Server (Port 8090) ----
-echo [1/3] Starting MCP Server...
+:: ---- MCP Pool (Playwright MCP on port 9400) ----
+echo [1/3] Starting MCP Pool ^(Playwright MCP^)...
 start "BrowsePilot-MCP" cmd /k ".venv\Scripts\python.exe -m browser_mcp.main"
-echo   MCP Server started
+echo   MCP Pool started
 
-timeout /t 2 /nobreak >nul
+timeout /t 3 /nobreak >nul
 
 :: ---- Backend (Port 8000) ----
 echo [2/3] Starting Backend...
@@ -52,9 +52,9 @@ echo   Frontend started
 
 echo.
 echo ==========================================
-echo   MCP:      http://localhost:8090/sse
 echo   Backend:  http://localhost:8000
 echo   Frontend: http://localhost:5173
+echo   (MCP pool on port 9400, no HTTP UI)
 echo ==========================================
 echo.
 echo Close each window to stop the service.

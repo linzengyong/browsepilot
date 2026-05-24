@@ -6,7 +6,7 @@ export interface ChatMessage {
   _streaming?: boolean
 }
 
-export type AgentPhase = 'planning' | 'executing' | 'reflecting' | 'replanning' | 'answering'
+export type AgentPhase = 'planning' | 'executing' | 'reflecting' | 'replanning' | 'answering' | 'waiting_human'
 
 export interface SSEEvent {
   event: string
@@ -48,4 +48,5 @@ export interface ChatState {
   tokenEstimated: boolean
   turns: Array<{ turn_index: number; task: string }>
   currentTurnIndex: number
+  humanPrompt: string
 }

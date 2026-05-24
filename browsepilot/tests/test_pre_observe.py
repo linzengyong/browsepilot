@@ -59,7 +59,7 @@ async def test_pre_observe_url_extraction():
 
     # Should have called navigate with the URL from task
     navigate_call = mock_mcp.call_tool.call_args_list[0]
-    assert navigate_call[0][0] == "navigate"
+    assert navigate_call[0][0] in ("navigate", "browser_navigate")
     assert "github.com" in navigate_call[0][1]["url"]
 
 
@@ -99,7 +99,7 @@ async def test_pre_observe_navigate_failure():
 
 @pytest.mark.asyncio
 async def test_pre_observe_vision_disabled_no_screenshot():
-    """vision disabled 时不调用 screenshot."""
+    """Screenshot always captured for UI replay even with vision disabled."""
     mock_mcp = AsyncMock()
     mock_mcp.call_tool.return_value = {"status": "success", "structure": {}}
     state = {"task": "搜索测试"}
@@ -108,6 +108,5 @@ async def test_pre_observe_vision_disabled_no_screenshot():
     settings.llm_vision_enabled = False
 
     result = await pre_observe_node(state, mock_mcp)
-    assert result["page_screenshot"] == ""
-    # Only navigate and get_page_structure, no screenshot
-    assert mock_mcp.call_tool.call_count == 2
+    # Screenshot is always captured now
+    assert mock_mcp.call_tool.call_count == 3

@@ -22,7 +22,10 @@ from backend.app.agent.prompts import (
     REPLAN_PROMPT,
 )
 from backend.app.config import settings
-from browser_mcp.tools.search_engines import match_search_engine, SEARCH_ENGINES
+from backend.app.agent.skill_loader import Skill
+from langgraph.types import interrupt
+
+USE_PLAYWRIGHT_MCP = os.getenv("USE_PLAYWRIGHT_MCP", "false").lower() == "true"
 
 
 def extract_json(text: str) -> str | None:
@@ -63,37 +66,41 @@ def repair_json(candidate: str) -> str:
 # --- Tool scoring classifier ---
 
 TOOL_RULES = {
-    "navigate": {
+    "browser_navigate": {
         "keywords": ["导航到", "访问", "打开", "跳转到"],
         "patterns": [r"https?://\S+", r"[a-z]+\.(com|cn|org)"],
     },
-    "get_page_structure": {
-        "keywords": ["页面结构", "获取结构", "选择器", "CSS", "元素列表"],
-        "patterns": [r"获取.*结构", r"找到.*选择器"],
+    "browser_snapshot": {
+        "keywords": ["页面结构", "获取结构", "快照", "可用的元素", "当前页面状态", "页面内容", "获取内容", "提取"],
+        "patterns": [r"获取.*(快照|结构|元素|内容)", r"当前.*页面"],
     },
-    "type_text": {
+    "browser_type": {
         "keywords": ["输入", "键入", "填写", "搜索"],
         "patterns": [r"在.{0,20}(输入|键入|填写|搜索)"],
     },
-    "click": {
+    "browser_click": {
         "keywords": ["点击", "按下", "提交"],
-        "patterns": [r"点击.{0,20}(按钮|链接|搜索)"],
+        "patterns": [r"点击.{0,20}(按钮|链接|搜索|提交)"],
     },
-    "get_content": {
-        "keywords": ["页面内容", "获取内容", "提取"],
-        "patterns": [r"获取.*(内容|文字|数据)"],
+    "browser_wait_for": {
+        "keywords": ["等待"],
+        "patterns": [r"等待.{0,20}(加载|出现|渲染|完成)"],
     },
-    "screenshot": {
+    "browser_take_screenshot": {
         "keywords": ["截图"],
         "patterns": [r"截图|screenshot"],
     },
-    "scroll": {
-        "keywords": ["滚动", "翻页"],
-        "patterns": [r"滚动|scroll|翻页"],
+    "browser_press_key": {
+        "keywords": ["按键", "按下", "回车", "Enter", "滚动", "翻页"],
+        "patterns": [r"(按下|按键|回车|Enter|滚动|翻页)"],
     },
-    "execute_script": {
-        "keywords": ["脚本", "执行脚本"],
-        "patterns": [r"执行.*脚本|execute_script"],
+    "browser_fill_form": {
+        "keywords": ["填写表单", "表单", "注册", "登录表单"],
+        "patterns": [r"填写.*表单|表单.*填写"],
+    },
+    "browser_evaluate": {
+        "keywords": ["脚本", "执行脚本", "JavaScript"],
+        "patterns": [r"执行.*(脚本|代码|JS)|JavaScript"],
     },
 }
 
@@ -120,58 +127,24 @@ def extract_args(tool: str, step: str) -> tuple[dict | None, bool]:
     """Try to extract arguments for a tool from step description text.
 
     Returns (args_dict_or_None, is_complete).
-    - ({"url": "..."}, True): all required args extracted, skip LLM
-    - ({"text": "..."}, False): partial args, need LLM for remaining
-    - (None, False): nothing extractable, need full LLM
     """
-    if tool == "navigate":
-        m = re.search(r"https?://[^\s]+", step)
+    if tool == "browser_navigate":
+        m = re.search(r"https?://\S+", step)
         if m:
-            return {"url": m.group(0)}, True
-        m = re.search(r"([a-z]+\.(?:com|cn|org)[^\s]*)", step)
+            return ({"url": m.group(0)}, True)
+        m = re.search(r"(?:导航到|打开|访问|跳转到|去)\s*([a-z]+\.[a-z]+(?:\.[a-z]+)?)", step)
         if m:
-            return {"url": "https://" + m.group(0)}, True
-        return None, False
+            return ({"url": "https://" + m.group(1)}, True)
+        return (None, False)
 
-    if tool == "screenshot":
-        return {}, True
+    if tool in ("browser_snapshot", "browser_take_screenshot"):
+        return ({}, True)
 
-    if tool == "get_content":
-        return {}, True
+    if tool in ("browser_click", "browser_type", "browser_wait_for",
+                 "browser_press_key", "browser_fill_form", "browser_evaluate"):
+        return (None, False)
 
-    if tool == "get_page_structure":
-        return {}, True
-
-    if tool == "type_text":
-        # Extract text to type, but selector needs page structure → LLM
-        text = None
-        for pat in [
-            r"输入['“\"‘](.+?)['”\"’]",
-            r'输入["“](.+?)["”]',
-            r"输入['‘](.+?)['’]",
-            r"输入(.+?)(?:$|，|。|,|\.)",
-        ]:
-            m = re.search(pat, step)
-            if m:
-                text = m.group(1).strip()
-                break
-        if text and len(text) <= 200:
-            return {"text": text}, False  # partial: need LLM for selector
-        return None, False  # need full LLM
-
-    if tool == "scroll":
-        direction = "down"
-        if "上" in step or "up" in step.lower():
-            direction = "up"
-        return {"direction": direction}, True
-
-    if tool == "click":
-        return None, False  # always needs LLM for selector
-
-    if tool == "execute_script":
-        return None, False  # always needs LLM for script content
-
-    return None, False
+    return (None, False)
 
 
 def compute_plan_similarity(old_plan: list[str], new_plan: list[str]) -> float:
@@ -344,56 +317,39 @@ async def pre_observe_node(state: AgentState, mcp_client) -> dict:
 
     pre_meta = {"session_id": state.get("session_id", ""), "step_index": -1}
     try:
-        nav_result = await mcp_client.call_tool("navigate", {"url": url}, meta=pre_meta)
+        nav_result = await mcp_client.call_tool("browser_navigate" if USE_PLAYWRIGHT_MCP else "navigate", {"url": url}, meta=pre_meta)
         if isinstance(nav_result, dict) and nav_result.get("status") == "error":
             logger.warning("[pre_observe] Navigate failed: {}", nav_result.get("error", ""))
     except Exception as e:
         logger.warning("[pre_observe] Navigate exception: {}", e)
 
     try:
-        struct_result = await mcp_client.call_tool("get_page_structure", {}, meta=pre_meta)
+        struct_result = await mcp_client.call_tool("browser_snapshot" if USE_PLAYWRIGHT_MCP else "get_page_structure", {}, meta=pre_meta)
         if isinstance(struct_result, dict):
             page_structure = struct_result
-            s = struct_result.get("structure", struct_result)
-            if isinstance(s, dict):
-                logger.info("[pre_observe] Structure: {} inputs, {} buttons, {} links",
-                    len(s.get("inputs", [])), len(s.get("buttons", [])), len(s.get("links", [])))
+            if USE_PLAYWRIGHT_MCP:
+                snap = struct_result.get("snapshot", "")
+                ref_count = snap.count("[ref=e") if snap else 0
+                logger.info("[pre_observe] Snapshot: {} refs", ref_count)
+            else:
+                s = struct_result.get("structure", struct_result)
+                if isinstance(s, dict):
+                    logger.info("[pre_observe] Structure: {} inputs, {} buttons, {} links",
+                        len(s.get("inputs", [])), len(s.get("buttons", [])), len(s.get("links", [])))
     except Exception as e:
         logger.warning("[pre_observe] get_page_structure exception: {}", e)
 
-    # Detect known search engines and inject verified selectors + search URL template.
-    # The input_selector bypasses LLM for type_text; the search URL template replaces
-    # unreliable button clicks with direct navigation to search results.
-    if page_structure:
-        try:
-            engine_name = match_search_engine(url)
-            if engine_name:
-                engine = SEARCH_ENGINES[engine_name]
-                known_selector = engine["input_selector"]
-                # Find label for known CSS selector via reverse lookup in element_map
-                element_map = page_structure.get("element_map", {})
-                input_label = known_selector  # fallback: use raw selector if label not found
-                for label, selector in element_map.items():
-                    if selector == known_selector and label.startswith("[input:"):
-                        input_label = label
-                        break
-                page_structure["_known_selectors"] = {
-                    "input": input_label,
-                    "search_url_template": engine["search_url_template"],
-                }
-                logger.info("[pre_observe] Known search engine detected: {} (input_ref={})",
-                    engine_name, input_label)
-        except Exception as e:
-            logger.warning("[pre_observe] Search engine detection failed: {}", e)
-
-    if settings.llm_vision_enabled:
-        try:
-            img_result = await mcp_client.call_tool("screenshot", {}, meta=pre_meta)
-            if isinstance(img_result, dict) and img_result.get("screenshot_base64"):
-                page_screenshot = img_result["screenshot_base64"]
+    # Always capture screenshot for UI replay (not just LLM vision)
+    screenshot_tool = "browser_take_screenshot" if USE_PLAYWRIGHT_MCP else "screenshot"
+    try:
+        img_result = await mcp_client.call_tool(screenshot_tool, {}, meta=pre_meta)
+        if isinstance(img_result, dict):
+            raw = img_result.get("raw_image") or img_result.get("data") or img_result.get("screenshot_base64")
+            if raw:
+                page_screenshot = raw if isinstance(raw, str) else base64.b64encode(raw).decode()
                 logger.info("[pre_observe] Screenshot captured ({} chars)", len(page_screenshot))
-        except Exception as e:
-            logger.warning("[pre_observe] Screenshot exception: {}", e)
+    except Exception as e:
+        logger.warning("[pre_observe] Screenshot exception: {}", e)
 
     return {
         "page_structure": page_structure,
@@ -454,6 +410,12 @@ async def plan_node(state: AgentState, mcp_client) -> dict:
                     page_context += f"链接: {json.dumps(s['links'][:5], ensure_ascii=False)}\n"
 
     system_prompt += page_context
+
+    # Skill injection (progressive disclosure)
+    system_prompt += "\n\n" + Skill.get_listing()
+    matched = Skill.match(state["task"])
+    if matched:
+        system_prompt += "\n\n" + Skill.format_matched(matched)
 
     human_input = state["task"]
     human_content = human_input
@@ -536,12 +498,16 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
         for t in tools
     )
 
-    # Build context from recent execution results (especially get_page_structure output)
+    # Build context from recent execution results (especially get_page_structure / browser_snapshot output)
     recent_context = ""
     for i, entry in enumerate(state["execution_log"]):
         result = entry.get("result", {})
-        if isinstance(result, dict) and result.get("elements"):
-            # New label format
+        if isinstance(result, dict) and result.get("snapshot"):
+            recent_context += "\n页面元素引用（来自 browser_snapshot）：\n"
+            recent_context += result["snapshot"]
+            recent_context += "\n"
+        elif isinstance(result, dict) and result.get("elements"):
+            # New label format (legacy get_page_structure)
             recent_context += f"\n页面可用元素（来自之前的get_page_structure）：\n"
             recent_context += f"元素列表: {json.dumps(result['elements'], ensure_ascii=False)}\n"
             if result.get("summary"):
@@ -580,32 +546,6 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
         logger.info("[execute_node] Classifier selected: {} (score >= {})", classified_tool, settings.tool_classify_threshold)
         extracted_args, is_complete = extract_args(classified_tool, current_step)
 
-        # Known search engine optimization: inject verified selectors for type_text,
-        # and replace unreliable button clicks with direct navigation to search URL.
-        if classified_tool in ("type_text", "click") and not is_complete:
-            known = state.get("page_structure", {}).get("_known_selectors", {})
-            if classified_tool == "type_text" and known.get("input"):
-                if extracted_args is None:
-                    extracted_args = {}
-                extracted_args["element_ref"] = known["input"]
-                is_complete = True
-                logger.info("[execute_node] Injected known input ref: {}", known["input"])
-            elif classified_tool == "click" and known.get("search_url_template"):
-                # Find the search query from the previous type_text step
-                query = ""
-                for entry in reversed(state.get("execution_log", [])):
-                    if entry.get("tool") == "type_text":
-                        query = entry.get("result", {}).get("arguments", {}).get("text", "")
-                        if not query:
-                            query = entry.get("step", "")
-                        break
-                if query:
-                    search_url = known["search_url_template"].format(query=query)
-                    extracted_args = {"url": search_url}
-                    is_complete = True
-                    classified_tool = "navigate"
-                    logger.info("[execute_node] Replaced click with navigate to search URL: {}", search_url)
-
         if extracted_args is not None and is_complete:
             # All args extracted from step text — skip LLM entirely
             tool_selection = {"tool": classified_tool, "arguments": extracted_args, "step": current_step}
@@ -632,7 +572,7 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
                         llm_result["arguments"] = {**extracted_args, **llm_result["arguments"]}
                     merged_args = llm_result.get("arguments", {})
                     # Validate: tools that require args must get non-empty args
-                    REQUIRES_ARGS = {"click", "type_text", "navigate", "execute_script"}
+                    REQUIRES_ARGS = {"browser_click", "browser_type", "browser_navigate", "browser_evaluate"}
                     if classified_tool in REQUIRES_ARGS and not merged_args:
                         raise ValueError(f"{classified_tool} requires arguments but LLM returned empty dict")
                     tool_selection = {"tool": classified_tool, "arguments": merged_args, "step": llm_result.get("step", current_step)}
@@ -669,7 +609,7 @@ async def execute_node(state: AgentState, mcp_client, tools: list) -> dict:
                 llm=llm,
                 messages=[SystemMessage(content=prompt), HumanMessage(content=current_step)],
                 node_name="execute",
-                fallback={"tool": "get_content", "arguments": {}, "step": current_step},
+                fallback={"tool": "browser_snapshot" if USE_PLAYWRIGHT_MCP else "get_content", "arguments": {}, "step": current_step},
             )
 
     token_usage = accumulate_tokens(state.get("token_usage", {}), usage, "execute")
@@ -742,7 +682,7 @@ def _run_heuristic_checks(state: AgentState) -> dict:
         return {"has_issue": False, "issue_type": None, "detail": ""}
 
     # Check 1: Page content too short — only for get_content tool
-    if last_entry.get("tool") == "get_content":
+    if last_entry.get("tool") == ("browser_snapshot" if USE_PLAYWRIGHT_MCP else "get_content"):
         content_text = last_result.get("result", last_result.get("content", ""))
         if isinstance(content_text, str) and content_text.strip():
             # Strip HTML tags for meaningful text length check
@@ -789,7 +729,7 @@ def _run_heuristic_checks(state: AgentState) -> dict:
     # Check 4: No interactive elements (page likely broken or blank)
     elements = last_result.get("elements")
     if isinstance(elements, dict):
-        if len(elements) == 0 and "get_page_structure" in last_entry.get("tool", ""):
+        if len(elements) == 0 and ("browser_snapshot" if USE_PLAYWRIGHT_MCP else "get_page_structure") in last_entry.get("tool", ""):
             return {
                 "has_issue": True,
                 "issue_type": "few_elements",
@@ -800,7 +740,7 @@ def _run_heuristic_checks(state: AgentState) -> dict:
         if isinstance(structure, dict):
             input_count = len(structure.get("inputs", []))
             button_count = len(structure.get("buttons", []))
-            if input_count == 0 and button_count == 0 and "get_page_structure" in last_entry.get("tool", ""):
+            if input_count == 0 and button_count == 0 and ("browser_snapshot" if USE_PLAYWRIGHT_MCP else "get_page_structure") in last_entry.get("tool", ""):
                 return {
                     "has_issue": True,
                     "issue_type": "few_elements",
@@ -808,7 +748,7 @@ def _run_heuristic_checks(state: AgentState) -> dict:
                 }
 
     # Check 5: Click that should trigger navigation but URL didn't change
-    if last_entry.get("tool") == "click" and last_entry.get("result", {}).get("status") == "success":
+    if last_entry.get("tool") == ("browser_click" if USE_PLAYWRIGHT_MCP else "click") and last_entry.get("result", {}).get("status") == "success":
         step_text = last_entry.get("step", "")
         nav_keywords = ("搜索", "提交", "跳转", "登录", "注册", "登录", "确认", "submit", "login", "search", "进入", "下一页")
         if any(kw in step_text for kw in nav_keywords):
@@ -958,6 +898,65 @@ If no viable alternative exists, select answer."""
     return result
 
 
+_HITL_HEADLESS_STOP = {
+    "plan": [], "need_replan": False,
+    "stop_reason": "检测到需要登录验证的网站。当前运行在 headless 模式下，无法进行人工干预。请在 .env 中设置 BROWSER_HEADLESS=false 后重试。"
+}
+
+
+def _hitl_navigate_hit(state: AgentState) -> dict | None:
+    """Check if last navigate hit a login/captcha wall."""
+    last_entry = state["execution_log"][-1] if state.get("execution_log") else None
+    if not last_entry:
+        return None
+    if last_entry.get("tool") != ("browser_navigate" if USE_PLAYWRIGHT_MCP else "navigate"):
+        return None
+    result = last_entry.get("result", {})
+    issues = result.get("detected_issues", []) if isinstance(result, dict) else []
+    if not any(issue in issues for issue in ["login_wall", "captcha"]):
+        return None
+    if settings.browser_headless:
+        return _HITL_HEADLESS_STOP
+    logger.info("[reflect_node] HITL triggered: detected {}", issues)
+    return {
+        "plan": [], "need_replan": False,
+        "pending_human_action": True,
+        "human_prompt": "检测到登录验证页面。请在浏览器中手动完成登录后，点击'继续'按钮恢复任务。",
+        "hitl_triggered_count": state.get("hitl_triggered_count", 0) + 1,
+    }
+
+
+def _hitl_verify_redirect(state: AgentState) -> dict | None:
+    """Check for repeated verify/captcha/challenge URL redirects."""
+    last_entry = state["execution_log"][-1] if state.get("execution_log") else None
+    if not last_entry:
+        return None
+    tool = last_entry.get("tool")
+    nav_tool = "browser_navigate" if USE_PLAYWRIGHT_MCP else "navigate"
+    click_tool = "browser_click" if USE_PLAYWRIGHT_MCP else "click"
+    if tool not in (nav_tool, click_tool):
+        return None
+    url = last_entry.get("result", {}).get("url_after", "")
+    if not isinstance(url, str) or not any(kw in url.lower() for kw in ["verify", "captcha", "challenge", "login"]):
+        return None
+    verify_count = sum(
+        1 for e in state["execution_log"]
+        if isinstance(e.get("result", {}).get("url_after", ""), str)
+        and any(kw in e["result"]["url_after"].lower() for kw in ["verify", "captcha", "challenge"])
+    )
+    if verify_count < 2:
+        return None
+    if settings.browser_headless:
+        return _HITL_HEADLESS_STOP
+    logger.info("[reflect_node] HITL triggered: repeated verify URL ({})", verify_count)
+    return {
+        "plan": [], "need_replan": False,
+        "pending_human_action": True,
+        "human_prompt": "连续跳转到验证页面，怀疑需要人工完成验证。请在浏览器中处理后点击'继续'。",
+        "hitl_triggered_count": state.get("hitl_triggered_count", 0) + 1,
+    }
+
+
 async def reflect_node(state: AgentState) -> dict:
     """Analyze the last execution result and decide next action (two-level reflection)."""
     logger.info("[reflect_node] Reflecting on execution...")
@@ -985,6 +984,12 @@ async def reflect_node(state: AgentState) -> dict:
         logger.warning("[reflect_node] Total step limit reached: {} total steps", total_steps_all)
         return {"plan": [], "need_replan": False,
                 "stop_reason": f"总计已执行 {total_steps_all} 步，达到全局上限，按照现有搜集到的材料组织回答"}
+
+    # --- HITL detection ---
+    if state.get("hitl_triggered_count", 0) == 0:
+        hitl_result = _hitl_navigate_hit(state) or _hitl_verify_redirect(state)
+        if hitl_result:
+            return hitl_result
 
     # Level 1: Heuristic check on last step (code-level, zero LLM cost)
     heuristic_result = _run_heuristic_checks(state)
@@ -1235,7 +1240,17 @@ def _extract_page_contents(execution_log: list) -> list[str]:
 
 
 async def answer_node(state: AgentState) -> dict:
-    """Prepare answer messages. Actual LLM streaming happens in main.py."""
+    """Prepare answer context. If HITL is pending, interrupts execution."""
+    # HITL: pause execution for human intervention
+    if state.get("pending_human_action"):
+        logger.info("[answer_node] HITL: interrupting for human action")
+        interrupt(state["human_prompt"])
+        logger.info("[answer_node] HITL: resumed after human action")
+        return {
+            "pending_human_action": False,
+            "human_prompt": "",
+        }
+
     logger.info("[answer_node] Preparing answer context...")
 
     if not state.get("execution_log"):

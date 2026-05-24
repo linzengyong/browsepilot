@@ -23,8 +23,18 @@ from backend.app.agent.graph import build_graph
 from backend.app.agent.state import AgentState
 from backend.app.events import SSEData
 from backend.app.session_manager import SessionManager
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
 
 session_manager = SessionManager(max_active_sessions=settings.max_active_sessions)
+
+# Shared checkpointer for HITL interrupt/resume support
+_checkpointer = MemorySaver()
+
+
+async def _sse_wrap(async_gen):
+    async for event in async_gen:
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
 @asynccontextmanager
@@ -93,6 +103,9 @@ async def chat_stream(request: Request):
                         final_answer=accumulated_state.get("final_answer", ""),
                         token_usage=accumulated_state.get("token_usage", {}),
                         status="failed",
+                        pending_human_action=accumulated_state.get("pending_human_action", False),
+                        human_prompt=accumulated_state.get("human_prompt", ""),
+                        hitl_triggered_count=accumulated_state.get("hitl_triggered_count", 0),
                     )
                     session_manager.persist(session_id)
             except Exception:
@@ -103,7 +116,7 @@ async def chat_stream(request: Request):
                 pass
 
         try:
-            graph = build_graph(mcp_client, lazy_mcp=True)
+            graph = build_graph(mcp_client, lazy_mcp=True, checkpointer=_checkpointer)
             # MCP will be connected lazily when classify routes to browser_task
 
             # If resuming an existing session, restore its full state
@@ -139,6 +152,9 @@ async def chat_stream(request: Request):
                     "stagnation_warning": False,
                     "completion_check_count": history.get("completion_check_count", 0),
                     "plan_step_count": 0,
+                    "pending_human_action": last_turn.get("pending_human_action", False),
+                    "human_prompt": last_turn.get("human_prompt", ""),
+                    "hitl_triggered_count": last_turn.get("hitl_triggered_count", 0),
                     "page_structure": history.get("page_structure", {}),
                     "page_screenshot": history.get("page_screenshot", ""),
                     "turn_index": turn.get("turn_index", 0) if turn else 0,
@@ -161,6 +177,9 @@ async def chat_stream(request: Request):
                     "final_answer": "",
                     "total_steps": 0,
                     "plan_step_count": 0,
+                    "pending_human_action": False,
+                    "human_prompt": "",
+                    "hitl_triggered_count": 0,
                     "page_structure": {},
                     "page_screenshot": "",
                     "token_usage": {"prompt": 0, "completion": 0, "breakdown": {}},
@@ -252,6 +271,9 @@ async def chat_stream(request: Request):
                         yield SSEData.thinking_status("reflecting", "正在反思执行结果...")
                         decision = "replan" if node_output.get("need_replan") else "success"
                         yield SSEData.reflection(decision, "")
+                        # HITL: if human intervention is needed, notify frontend
+                        if node_output.get("pending_human_action"):
+                            yield SSEData.human_intervention_needed(node_output.get("human_prompt", ""))
 
                     elif node_name == "replan":
                         yield SSEData.thinking_status("replanning", "正在重新规划替代方案...")
@@ -311,13 +333,18 @@ async def chat_stream(request: Request):
 
             # Persist session using accumulated state
             if accumulated_state:
+                is_hitl = accumulated_state.get("pending_human_action", False)
                 session_manager.update_current_turn(session_id,
                     execution_log=accumulated_state.get("execution_log", []),
                     final_answer=accumulated_state.get("final_answer", ""),
                     token_usage=accumulated_state.get("token_usage", {}),
-                    status="completed",
+                    status="paused" if is_hitl else "completed",
+                    pending_human_action=is_hitl,
+                    human_prompt=accumulated_state.get("human_prompt", ""),
+                    hitl_triggered_count=accumulated_state.get("hitl_triggered_count", 0),
                 )
-            session_manager.persist(session_id)
+            if not accumulated_state or not accumulated_state.get("pending_human_action"):
+                session_manager.persist(session_id)
 
             # Close MCP connection promptly (don't wait for TTL)
             await mcp_client.close()
@@ -339,12 +366,90 @@ async def chat_stream(request: Request):
             yield SSEData.error(str(e))
             await _cleanup_session()
 
-    async def sse_formatted_generator():
-        async for event in event_generator():
-            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+    return StreamingResponse(
+        _sse_wrap(event_generator()),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/chat/resume")
+async def resume_chat(request: Request):
+    """Resume a paused agent session after human intervention."""
+    body = await request.json()
+    session_id = body.get("session_id", "")
+    if not session_id:
+        return JSONResponse(content={"error": "session_id is required"}, status_code=400)
+
+    config = {"configurable": {"thread_id": session_id}, "recursion_limit": 100}
+    mcp_client = MCPClient(get_mcp_server_config("browser-mcp"))
+
+    async def event_generator():
+        try:
+            graph = build_graph(mcp_client, lazy_mcp=True, checkpointer=_checkpointer)
+
+            async for event in graph.astream(Command(resume="continue"), config):
+                if isinstance(event, dict):
+                    node_name = list(event.keys())[0] if event else ""
+                    node_data = event.get(node_name, {})
+
+                    # Handle answer_node streaming output (reuse /chat/stream pattern)
+                    if node_name == "answer" and isinstance(node_data, dict):
+                        answer_messages = node_data.get("answer_messages", [])
+                        if answer_messages:
+                            from backend.app.agent.nodes import get_llm
+                            llm = get_llm()
+                            yield SSEData.thinking_status("answering", "正在生成最终回答...")
+                            async for chunk in llm.astream(answer_messages):
+                                if hasattr(chunk, 'content') and chunk.content:
+                                    yield SSEData.answer_chunk(chunk.content)
+                            yield SSEData.thinking_status("done", "已完成")
+
+                    # Send token usage updates
+                    if isinstance(node_data, dict):
+                        token_usage = node_data.get("token_usage", {})
+                        if token_usage:
+                            yield SSEData.token_update(
+                                token_usage.get("prompt", 0), token_usage.get("completion", 0)
+                            )
+
+                    # Check for new HITL request during resume
+                    if isinstance(node_data, dict) and node_data.get("pending_human_action"):
+                        yield SSEData.human_intervention_needed(node_data.get("human_prompt", ""))
+
+            yield SSEData.thinking_status("done", "已完成")
+
+        except Exception as e:
+            logger.error(f"Resume stream error: {e}")
+            yield SSEData.error(str(e))
+        finally:
+            # Persist state after resume
+            try:
+                state_snapshot = graph.get_state(config)
+                if state_snapshot and state_snapshot.values:
+                    sv = state_snapshot.values
+                    status = sv.get("stop_reason", "completed") if sv.get("stop_reason") else "completed"
+                    session_manager.update_current_turn(
+                        session_id,
+                        execution_log=sv.get("execution_log", []),
+                        final_answer=sv.get("final_answer", ""),
+                        token_usage=sv.get("token_usage", {}),
+                        status=status,
+                        pending_human_action=sv.get("pending_human_action", False),
+                        human_prompt=sv.get("human_prompt", ""),
+                        hitl_triggered_count=sv.get("hitl_triggered_count", 0),
+                    )
+                    await session_manager.persist(session_id)
+            except Exception as e:
+                logger.warning(f"Failed to persist session after resume: {e}")
+            await mcp_client.close()
 
     return StreamingResponse(
-        sse_formatted_generator(),
+        _sse_wrap(event_generator()),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

@@ -1,6 +1,25 @@
 <!-- frontend-vue/src/components/ChatPanel.vue -->
 <template>
   <div class="flex flex-col h-full min-h-0">
+    <!-- HITL banner -->
+    <div v-if="store.phase === 'waiting_human'"
+         class="bg-amber-50 border-b border-amber-300 px-4 py-3">
+      <div class="flex items-center justify-between">
+        <div class="flex items-center gap-2">
+          <span class="text-amber-600 text-sm">⏸</span>
+          <div>
+            <p class="text-amber-800 font-semibold text-sm">等待人工操作</p>
+            <p class="text-amber-600 text-xs mt-0.5">{{ store.humanPrompt }}</p>
+          </div>
+        </div>
+        <button @click="store.resumeChat()"
+                :disabled="store.processing"
+                class="bg-amber-500 text-white px-4 py-1.5 rounded text-sm hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
+          继续
+        </button>
+      </div>
+    </div>
+
     <!-- Messages area -->
     <div ref="scrollRef" class="flex-1 min-h-0 overflow-y-auto px-4">
       <div

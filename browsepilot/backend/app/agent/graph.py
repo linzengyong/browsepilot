@@ -14,7 +14,7 @@ from backend.app.agent.nodes import (
 from backend.app.mcp_client import MCPClient
 
 
-def build_graph(mcp_client: MCPClient, lazy_mcp: bool = False):
+def build_graph(mcp_client: MCPClient, lazy_mcp: bool = False, checkpointer=None):
     """Build and compile the BrowsePilot agent StateGraph."""
     workflow = StateGraph(AgentState)
 
@@ -82,7 +82,7 @@ def build_graph(mcp_client: MCPClient, lazy_mcp: bool = False):
         },
     )
 
-    return workflow.compile(checkpointer=MemorySaver())
+    return workflow.compile(checkpointer=checkpointer or MemorySaver())
 
 
 def _route_classify(state: AgentState) -> str:
