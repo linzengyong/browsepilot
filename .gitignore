@@ -36,6 +36,12 @@ docs/
 # Superpowers
 .superpowers/
 
+# Personal documents (not for public repo)
+简历.md
+面试冲刺计划.md
+browsepilot/*.yml
+browsepilot/*.yaml
+
 # OS
 .DS_Store
 Thumbs.db
