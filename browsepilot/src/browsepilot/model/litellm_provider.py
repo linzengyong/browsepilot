@@ -5,10 +5,19 @@
 """
 from __future__ import annotations
 
+import json
 from typing import Any, AsyncIterator
+
+from loguru import logger
+from pydantic import ValidationError
 
 from browsepilot.model.messages import ChatResult, Cost, Message, Usage, UsageInfo
 from browsepilot.model.provider import ModelProvider
+from browsepilot.model.structured import (
+    StructuredOutputError,
+    schema_for,
+    tool_spec_for,
+)
 
 
 class LiteLLMProvider:
@@ -93,9 +102,30 @@ class LiteLLMProvider:
         model: str | None = None,
         max_retries: int = 3,
     ) -> BaseModel:
-        """Structured output — declared for the ModelProvider protocol.
+        import litellm
 
-        Full implementation lands in T5 (forced tool calling + Pydantic
-        validation + retry, see model/structured.py).
-        """
-        raise NotImplementedError("structured() is implemented in T5")
+        schema_dict = schema_for(schema)
+        tool = tool_spec_for(schema_dict)
+        msgs = [m.to_openai() for m in messages]
+        last_error: Exception | None = None
+        for attempt in range(max_retries):
+            resp = await litellm.acompletion(
+                model=model or self.model,
+                messages=msgs,
+                tools=[tool],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": tool["function"]["name"]},
+                },
+                **self._kwargs(),
+            )
+            try:
+                call = resp.choices[0].message.tool_calls[0].function
+                data = json.loads(call.arguments)
+                return schema(**data)
+            except (IndexError, AttributeError, json.JSONDecodeError, ValidationError) as exc:
+                last_error = exc
+                logger.warning("structured attempt {} failed: {}", attempt + 1, exc)
+        raise StructuredOutputError(
+            f"structured output failed after {max_retries} attempts: {last_error}"
+        )
