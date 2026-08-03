@@ -1,0 +1,7 @@
+id: p0-read-page
+name: 网页内容获取（Tier2）
+prompt: "打开 https://www.python.org 告诉我页面主要内容"
+tier: tier2
+checks:
+  - type: contains_keyword
+    keywords: ["Python"]

@@ -1,0 +1,11 @@
+id: p0-weather
+name: 天气查询（Tier1，必须 100% 可靠）
+prompt: "北京今天天气怎么样？"
+tier: tier1
+checks:
+  - type: field
+    field: city
+    expected: "北京"
+  - type: field
+    field: temperature_c
+    kind: number

@@ -1,0 +1,7 @@
+id: p0-search
+name: 搜索结果提取（Tier1）
+prompt: "搜索一下 Python 3.13 正式发布时间"
+tier: tier1
+checks:
+  - type: contains_keyword
+    keywords: ["2024"]
