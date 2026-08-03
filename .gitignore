@@ -27,6 +27,10 @@ venv/
 data/
 docs/
 
+# V2 docs are planned deliverables (keep versioned)
+!browsepilot/docs/
+!browsepilot/docs/**
+
 # Playwright MCP generated files
 .playwright-mcp/
 
