@@ -21,6 +21,9 @@ dependencies = [
     "fastmcp>=3.3",
     "jieba>=0.42",
     "aiofiles>=25.0",
+    "litellm>=1.40",
+    "ddgs>=8.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +33,7 @@ dev = [
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["browser_mcp", "backend", "frontend"]
+packages = ["src/browsepilot", "browser_mcp", "backend", "frontend"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
@@ -39,3 +42,7 @@ default = true
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
