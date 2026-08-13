@@ -20,6 +20,24 @@ from browsepilot.model.structured import (
 )
 
 
+def to_openai_messages(messages: list[Message]) -> list[dict[str, Any]]:
+    """Serialize unified messages to LiteLLM's OpenAI-style wire format.
+
+    Kept in the adapter (not on Message) so the unified model stays
+    provider-neutral: the wire format is a LiteLLM contract, not part of
+    the message's meaning.
+    """
+    out: list[dict[str, Any]] = []
+    for m in messages:
+        item: dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.tool_call_id is not None:
+            item["tool_call_id"] = m.tool_call_id
+        if m.name is not None:
+            item["name"] = m.name
+        out.append(item)
+    return out
+
+
 class LiteLLMProvider:
     def __init__(
         self,
@@ -65,7 +83,7 @@ class LiteLLMProvider:
 
         resp = await litellm.acompletion(
             model=model or self.model,
-            messages=[m.to_openai() for m in messages],
+            messages=to_openai_messages(messages),
             **self._kwargs(),
         )
         text = resp.choices[0].message.content or ""
@@ -82,7 +100,7 @@ class LiteLLMProvider:
 
         stream = await litellm.acompletion(
             model=model or self.model,
-            messages=[m.to_openai() for m in messages],
+            messages=to_openai_messages(messages),
             stream=True,
             **self._kwargs(),
         )
@@ -106,7 +124,7 @@ class LiteLLMProvider:
 
         schema_dict = schema_for(schema)
         tool = tool_spec_for(schema_dict)
-        msgs = [m.to_openai() for m in messages]
+        msgs = to_openai_messages(messages)
         last_error: Exception | None = None
         for attempt in range(max_retries):
             resp = await litellm.acompletion(

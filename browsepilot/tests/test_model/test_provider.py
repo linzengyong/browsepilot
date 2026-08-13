@@ -5,7 +5,18 @@ import pytest
 
 from browsepilot.model.messages import Message
 from browsepilot.model.provider import ModelProvider
-from browsepilot.model.litellm_provider import LiteLLMProvider
+from browsepilot.model.litellm_provider import LiteLLMProvider, to_openai_messages
+
+
+def test_to_openai_messages_serializes_user():
+    assert to_openai_messages([Message(role="user", content="你好")]) == [
+        {"role": "user", "content": "你好"}
+    ]
+
+
+def test_to_openai_messages_includes_tool_call_id():
+    out = to_openai_messages([Message(role="tool", content="ok", tool_call_id="call_1")])
+    assert out == [{"role": "tool", "content": "ok", "tool_call_id": "call_1"}]
 
 
 class _FakeUsage:

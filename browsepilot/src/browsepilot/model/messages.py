@@ -1,7 +1,9 @@
 """Unified message / usage / cost models (model layer, pi-ai equivalent).
 
 Owned by the model layer. Nothing above this layer may depend on a
-provider-specific format (OpenAI/Anthropic/...) directly.
+provider-specific format (OpenAI/Anthropic/...) directly — wire-format
+serialization lives in the provider adapters
+(see browsepilot.model.litellm_provider.to_openai_messages).
 """
 from __future__ import annotations
 
@@ -38,14 +40,6 @@ class Message(BaseModel):
     content: str = ""
     tool_call_id: str | None = None
     name: str | None = None
-
-    def to_openai(self) -> dict:
-        out: dict = {"role": self.role, "content": self.content}
-        if self.tool_call_id is not None:
-            out["tool_call_id"] = self.tool_call_id
-        if self.name is not None:
-            out["name"] = self.name
-        return out
 
 
 class ChatResult(BaseModel):
