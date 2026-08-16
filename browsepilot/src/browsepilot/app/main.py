@@ -57,13 +57,19 @@ def create_app(
         """执行一个用户任务，SSE 返回阶段事件与最终回答。"""
         async def gen():
             yield _sse({"type": "phase", "phase": "start", "task": req.task[:100]})
-            result = await run_task(
-                req.task,
-                provider=provider,
-                executor=executor,
-                tracer=tracer,
-                session_id=req.session_id,
-            )
+            try:
+                result = await run_task(
+                    req.task,
+                    provider=provider,
+                    executor=executor,
+                    tracer=tracer,
+                    session_id=req.session_id,
+                )
+            except Exception as exc:
+                logger.exception("chat stream failed for task {!r}", req.task[:100])
+                yield _sse({"type": "error", "message": f"任务执行失败：{exc}"})
+                yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
+                return
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
             yield _sse({"type": "done", "stop_reason": result.get("stop_reason", ""),
                         "result_data": result.get("result_data", {})})

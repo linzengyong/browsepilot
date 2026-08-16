@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from browsepilot.agent.tools import ToolResult, ToolSpec
@@ -24,6 +26,11 @@ class FakeProvider:
         if "url" in schema.model_fields:
             return schema(url="https://example.com")
         return schema()
+
+
+class RaisingProvider:
+    async def chat(self, messages, *, model=None):
+        raise RuntimeError("boom")
 
 
 class FakeExecutor:
@@ -77,10 +84,38 @@ def test_chat_stream_endpoint(tmp_path):
     client = TestClient(app)
     with client.stream("POST", "/chat/stream", json={"task": "北京今天天气怎么样？"}) as resp:
         assert resp.status_code == 200
-        events = [line for line in resp.iter_lines() if line.startswith("data: ")]
-        joined = "\n".join(events)
-        assert '"type": "answer"' in joined
-        assert '"type": "done"' in joined
+        events = [json.loads(line[len("data: "):])
+                  for line in resp.iter_lines() if line.startswith("data: ")]
+        assert [e["type"] for e in events] == ["phase", "answer", "done"]
+        phase, answer, done = events
+        assert phase["phase"] == "start"
+        assert phase["task"] == "北京今天天气怎么样？"
+        assert answer["text"] == "合成回答"
+        assert done["stop_reason"] == "completed"
+
+
+def test_chat_stream_emits_error_and_done_on_run_task_exception(tmp_path):
+    app = create_app(
+        Settings(_env_file=None),
+        provider=RaisingProvider(),
+        executor=FakeExecutor(),
+        tracer=JsonlTracer(trace_id="api-test", out_dir=tmp_path),
+    )
+    client = TestClient(app)
+    with client.stream("POST", "/chat/stream", json={"task": "你好"}) as resp:
+        assert resp.status_code == 200
+        events = [json.loads(line[len("data: "):])
+                  for line in resp.iter_lines() if line.startswith("data: ")]
+        types = [e["type"] for e in events]
+        assert types[0] == "phase"
+        error_idx = types.index("error")
+        done_idx = types.index("done")
+        assert error_idx < done_idx
+        assert done_idx == len(events) - 1  # done is terminal
+        assert "boom" in events[error_idx]["message"]
+        assert events[done_idx]["stop_reason"] == "error"
+        assert events[done_idx]["result_data"] == {}
+        assert "answer" not in types
 
 
 def test_chat_stream_rejects_empty_task(tmp_path):
