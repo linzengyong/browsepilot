@@ -1,23 +1,50 @@
-"""P0 agent graph skeleton: classify -> answer.
+"""Agent graph: classify -> answer.
 
-No LLM and no real tools yet — this task proves the LangGraph + Pydantic
-state + Tracer wiring works end to end.
+classify is hybrid rules-first (article 3): cheap keyword/regex rules win;
+the small model is the fallback via provider.structured; a final fallback
+defaults to tier1/search. answer is still the P0 stub (T7 rewrites it).
 """
 from __future__ import annotations
 
 from langgraph.graph import END, StateGraph
 
+from browsepilot.agent.router import IntentResult, RouteDecision, classify_by_rules
 from browsepilot.agent.state import AgentState
 from browsepilot.agent.tools import ToolExecutor
-from browsepilot.agent.tracer import Tracer
+from browsepilot.agent.tracer import TraceEvent, Tracer
+from browsepilot.model.messages import Message
+from browsepilot.model.provider import ModelProvider
+from browsepilot.model.structured import StructuredOutputError
 
 
-def build_graph(executor: ToolExecutor, tracer: Tracer):
+def build_graph(
+    executor: ToolExecutor,
+    tracer: Tracer,
+    provider: ModelProvider,
+    *,
+    small_model: str | None = None,
+):
     workflow = StateGraph(AgentState)
 
-    def classify(state: AgentState) -> dict:
+    async def classify(state: AgentState) -> dict:
         with tracer.span("classify", task=state.task[:60]):
-            return {"intent": "browser_task", "tier": "tier1"}
+            decision = classify_by_rules(state.task)
+            if decision is None:
+                try:
+                    result = await provider.structured(
+                        [Message(role="system", content="你是意图分类器。"),
+                         Message(role="user", content=state.task)],
+                        schema=IntentResult,
+                        model=small_model,
+                    )
+                    decision = RouteDecision(intent=result.intent, tier=result.tier, confidence=0.8)
+                except StructuredOutputError:
+                    # fallback: search is the safest default for an info product
+                    decision = RouteDecision(intent="search", tier="tier1", confidence=0.0)
+            tracer.emit(TraceEvent(trace_id=tracer.trace_id, span_id=tracer.new_span_id(),
+                                   node="classify", event_type="decision",
+                                   data=decision.model_dump()))
+            return {"intent": decision.intent, "tier": decision.tier}
 
     def answer(state: AgentState) -> dict:
         with tracer.span("answer"):

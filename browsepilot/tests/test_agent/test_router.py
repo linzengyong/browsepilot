@@ -1,0 +1,35 @@
+from browsepilot.agent.router import classify_by_rules, RouteDecision
+
+
+def test_weather_rule():
+    d = classify_by_rules("北京今天天气怎么样？")
+    assert d is not None
+    assert d.intent == "weather" and d.tier == "tier1" and d.confidence == 1.0
+
+
+def test_search_rule():
+    d = classify_by_rules("搜索一下 Python 3.13 正式发布时间")
+    assert d is not None
+    assert d.intent == "search" and d.tier == "tier1"
+
+
+def test_read_page_rule_by_url():
+    d = classify_by_rules("打开 https://www.python.org 告诉我页面主要内容")
+    assert d is not None
+    assert d.intent == "read_page" and d.tier == "tier2"
+
+
+def test_chitchat_rule():
+    d = classify_by_rules("你好")
+    assert d is not None
+    assert d.intent == "chitchat" and d.tier == "answer"
+
+
+def test_knowledge_qa_rule():
+    d = classify_by_rules("什么是 HTTP/2？")
+    assert d is not None
+    assert d.intent == "knowledge_qa" and d.tier == "answer"
+
+
+def test_unknown_task_returns_none():
+    assert classify_by_rules("帮我处理一下那个事情") is None
