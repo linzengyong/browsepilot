@@ -5,6 +5,8 @@ import glob
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openai import OpenAI
@@ -14,8 +16,9 @@ from backend.app.config import settings
 # 1. Find an existing screenshot
 screenshots = glob.glob("data/screenshots/*/step_*.png")
 if not screenshots:
-    print("No screenshots found. Run a browser task first.")
-    sys.exit(1)
+    # data/screenshots is gitignored, so a fresh CI checkout has none; skip
+    # instead of aborting pytest collection with sys.exit(1).
+    pytest.skip("no screenshots available", allow_module_level=True)
 
 screenshot_path = sorted(screenshots)[-1]  # latest
 with open(screenshot_path, "rb") as f:
