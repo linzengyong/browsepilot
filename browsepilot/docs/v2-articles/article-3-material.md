@@ -79,7 +79,7 @@ _RULES: list[tuple[str, str, list[str]]] = [
 1. **URL 正则特判**：`_URL_RE = re.compile(r"https?://[^\s，。！？\"]+")` 优先于规则表执行——"打开 https://… 告诉我内容"必须进 read_page，不依赖关键词运气，也不怕"打开"被别的意图抢走。
 2. **规则顺序即优先级**：weather → read_page → knowledge_qa → search → chitchat。最关键的注释（router.py 原文）：
    > 注意 knowledge_qa 必须在 search 之前（"什么是"同时匹配两者）
-   "什么是 HTTP/2？"同时命中 knowledge_qa（"什么是"）与 search（"是什么"）——靠顺序裁决，这正是 v1 里"关键词打架"问题的解法：**不消除重叠，用顺序显式裁决**。
+   "搜索一下什么是 HTTP/2"同时命中 search 规则的关键词"搜索"与 knowledge_qa 规则的关键词"什么是"——真正的双命中，规则顺序决定路由结果：knowledge_qa 在前则归 knowledge_qa。注意这里不是子串关系（"什么是"并不是"是什么"的子串）：顺序之所以是裁决者，是因为两类规则的关键词表都可能同时命中混合意图的表述——这正是 v1 里"关键词打架"问题的解法：**不消除重叠，用顺序显式裁决**。
 3. **空输入兜底 chitchat**（`classify_by_rules` 开头 `if not text`）。
 
 ### IntentResult 的 Literal 约束（structured output 保证枚举合法）
@@ -138,7 +138,7 @@ except StructuredOutputError:
 | 帮我查一下今天的天气 | 规则命中 → weather |
 | 搜一下 Rust 异步编程教程 | 规则命中 → search |
 | 帮我找找 OpenAI 的最新公告 | 规则命中 → search |
-| 什么是最小可行产品 MVP | 规则命中 → knowledge_qa（顺序裁决压过 search） |
+| 什么是最小可行产品 MVP | 规则命中 → knowledge_qa |
 | 解释一下量子纠缠 | 规则命中 → knowledge_qa |
 | 打开 https://news.ycombinator.com 看看热帖 | 规则命中（URL 特判）→ read_page |
 | 你好 | 规则命中 → chitchat |
