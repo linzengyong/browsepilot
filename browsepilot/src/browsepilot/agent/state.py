@@ -29,3 +29,4 @@ class AgentState(BaseModel):
     consecutive_failures: int = 0
     replan_count: int = 0
     stop_reason: str = ""
+    result_data: dict[str, Any] = Field(default_factory=dict)  # structured payload from the last tool call
