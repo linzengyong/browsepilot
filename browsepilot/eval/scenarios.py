@@ -1,4 +1,5 @@
 """Eval scenario schema and loader (article 4 material)."""
+
 from __future__ import annotations
 
 from pathlib import Path

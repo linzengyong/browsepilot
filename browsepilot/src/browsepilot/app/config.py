@@ -1,13 +1,12 @@
 """V2 configuration. Env vars use the BP_ prefix to avoid clashing with v1."""
+
 from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(
-        env_prefix="BP_", env_file=".env", extra="ignore"
-    )
+    model_config = SettingsConfigDict(env_prefix="BP_", env_file=".env", extra="ignore")
 
     default_model: str = "deepseek/deepseek-chat"
     model_api_key: str = ""

@@ -1,9 +1,14 @@
 """Verify DeepSeek V4 vision support by sending an existing screenshot."""
-import base64, sys, os, glob
+
+import base64
+import glob
+import os
+import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from openai import OpenAI
+
 from backend.app.config import settings
 
 # 1. Find an existing screenshot
@@ -39,13 +44,18 @@ for model in models_to_test:
     try:
         response = client.chat.completions.create(
             model=model,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                    {"type": "text", "text": "Describe what you see on this webpage in 2-3 sentences."},
-                ],
-            }],
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
+                        {
+                            "type": "text",
+                            "text": "Describe what you see on this webpage in 2-3 sentences.",
+                        },
+                    ],
+                }
+            ],
             max_tokens=300,
         )
         print(f"  Response: {response.choices[0].message.content[:200]}")
@@ -56,7 +66,7 @@ for model in models_to_test:
             if usage.prompt_tokens > 200:
                 print(f"  Verdict: VISION WORKS for {model}")
             else:
-                print(f"  Verdict: INCONCLUSIVE (low token count)")
+                print("  Verdict: INCONCLUSIVE (low token count)")
         print()
     except Exception as e:
         print(f"  ERROR: {str(e)[:200]}")

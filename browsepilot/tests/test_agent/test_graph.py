@@ -16,8 +16,11 @@ class StubExecutor:
 
     async def call(self, name, arguments):
         if name == "weather":
-            return ToolResult(status="success", content="北京：晴，26.0°C",
-                              data={"city": "北京", "temperature_c": 26.0})
+            return ToolResult(
+                status="success",
+                content="北京：晴，26.0°C",
+                data={"city": "北京", "temperature_c": 26.0},
+            )
         return ToolResult(content="stub")
 
 

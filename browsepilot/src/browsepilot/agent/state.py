@@ -1,4 +1,5 @@
 """Agent state models (Pydantic v2). Replaces the flat TypedDict of v1."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -29,4 +30,6 @@ class AgentState(BaseModel):
     consecutive_failures: int = 0
     replan_count: int = 0
     stop_reason: str = ""
-    result_data: dict[str, Any] = Field(default_factory=dict)  # structured payload from the last tool call
+    result_data: dict[str, Any] = Field(
+        default_factory=dict
+    )  # structured payload from the last tool call

@@ -1,4 +1,4 @@
-from browsepilot.model.messages import ChatResult, Message, UsageInfo
+from browsepilot.model.messages import ChatResult, UsageInfo
 
 
 def test_usage_info_defaults():

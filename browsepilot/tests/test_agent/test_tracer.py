@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from browsepilot.agent.tracer import JsonlTracer, Tracer, TraceEvent
+from browsepilot.agent.tracer import JsonlTracer, TraceEvent, Tracer
 
 
 def test_tracer_implements_protocol():

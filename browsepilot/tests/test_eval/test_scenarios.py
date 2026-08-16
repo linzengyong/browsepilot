@@ -40,20 +40,31 @@ def test_run_eval_smoke(capsys, monkeypatch):
 # data={"city": "北京", "temperature_c": 26.0}，对 search 返回 data={"results": []}，
 # 对 fetch_page 返回 data={"text": "Python 主页"}，其余返回 success 空 data。
 
+
 def test_check_field_expected():
-    ok, _ = check_outcome({"result_data": {"city": "北京"}}, Check(type="field", field="city", expected="北京"))
+    ok, _ = check_outcome(
+        {"result_data": {"city": "北京"}}, Check(type="field", field="city", expected="北京")
+    )
     assert ok
 
 
 def test_check_field_number_kind():
-    ok, _ = check_outcome({"result_data": {"temperature_c": 26.0}}, Check(type="field", field="temperature_c", kind="number"))
+    ok, _ = check_outcome(
+        {"result_data": {"temperature_c": 26.0}},
+        Check(type="field", field="temperature_c", kind="number"),
+    )
     assert ok
-    ok2, _ = check_outcome({"result_data": {"temperature_c": "hot"}}, Check(type="field", field="temperature_c", kind="number"))
+    ok2, _ = check_outcome(
+        {"result_data": {"temperature_c": "hot"}},
+        Check(type="field", field="temperature_c", kind="number"),
+    )
     assert not ok2
 
 
 def test_check_contains_keyword():
-    ok, _ = check_outcome({"final_answer": "发布于 2024 年"}, Check(type="contains_keyword", keywords=["2024"]))
+    ok, _ = check_outcome(
+        {"final_answer": "发布于 2024 年"}, Check(type="contains_keyword", keywords=["2024"])
+    )
     assert ok
 
 

@@ -12,6 +12,7 @@ network access. Values are chosen to satisfy the P0 scenario checks:
     fetch_page -> data={"text": "Python 主页"}
     other      -> success, empty data
 """
+
 from __future__ import annotations
 
 from typing import Any
@@ -64,8 +65,11 @@ class FakeExecutor:
 
     async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         if name == "weather":
-            return ToolResult(status="success", content="北京：晴，26.0°C",
-                              data={"city": "北京", "temperature_c": 26.0})
+            return ToolResult(
+                status="success",
+                content="北京：晴，26.0°C",
+                data={"city": "北京", "temperature_c": 26.0},
+            )
         if name == "search":
             return ToolResult(status="success", content="", data={"results": []})
         if name == "fetch_page":

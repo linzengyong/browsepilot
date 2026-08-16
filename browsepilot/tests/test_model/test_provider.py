@@ -3,9 +3,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from browsepilot.model.litellm_provider import LiteLLMProvider, to_openai_messages
 from browsepilot.model.messages import Message
 from browsepilot.model.provider import ModelProvider
-from browsepilot.model.litellm_provider import LiteLLMProvider, to_openai_messages
 
 
 def test_to_openai_messages_serializes_user():

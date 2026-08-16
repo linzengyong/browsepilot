@@ -1,4 +1,5 @@
 """V2 FastAPI application factory — the composition root."""
+
 from __future__ import annotations
 
 import json
@@ -55,6 +56,7 @@ def create_app(
     @app.post("/chat/stream")
     async def chat_stream(req: ChatRequest):
         """执行一个用户任务，SSE 返回阶段事件与最终回答。"""
+
         async def gen():
             yield _sse({"type": "phase", "phase": "start", "task": req.task[:100]})
             try:
@@ -71,8 +73,13 @@ def create_app(
                 yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
                 return
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
-            yield _sse({"type": "done", "stop_reason": result.get("stop_reason", ""),
-                        "result_data": result.get("result_data", {})})
+            yield _sse(
+                {
+                    "type": "done",
+                    "stop_reason": result.get("stop_reason", ""),
+                    "result_data": result.get("result_data", {}),
+                }
+            )
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 

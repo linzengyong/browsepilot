@@ -1,0 +1,18 @@
+name: ci
+on:
+  push:
+    branches: [master, v2.0]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras --frozen
+      - run: uv run ruff check src/ eval/ tests/
+      - run: uv run mypy src/browsepilot/
+      - run: uv run pytest tests/ -q

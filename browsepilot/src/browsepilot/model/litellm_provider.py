@@ -3,13 +3,15 @@
 `model` is a LiteLLM model string, e.g.
 'deepseek/deepseek-chat', 'anthropic/claude-3-7-sonnet-20250219', 'ollama/llama3'.
 """
+
 from __future__ import annotations
 
 import json
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 from loguru import logger
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from tenacity import (
     RetryError,
     retry,
@@ -19,7 +21,6 @@ from tenacity import (
 )
 
 from browsepilot.model.messages import ChatResult, Cost, Message, Usage, UsageInfo
-from browsepilot.model.provider import ModelProvider
 from browsepilot.model.structured import (
     StructuredOutputError,
     schema_for,
@@ -83,9 +84,7 @@ class LiteLLMProvider:
             estimated=False,
         )
 
-    async def chat(
-        self, messages: list[Message], *, model: str | None = None
-    ) -> ChatResult:
+    async def chat(self, messages: list[Message], *, model: str | None = None) -> ChatResult:
         import litellm
 
         resp = await litellm.acompletion(

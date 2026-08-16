@@ -1,6 +1,7 @@
 """Tests for skill loader module."""
+
 import pytest
-from pathlib import Path
+
 from backend.app.agent.skill_loader import Skill
 
 
@@ -31,11 +32,14 @@ def test_listing_cache():
     assert listing2 == listing
 
 
-@pytest.mark.parametrize("task,expected_skill", [
-    ("去京东搜机械键盘对比价格", "ecommerce-compare"),
-    ("帮我比价淘宝和拼多多", "ecommerce-compare"),
-    ("推荐三款500元的键盘", "ecommerce-compare"),
-])
+@pytest.mark.parametrize(
+    "task,expected_skill",
+    [
+        ("去京东搜机械键盘对比价格", "ecommerce-compare"),
+        ("帮我比价淘宝和拼多多", "ecommerce-compare"),
+        ("推荐三款500元的键盘", "ecommerce-compare"),
+    ],
+)
 def test_skill_matching(task, expected_skill):
     """Verify skills are correctly matched to tasks."""
     matched = Skill.match(task)

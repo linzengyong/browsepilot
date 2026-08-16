@@ -8,6 +8,7 @@ node_end events. Nesting is tracked per-tracer via a contextvar stack
 (task-local, async-safe), so concurrent graph runs on the same tracer
 instance don't corrupt parent linkage.
 """
+
 from __future__ import annotations
 
 import contextvars
@@ -16,7 +17,7 @@ import threading
 import time
 import uuid
 from contextlib import AbstractContextManager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -24,7 +25,7 @@ from pydantic import BaseModel, Field
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class TraceEvent(BaseModel):
@@ -32,7 +33,9 @@ class TraceEvent(BaseModel):
     span_id: str
     parent_span_id: str | None = None
     node: str = ""
-    event_type: str = "info"  # node_start | node_end | tool_call | llm_call | decision | error | info
+    event_type: str = (
+        "info"  # node_start | node_end | tool_call | llm_call | decision | error | info
+    )
     timestamp: str = Field(default_factory=_now_iso)
     data: dict[str, Any] = Field(default_factory=dict)
     duration_ms: float | None = None
@@ -44,7 +47,7 @@ class Tracer(Protocol):
 
     def emit(self, event: TraceEvent) -> None: ...
 
-    def span(self, node: str, **data: Any) -> AbstractContextManager["TraceSpan"]: ...
+    def span(self, node: str, **data: Any) -> AbstractContextManager[TraceSpan]: ...
 
     def new_span_id(self) -> str: ...
 
@@ -70,7 +73,7 @@ class TraceSpan:
         self._stack_token: contextvars.Token | None = None
         self._start: float | None = None
 
-    def __enter__(self) -> "TraceSpan":
+    def __enter__(self) -> TraceSpan:
         self._start = time.monotonic()
         if self._stack is not None:
             current = self._stack.get()
@@ -97,7 +100,7 @@ class TraceSpan:
                 parent_span_id=self._parent_span_id,
                 node=self._node,
                 event_type="node_end",
-                duration_ms=(time.monotonic() - self._start) * 1000,
+                duration_ms=(time.monotonic() - (self._start or 0.0)) * 1000,
             )
         )
 

@@ -2,9 +2,7 @@ import pytest
 
 from browsepilot.agent.tools import ToolExecutor, ToolSpec
 from browsepilot.app.executor import AppToolExecutor
-from browsepilot.app.services.fetch import PageFetchService
-from browsepilot.app.services.search import SearchService
-from browsepilot.app.services.weather import Weather, WeatherService
+from browsepilot.app.services.weather import Weather
 
 
 class FakeWeather:

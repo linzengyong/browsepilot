@@ -1,4 +1,5 @@
 """Layer boundary guards: model <- agent <- app, single-direction imports."""
+
 import ast
 from pathlib import Path
 

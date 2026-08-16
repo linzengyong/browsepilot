@@ -4,6 +4,7 @@ Modes:
   --mock   : fake provider/executor (no network, no tokens) — CI mode
   default  : real model + services (needs BP_MODEL_API_KEY) — acceptance mode
 """
+
 from __future__ import annotations
 
 import argparse
@@ -34,7 +35,9 @@ def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
     return False, f"unknown check type {check.type}"
 
 
-async def _run_scenario(scenario: Scenario, *, provider, executor, tracer) -> tuple[dict, list[tuple[bool, str]]]:
+async def _run_scenario(
+    scenario: Scenario, *, provider, executor, tracer
+) -> tuple[dict, list[tuple[bool, str]]]:
     outcome = await run_task(scenario.prompt, provider=provider, executor=executor, tracer=tracer)
     return outcome, [check_outcome(outcome, c) for c in scenario.checks]
 
@@ -44,7 +47,9 @@ def run_all(*, provider, executor, tracer) -> int:
     print(f"[browsepilot eval v0.2] {len(scenarios)} scenarios loaded")
     failed = 0
     for s in scenarios:
-        outcome, checks = asyncio.run(_run_scenario(s, provider=provider, executor=executor, tracer=tracer))
+        outcome, checks = asyncio.run(
+            _run_scenario(s, provider=provider, executor=executor, tracer=tracer)
+        )
         ok = all(passed for passed, _ in checks)
         failed += 0 if ok else 1
         detail = "; ".join(d for _, d in checks)
@@ -55,7 +60,9 @@ def run_all(*, provider, executor, tracer) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mock", action="store_true", help="run with fake deps (no network/tokens)")
+    parser.add_argument(
+        "--mock", action="store_true", help="run with fake deps (no network/tokens)"
+    )
     args = parser.parse_args()
 
     if args.mock:
@@ -69,8 +76,11 @@ def main() -> int:
         from browsepilot.model.litellm_provider import LiteLLMProvider
 
         settings = Settings()
-        provider = LiteLLMProvider(settings.default_model, api_key=settings.model_api_key or None,
-                                   base_url=settings.model_base_url or None)
+        provider = LiteLLMProvider(
+            settings.default_model,
+            api_key=settings.model_api_key or None,
+            base_url=settings.model_base_url or None,
+        )
         executor = AppToolExecutor(WeatherService(), SearchService(), PageFetchService())
 
     tracer = JsonlTracer(out_dir=Path("data/traces"))

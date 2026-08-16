@@ -1,8 +1,9 @@
 """Tests for pre_observe_node."""
-import re
+
 import os
+import re
 import sys
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -32,12 +33,14 @@ def test_url_strip_trailing_punctuation():
 
 def test_default_search_url():
     from backend.app.config import settings
+
     assert settings.default_search_url
     assert "." in settings.default_search_url
 
 
 def test_state_fields_exist():
     from backend.app.agent.state import AgentState
+
     assert "page_structure" in AgentState.__annotations__
     assert "page_screenshot" in AgentState.__annotations__
 
@@ -48,14 +51,15 @@ async def test_pre_observe_url_extraction():
     mock_mcp = AsyncMock()
     mock_mcp.call_tool.return_value = {
         "status": "success",
-        "structure": {"inputs": [], "buttons": [], "links": []}
+        "structure": {"inputs": [], "buttons": [], "links": []},
     }
     state = {"task": "打开 https://github.com 搜索项目"}
 
     from backend.app.config import settings
+
     settings.llm_vision_enabled = False
 
-    result = await pre_observe_node(state, mock_mcp)
+    await pre_observe_node(state, mock_mcp)
 
     # Should have called navigate with the URL from task
     navigate_call = mock_mcp.call_tool.call_args_list[0]
@@ -71,9 +75,10 @@ async def test_pre_observe_no_url_uses_default():
     state = {"task": "搜索机械键盘"}
 
     from backend.app.config import settings
+
     settings.llm_vision_enabled = False
 
-    result = await pre_observe_node(state, mock_mcp)
+    await pre_observe_node(state, mock_mcp)
 
     navigate_call = mock_mcp.call_tool.call_args_list[0]
     assert "bing.com" in navigate_call[0][1]["url"]
@@ -84,12 +89,13 @@ async def test_pre_observe_navigate_failure():
     """navigate 失败时 page_structure 仍尝试获取."""
     mock_mcp = AsyncMock()
     mock_mcp.call_tool.side_effect = [
-        Exception("navigate failed"),      # navigate raises
+        Exception("navigate failed"),  # navigate raises
         Exception("get_page_structure failed"),  # get_page_structure raises too
     ]
     state = {"task": "搜索测试"}
 
     from backend.app.config import settings
+
     settings.llm_vision_enabled = False
 
     result = await pre_observe_node(state, mock_mcp)
@@ -105,8 +111,9 @@ async def test_pre_observe_vision_disabled_no_screenshot():
     state = {"task": "搜索测试"}
 
     from backend.app.config import settings
+
     settings.llm_vision_enabled = False
 
-    result = await pre_observe_node(state, mock_mcp)
+    await pre_observe_node(state, mock_mcp)
     # Screenshot is always captured now
     assert mock_mcp.call_tool.call_count == 3

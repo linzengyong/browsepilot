@@ -1,4 +1,5 @@
 """Agent entry point shared by the HTTP API and the eval harness."""
+
 from __future__ import annotations
 
 from browsepilot.agent.graph import build_graph

@@ -5,6 +5,7 @@ provider-specific format (OpenAI/Anthropic/...) directly — wire-format
 serialization lives in the provider adapters
 (see browsepilot.model.litellm_provider.to_openai_messages).
 """
+
 from __future__ import annotations
 
 from typing import Literal

@@ -1,8 +1,9 @@
 """Tier1 search service backed by ddgs (DuckDuckGo, no API key)."""
+
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable
+from collections.abc import Callable
 
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential

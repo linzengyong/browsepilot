@@ -6,10 +6,8 @@ Requirements covered:
   R3: Session management (API: PATCH rename/pin, list_sessions sort)
 """
 
-import json
 import os
 import sys
-import tempfile
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -17,10 +15,9 @@ from httpx import ASGITransport, AsyncClient
 # Add worktree to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.app.agent.nodes import TOOL_RULES, classify_tool
 from backend.app.config import settings
-
-from backend.app.agent.nodes import classify_tool, TOOL_RULES
-
+from backend.app.main import app
 
 # ── R1: Tool Selection Classifier ──────────────────────────────────────
 
@@ -38,6 +35,7 @@ CLASSIFIER_CASES = [
     ("获取搜索结果结构，提取前3条标题和链接", "browser_snapshot"),
 ]
 
+
 @pytest.mark.parametrize("step,expected", CLASSIFIER_CASES)
 def test_classify_tool_boundary(step, expected):
     result = classify_tool(step)
@@ -47,9 +45,15 @@ def test_classify_tool_boundary(step, expected):
 def test_all_tools_in_rules():
     """Verify all 8 tools are defined."""
     assert set(TOOL_RULES.keys()) == {
-        "browser_navigate", "browser_snapshot", "browser_type", "browser_click",
-        "browser_wait_for", "browser_take_screenshot", "browser_press_key",
-        "browser_fill_form", "browser_evaluate",
+        "browser_navigate",
+        "browser_snapshot",
+        "browser_type",
+        "browser_click",
+        "browser_wait_for",
+        "browser_take_screenshot",
+        "browser_press_key",
+        "browser_fill_form",
+        "browser_evaluate",
     }
 
 
@@ -75,6 +79,7 @@ def test_classifier_returns_none_for_ambiguous():
     assert classify_tool("") is None
     # 纯聊天
     assert classify_tool("你好，今天天气怎么样") is None
+
 
 def test_create_and_persist_session(session_manager):
     sm = session_manager
@@ -172,8 +177,6 @@ def test_list_sessions_includes_new_fields(session_manager):
 
 # ── R2 & R3: API Endpoints ─────────────────────────────────────────────
 
-from backend.app.main import app
-
 
 @pytest.fixture
 def api_client():
@@ -186,6 +189,7 @@ def api_client():
 def api_session(api_client):
     """Create a session and persist it for API tests."""
     from backend.app.main import session_manager as sm
+
     sm.create_session("api-test-001")
     sm.start_turn("api-test-001", "test task for API")
     sm.update_current_turn("api-test-001", token_usage={"prompt": 100, "completion": 50})

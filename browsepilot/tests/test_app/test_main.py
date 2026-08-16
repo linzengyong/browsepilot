@@ -84,8 +84,11 @@ def test_chat_stream_endpoint(tmp_path):
     client = TestClient(app)
     with client.stream("POST", "/chat/stream", json={"task": "北京今天天气怎么样？"}) as resp:
         assert resp.status_code == 200
-        events = [json.loads(line[len("data: "):])
-                  for line in resp.iter_lines() if line.startswith("data: ")]
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
         assert [e["type"] for e in events] == ["phase", "answer", "done"]
         phase, answer, done = events
         assert phase["phase"] == "start"
@@ -104,8 +107,11 @@ def test_chat_stream_emits_error_and_done_on_run_task_exception(tmp_path):
     client = TestClient(app)
     with client.stream("POST", "/chat/stream", json={"task": "你好"}) as resp:
         assert resp.status_code == 200
-        events = [json.loads(line[len("data: "):])
-                  for line in resp.iter_lines() if line.startswith("data: ")]
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
         types = [e["type"] for e in events]
         assert types[0] == "phase"
         error_idx = types.index("error")
@@ -119,8 +125,12 @@ def test_chat_stream_emits_error_and_done_on_run_task_exception(tmp_path):
 
 
 def test_chat_stream_rejects_empty_task(tmp_path):
-    app = create_app(Settings(_env_file=None), provider=FakeProvider(), executor=FakeExecutor(),
-                      tracer=JsonlTracer(trace_id="t", out_dir=tmp_path))
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=FakeExecutor(),
+        tracer=JsonlTracer(trace_id="t", out_dir=tmp_path),
+    )
     client = TestClient(app)
     resp = client.post("/chat/stream", json={"task": ""})
     assert resp.status_code == 422

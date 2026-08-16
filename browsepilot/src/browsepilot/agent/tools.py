@@ -3,6 +3,7 @@
 MCP servers, local functions, and HTTP endpoints are all implementations
 of this protocol. The agent core never imports MCP code.
 """
+
 from __future__ import annotations
 
 from typing import Any, Literal, Protocol, runtime_checkable

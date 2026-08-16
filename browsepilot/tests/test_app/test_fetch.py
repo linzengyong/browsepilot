@@ -14,7 +14,9 @@ SAMPLE_HTML = """<!DOCTYPE html><html><head><title>测试页</title></head>
 @pytest.mark.asyncio
 async def test_fetch_extracts_main_text():
     def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, text=SAMPLE_HTML, headers={"content-type": "text/html; charset=utf-8"})
+        return httpx.Response(
+            200, text=SAMPLE_HTML, headers={"content-type": "text/html; charset=utf-8"}
+        )
 
     service = PageFetchService(client=httpx.AsyncClient(transport=httpx.MockTransport(handler)))
     page = await service.fetch("https://example.com/article")

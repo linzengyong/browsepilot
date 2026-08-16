@@ -1,4 +1,5 @@
 """App-layer ToolExecutor: wires agent tool calls to the Tier1/2 services."""
+
 from __future__ import annotations
 
 from typing import Any
@@ -9,12 +10,15 @@ from browsepilot.app.services.search import SearchError, SearchService
 from browsepilot.app.services.weather import CityNotFoundError, WeatherService
 
 _TOOL_SPECS = [
-    ToolSpec(name="weather", description="查询指定中国城市的当前天气（温度/天气状况/湿度/风速）",
-             parameters={"city": "string"}),
-    ToolSpec(name="search", description="搜索互联网获取信息",
-             parameters={"query": "string"}),
-    ToolSpec(name="fetch_page", description="抓取并提取指定 URL 的网页正文",
-             parameters={"url": "string"}),
+    ToolSpec(
+        name="weather",
+        description="查询指定中国城市的当前天气（温度/天气状况/湿度/风速）",
+        parameters={"city": "string"},
+    ),
+    ToolSpec(name="search", description="搜索互联网获取信息", parameters={"query": "string"}),
+    ToolSpec(
+        name="fetch_page", description="抓取并提取指定 URL 的网页正文", parameters={"url": "string"}
+    ),
 ]
 
 
@@ -36,8 +40,11 @@ class AppToolExecutor:
         try:
             if name == "weather":
                 w = await self._weather.get(arguments["city"])
-                return ToolResult(status="success", content=f"{w.city}：{w.conditions}，{w.temperature_c}°C",
-                                  data=w.model_dump())
+                return ToolResult(
+                    status="success",
+                    content=f"{w.city}：{w.conditions}，{w.temperature_c}°C",
+                    data=w.model_dump(),
+                )
             if name == "search":
                 results = await self._search.search(arguments["query"])
                 return ToolResult(
@@ -48,7 +55,9 @@ class AppToolExecutor:
             if name == "fetch_page":
                 page = await self._fetch.fetch(arguments["url"])
                 return ToolResult(status="success", content=page.text, data=page.model_dump())
-            return ToolResult(status="error", error_type="unknown_tool", error_message=f"unknown tool: {name}")
+            return ToolResult(
+                status="error", error_type="unknown_tool", error_message=f"unknown tool: {name}"
+            )
         except CityNotFoundError as exc:
             return ToolResult(status="error", error_type="city_not_found", error_message=str(exc))
         except (SearchError, FetchError) as exc:

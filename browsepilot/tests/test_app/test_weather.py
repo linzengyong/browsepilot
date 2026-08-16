@@ -3,9 +3,9 @@ import pytest
 
 from browsepilot.app.services.city_coords import CITY_COORDS
 from browsepilot.app.services.weather import (
+    WMO_TO_CONDITIONS,
     CityNotFoundError,
     WeatherService,
-    WMO_TO_CONDITIONS,
 )
 
 
@@ -28,6 +28,7 @@ def test_wmo_code_mapping_spot_checks():
 
 def test_resolve_city_exact_match():
     from browsepilot.app.services.weather import resolve_city
+
     name, lat, lon = resolve_city("北京")
     assert name == "北京"
     assert lat == pytest.approx(39.9042, abs=0.01)
@@ -35,12 +36,14 @@ def test_resolve_city_exact_match():
 
 def test_resolve_city_substring_match():
     from browsepilot.app.services.weather import resolve_city
+
     name, _, _ = resolve_city("北京市海淀区")
     assert name == "北京"
 
 
 def test_resolve_city_unknown_raises():
     from browsepilot.app.services.weather import resolve_city
+
     with pytest.raises(CityNotFoundError):
         resolve_city("不存在的城市XYZ")
 
@@ -49,14 +52,17 @@ def test_resolve_city_unknown_raises():
 async def test_weather_service_get():
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["latitude"] == "39.9042"
-        return httpx.Response(200, json={
-            "current": {
-                "temperature_2m": 26.5,
-                "relative_humidity_2m": 60,
-                "weather_code": 0,
-                "wind_speed_10m": 12.3,
-            }
-        })
+        return httpx.Response(
+            200,
+            json={
+                "current": {
+                    "temperature_2m": 26.5,
+                    "relative_humidity_2m": 60,
+                    "weather_code": 0,
+                    "wind_speed_10m": 12.3,
+                }
+            },
+        )
 
     client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     service = WeatherService(client=client)

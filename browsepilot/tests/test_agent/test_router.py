@@ -1,4 +1,4 @@
-from browsepilot.agent.router import classify_by_rules, RouteDecision
+from browsepilot.agent.router import classify_by_rules
 
 
 def test_weather_rule():

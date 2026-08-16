@@ -1,7 +1,9 @@
 """ModelProvider port — the model layer's only public entry point."""
+
 from __future__ import annotations
 
-from typing import AsyncIterator, Protocol, runtime_checkable
+from collections.abc import AsyncIterator
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
@@ -10,11 +12,9 @@ from browsepilot.model.messages import ChatResult, Message
 
 @runtime_checkable
 class ModelProvider(Protocol):
-    async def chat(
-        self, messages: list[Message], *, model: str | None = None
-    ) -> ChatResult: ...
+    async def chat(self, messages: list[Message], *, model: str | None = None) -> ChatResult: ...
 
-    async def stream(
+    def stream(
         self, messages: list[Message], *, model: str | None = None
     ) -> AsyncIterator[str]: ...
 

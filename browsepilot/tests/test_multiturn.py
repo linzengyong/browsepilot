@@ -2,6 +2,7 @@
 
 import json
 import os
+
 import pytest
 from fastapi import HTTPException
 
@@ -30,6 +31,7 @@ class TestStartTurn:
         sm = session_manager
         sm.create_session("mt-003")
         from backend.app.config import settings
+
         for i in range(settings.max_turns_per_session):
             sm.start_turn("mt-003", f"task-{i}")
         with pytest.raises(HTTPException) as exc:
@@ -41,9 +43,10 @@ class TestStartTurn:
         sm = session_manager
         sm.create_session("mt-004")
         from backend.app.config import settings
+
         # Create a turn with max tokens already consumed
         huge_usage = {"prompt": settings.max_session_tokens, "completion": 0}
-        turn = sm.start_turn("mt-004", "first")
+        sm.start_turn("mt-004", "first")
         sm.update_current_turn("mt-004", token_usage=huge_usage)
         with pytest.raises(HTTPException) as exc:
             sm.start_turn("mt-004", "second")
@@ -64,6 +67,7 @@ class TestGetHistoryBackwardCompat:
             "token_usage": {"prompt": 100, "completion": 50},
         }
         from backend.app.config import settings
+
         filepath = os.path.join(settings.data_dir, "sessions", "old-001.json")
         with open(filepath, "w", encoding="utf-8") as f:
             json.dump(old_data, f, ensure_ascii=False)
@@ -87,9 +91,12 @@ class TestGetHistoryBackwardCompat:
         sm = session_manager
         sm.create_session("mt-005")
         sm.start_turn("mt-005", "任务A")
-        sm.update_current_turn("mt-005", final_answer="answer A",
-                               execution_log=[{"step": "s1"}],
-                               token_usage={"prompt": 10, "completion": 5})
+        sm.update_current_turn(
+            "mt-005",
+            final_answer="answer A",
+            execution_log=[{"step": "s1"}],
+            token_usage={"prompt": 10, "completion": 5},
+        )
         sm.persist("mt-005")
 
         history = sm.get_history("mt-005")
@@ -130,8 +137,9 @@ class TestUpdateCurrentTurn:
         sm.start_turn("mt-008", "first")
         sm.start_turn("mt-008", "second")
 
-        sm.update_current_turn("mt-008", final_answer="second answer",
-                               execution_log=[{"step": "x"}])
+        sm.update_current_turn(
+            "mt-008", final_answer="second answer", execution_log=[{"step": "x"}]
+        )
 
         # Check second turn only
         session = sm.get_history("mt-008")
@@ -156,13 +164,19 @@ class TestGetReplay:
         sm = session_manager
         sm.create_session("mt-010")
         sm.start_turn("mt-010", "t1")
-        sm.update_current_turn("mt-010", execution_log=[
-            {"step": "step1", "screenshot_path": "/s1.png", "timestamp": "t1"},
-        ])
+        sm.update_current_turn(
+            "mt-010",
+            execution_log=[
+                {"step": "step1", "screenshot_path": "/s1.png", "timestamp": "t1"},
+            ],
+        )
         sm.start_turn("mt-010", "t2")
-        sm.update_current_turn("mt-010", execution_log=[
-            {"step": "step2", "screenshot_path": "/s2.png", "timestamp": "t2"},
-        ])
+        sm.update_current_turn(
+            "mt-010",
+            execution_log=[
+                {"step": "step2", "screenshot_path": "/s2.png", "timestamp": "t2"},
+            ],
+        )
 
         replay = sm.get_replay("mt-010")
         assert len(replay) == 1
@@ -172,13 +186,19 @@ class TestGetReplay:
         sm = session_manager
         sm.create_session("mt-011")
         sm.start_turn("mt-011", "t1")
-        sm.update_current_turn("mt-011", execution_log=[
-            {"step": "first-step"},
-        ])
+        sm.update_current_turn(
+            "mt-011",
+            execution_log=[
+                {"step": "first-step"},
+            ],
+        )
         sm.start_turn("mt-011", "t2")
-        sm.update_current_turn("mt-011", execution_log=[
-            {"step": "second-step"},
-        ])
+        sm.update_current_turn(
+            "mt-011",
+            execution_log=[
+                {"step": "second-step"},
+            ],
+        )
 
         replay = sm.get_replay("mt-011", turn_index=0)
         assert len(replay) == 1
@@ -211,18 +231,22 @@ class TestDeleteSessionFiles:
         sm = session_manager
         sm.create_session("mt-014")
         sm.start_turn("mt-014", "t1")
-        sm.update_current_turn("mt-014", execution_log=[
-            {"step": "s1", "screenshot_path": ""},
-        ])
+        sm.update_current_turn(
+            "mt-014",
+            execution_log=[
+                {"step": "s1", "screenshot_path": ""},
+            ],
+        )
         sm.persist("mt-014")
 
         # Should not crash — traversal of turns works
-        filepath = f"{sm._active_sessions['mt-014'].get('_data_dir', '')}"
         sm._delete_session_files("mt-014")
         # After deletion, the file no longer exists and memory is cleaned via schedule_cleanup
         # get_history falls back to _active_sessions — verify file is gone
         import os
+
         from backend.app.config import settings
+
         session_file = os.path.join(settings.data_dir, "sessions", "mt-014.json")
         assert not os.path.exists(session_file)
         # Clean up memory
@@ -266,28 +290,13 @@ class TestPlanNodeTurnHistory:
         assert past_turns[-3:][0]["turn_index"] == 1
         assert len(past_turns[-3:]) == 3
 
-    def test_past_turns_filtered_correctly(self):
-        """Verify that only turns before current_turn are included."""
-        from backend.app.agent.nodes import plan_node
-
-        session_turns = [
-            {"turn_index": 0, "task": "t0", "final_answer": "a0"},
-            {"turn_index": 1, "task": "t1", "final_answer": "a1"},
-            {"turn_index": 2, "task": "t2", "final_answer": "a2"},
-        ]
-        current_turn = 2
-        past_turns = [t for t in session_turns if t.get("turn_index", 0) < current_turn]
-        assert len(past_turns) == 2
-        assert past_turns[0]["turn_index"] == 0
-        assert past_turns[1]["turn_index"] == 1
-
 
 class TestSameTaskReuse:
     def test_incomplete_same_task_reuses_turn(self, session_manager):
         """When same task arrives and turn is incomplete, no new turn created."""
         sm = session_manager
         sm.create_session("mt-015")
-        t1 = sm.start_turn("mt-015", "搜索任务")
+        sm.start_turn("mt-015", "搜索任务")
         sm.update_current_turn("mt-015", execution_log=[{"step": "s1"}])
 
         turns = sm.get_history("mt-015")["turns"]

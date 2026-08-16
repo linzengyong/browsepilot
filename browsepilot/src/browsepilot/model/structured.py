@@ -2,6 +2,7 @@
 
 Strategy: forced function calling (tool_choice) + Pydantic validation + retry.
 """
+
 from __future__ import annotations
 
 from typing import Any

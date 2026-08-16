@@ -3,6 +3,7 @@
 No clicking, no interaction — serves "read a page" tasks. trafilatura does
 the boilerplate stripping (article 2/3 material: leverage the ecosystem).
 """
+
 from __future__ import annotations
 
 import httpx
@@ -29,7 +30,9 @@ class PageFetchService:
     async def fetch(self, url: str) -> PageContent:
         import trafilatura
 
-        client = self._client or httpx.AsyncClient(headers={"User-Agent": "Mozilla/5.0 browsepilot/2.0"}, follow_redirects=True)
+        client = self._client or httpx.AsyncClient(
+            headers={"User-Agent": "Mozilla/5.0 browsepilot/2.0"}, follow_redirects=True
+        )
         try:
             resp = await self._get(client, url)
             html = resp.text

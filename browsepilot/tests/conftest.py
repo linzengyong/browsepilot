@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pytest
+
 from backend.app.config import settings
 from backend.app.session_manager import SessionManager
 
