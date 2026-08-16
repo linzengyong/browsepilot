@@ -5,8 +5,8 @@
 | # | 标题 | 状态 | 素材文件 |
 |---|------|------|---------|
 | 1 | 从"最短路径"到"工程化"：一次 Vibe Coding 的重构实录 | 起草中 | article-1-material.md |
-| 2 | LLM 结构化输出之战：如何让 AI 稳定返回 JSON | 起草中 | article-2-notes.md |
-| 3 | Agent 的"大脑"：意图识别系统的设计与演进 | P1 阶段产出 | — |
+| 2 | LLM 结构化输出之战：如何让 AI 稳定返回 JSON | P1 实战案例已补 | article-2-notes.md |
+| 3 | Agent 的"大脑"：意图识别系统的设计与演进 | 起草中，素材见 article-3-material.md | article-3-material.md |
 | 4 | Agent 的"体检"：如何构建评测集与评测体系 | P4 阶段产出 | — |
 | 5 | Agent 的"黑匣子"：可观测性系统的设计与实现 | P2 阶段产出 | — |
 
