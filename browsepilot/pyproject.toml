@@ -24,6 +24,7 @@ dependencies = [
     "litellm>=1.40",
     "ddgs>=8.0",
     "pyyaml>=6.0",
+    "tenacity>=9.0",
 ]
 
 [project.optional-dependencies]

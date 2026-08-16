@@ -10,6 +10,13 @@ from typing import Any, AsyncIterator
 
 from loguru import logger
 from pydantic import ValidationError
+from tenacity import (
+    RetryError,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_fixed,
+)
 
 from browsepilot.model.messages import ChatResult, Cost, Message, Usage, UsageInfo
 from browsepilot.model.provider import ModelProvider
@@ -125,8 +132,15 @@ class LiteLLMProvider:
         schema_dict = schema_for(schema)
         tool = tool_spec_for(schema_dict)
         msgs = to_openai_messages(messages)
-        last_error: Exception | None = None
-        for attempt in range(max_retries):
+
+        @retry(
+            stop=stop_after_attempt(max_retries),
+            retry=retry_if_exception_type(
+                (IndexError, AttributeError, json.JSONDecodeError, ValidationError)
+            ),
+            wait=wait_fixed(0),  # LLM 重试保持零等待（与 P0 行为一致）；后续可换 wait_exponential
+        )
+        async def _attempt() -> BaseModel:
             resp = await litellm.acompletion(
                 model=model or self.model,
                 messages=msgs,
@@ -137,13 +151,15 @@ class LiteLLMProvider:
                 },
                 **self._kwargs(),
             )
-            try:
-                call = resp.choices[0].message.tool_calls[0].function
-                data = json.loads(call.arguments)
-                return schema(**data)
-            except (IndexError, AttributeError, json.JSONDecodeError, ValidationError) as exc:
-                last_error = exc
-                logger.warning("structured attempt {} failed: {}", attempt + 1, exc)
-        raise StructuredOutputError(
-            f"structured output failed after {max_retries} attempts: {last_error}"
-        )
+            call = resp.choices[0].message.tool_calls[0].function
+            data = json.loads(call.arguments)
+            return schema(**data)
+
+        try:
+            return await _attempt()
+        except RetryError as exc:
+            last = exc.last_attempt.exception()
+            logger.warning("structured output failed after {} attempts: {}", max_retries, last)
+            raise StructuredOutputError(
+                f"structured output failed after {max_retries} attempts: {last}"
+            ) from last
