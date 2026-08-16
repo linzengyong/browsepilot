@@ -34,6 +34,7 @@ class SearchService:
             stop=stop_after_attempt(2),
             retry=retry_if_exception_type((Exception,)),
             wait=wait_exponential(multiplier=1, min=1, max=5),
+            reraise=True,
         )
         async def _run() -> list[SearchResult]:
             # ddgs is sync; run in a thread to avoid blocking the event loop
