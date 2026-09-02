@@ -20,3 +20,8 @@ class Settings(BaseSettings):
     max_steps: int = 30
     max_replans: int = 2
     consecutive_failures_threshold: int = 3
+
+    # ── P2 生产安全层：限流 + 会话成本预算 ──
+    rate_limit_requests: int = 60
+    rate_limit_window_seconds: int = 60
+    session_budget_tokens: int = 200000

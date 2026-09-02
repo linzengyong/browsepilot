@@ -8,7 +8,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -18,6 +18,7 @@ from browsepilot.agent.api import has_pending_human_action, resume_task, run_tas
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
 from browsepilot.app.config import Settings
+from browsepilot.app.rate_limit import SlidingWindowRateLimiter
 from browsepilot.app.sessions import SessionInfo, SessionStore
 from browsepilot.model.provider import ModelProvider
 
@@ -82,6 +83,14 @@ def _build_history_entries(turns: list[dict]) -> list[str]:
     return entries
 
 
+# ── P2 生产安全层 ────────────────────────────────────────────────────────
+# 受限流的生成型 chat 端点（按客户端 IP 计数）。
+_RATE_LIMITED_PATHS = ("/chat/stream", "/chat/resume")
+# 会话预算估算：每个已记录 turn 的粗粒度 token 上限（含注入历史 + 回答生成）。
+# 估算性质 —— P4 换精确 token 统计。
+_EST_TOKENS_PER_TURN = 4000
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -90,6 +99,7 @@ def create_app(
     tracer: Tracer,
     session_store: SessionStore | None = None,
     checkpointer=None,
+    rate_limiter: SlidingWindowRateLimiter | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
 
@@ -120,6 +130,22 @@ def create_app(
         version=__version__,
         lifespan=lifespan,
     )
+
+    # ── Rate limiting middleware（P2 生产安全层）───────────────────────────
+    # 内存滑动窗口（单实例；scale 时换 Redis 实现）。只保护生成型 chat 端点，
+    # 按客户端 IP 限流：超限 → 429 + Retry-After（窗口秒数）。create_app 默认
+    # 不注入 limiter（单测旁路）；生产接线 _default_app 按 Settings 构造。
+    @app.middleware("http")
+    async def rate_limit_middleware(request, call_next):
+        if rate_limiter is not None and request.url.path in _RATE_LIMITED_PATHS:
+            client = request.client.host if request.client else "unknown"
+            if not rate_limiter.allow(client):
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "rate limit exceeded"},
+                    headers={"Retry-After": str(settings.rate_limit_window_seconds)},
+                )
+        return await call_next(request)
 
     def _active_checkpointer():
         """请求期实际使用的 checkpointer：优先显式传入，否则 lifespan 创建的。"""
@@ -175,7 +201,23 @@ def create_app(
         session_id 非空且配置了 session_store 时：把该会话已记录的轮次
         格式化为历史摘要注入模型上下文（多轮）；任务完成后把本轮
         task/answer 记录进 turns 表（持久化失败不破坏 SSE 契约）。
+
+        P2 预算闸门：已记录 turns 数 × 4000 估算会话累计 token 开销，超
+        session_budget_tokens → 429（估算性质，P4 换精确 token 统计）。
         """
+        # 预算检查必须在启动任务前完成（此处 429 返回 JSON，而非 SSE 错误流）
+        if req.session_id and session_store is not None:
+            turn_count = len(session_store.list_turns(req.session_id))
+            estimated = turn_count * _EST_TOKENS_PER_TURN
+            if estimated > settings.session_budget_tokens:
+                raise HTTPException(
+                    status_code=429,
+                    detail=(
+                        f"session token budget exceeded: {turn_count} turns × "
+                        f"{_EST_TOKENS_PER_TURN} ≈ {estimated} tokens > budget "
+                        f"{settings.session_budget_tokens}; start a new session"
+                    ),
+                )
 
         def _history_context() -> list[str]:
             if not req.session_id or session_store is None:
@@ -337,6 +379,9 @@ def _default_app() -> FastAPI:
         executor=executor,
         tracer=tracer,
         session_store=session_store,
+        rate_limiter=SlidingWindowRateLimiter(
+            settings.rate_limit_requests, settings.rate_limit_window_seconds
+        ),
     )
 
 
