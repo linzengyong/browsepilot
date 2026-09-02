@@ -4,14 +4,14 @@ from __future__ import annotations
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from pydantic import BaseModel
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 class SessionInfo(BaseModel):
@@ -37,6 +37,14 @@ class SessionStore:
             )
             """
         )
+        self._conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL,
+                task TEXT NOT NULL, answer TEXT NOT NULL, created_at TEXT NOT NULL
+            )
+            """
+        )
         self._conn.commit()
 
     def create_session(self, thread_id: str) -> str:
@@ -57,6 +65,24 @@ class SessionStore:
     def get_session(self, session_id: str) -> SessionInfo | None:
         row = self._conn.execute("SELECT * FROM sessions WHERE id=?", (session_id,)).fetchone()
         return self._row_to_info(row) if row else None
+
+    def record_turn(self, session_id: str, task: str, answer: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO turns (session_id, task, answer, created_at) VALUES (?,?,?,?)",
+                (session_id, task, answer, _now()),
+            )
+            self._conn.execute(
+                "UPDATE sessions SET updated_at=? WHERE id=?", (_now(), session_id)
+            )
+            self._conn.commit()
+
+    def list_turns(self, session_id: str) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT task, answer, created_at FROM turns WHERE session_id=? ORDER BY id",
+            (session_id,),
+        ).fetchall()
+        return [{"task": r[0], "answer": r[1], "created_at": r[2]} for r in rows]
 
     def list_sessions(self) -> list[SessionInfo]:
         rows = self._conn.execute("SELECT * FROM sessions ORDER BY pinned DESC, updated_at DESC").fetchall()

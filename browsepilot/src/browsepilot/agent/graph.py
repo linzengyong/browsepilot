@@ -111,13 +111,20 @@ def build_graph(
     async def answer(state: AgentState) -> dict:
         with tracer.span("answer"):
             if state.intent in ("chitchat", "knowledge_qa"):
+                # 直答路径同样把历史摘要放进上下文；无历史时保持原有 prompt
+                if state.history:
+                    history_text = "\n".join(state.history[-5:])
+                    user_content = f"历史对话：\n{history_text}\n\n任务：{state.task}"
+                else:
+                    user_content = state.task
                 chat_result: ChatResult = await provider.chat(
-                    [Message(role="user", content=state.task)]
+                    [Message(role="user", content=user_content)]
                 )
                 text = chat_result.text
             elif state.result_data.get("error"):
                 text = f"抱歉，这个任务暂时无法完成：{state.result_data['message']}。可以换个说法试试。"
             else:
+                history_text = "\n".join(state.history[-5:]) if state.history else "（无历史）"
                 answer_result: ChatResult = await provider.chat(
                     [
                         Message(
@@ -126,7 +133,10 @@ def build_graph(
                         ),
                         Message(
                             role="user",
-                            content=f"任务：{state.task}\n数据：{json.dumps(state.result_data, ensure_ascii=False)}",
+                            content=(
+                                f"历史对话：\n{history_text}\n\n"
+                                f"任务：{state.task}\n数据：{json.dumps(state.result_data, ensure_ascii=False)}"
+                            ),
                         ),
                     ]
                 )

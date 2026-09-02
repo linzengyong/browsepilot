@@ -19,6 +19,15 @@ def test_session_store_crud(tmp_path):
     assert store.get_session(sid) is None
 
 
+def test_record_and_list_turns(tmp_path):
+    store = SessionStore(tmp_path / "s.sqlite")
+    sid = store.create_session("t")
+    store.record_turn(sid, "查天气", "晴")
+    store.record_turn(sid, "查新闻", "ok")
+    turns = store.list_turns(sid)
+    assert [t["task"] for t in turns] == ["查天气", "查新闻"]
+
+
 def test_list_sessions_pinned_first_then_recency(tmp_path):
     store = SessionStore(tmp_path / "s.sqlite")
     a = store.create_session("t-a")

@@ -36,8 +36,40 @@ class PinResponse(BaseModel):
     pinned: bool
 
 
+class TurnRecord(BaseModel):
+    """一轮对话的持久化记录（/history 返回单元）。"""
+
+    task: str
+    answer: str
+    created_at: str
+
+
+class HistoryResponse(BaseModel):
+    session: SessionInfo
+    turns: list[TurnRecord]
+
+
 def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
+_HISTORY_MAX_ENTRIES = 5
+_HISTORY_MAX_ENTRY_CHARS = 200
+
+
+def _build_history_entries(turns: list[dict]) -> list[str]:
+    """Turns 行 → AgentState.history 摘要条目（多轮上下文）。
+
+    每条格式 "Q: <task> / A: <answer>"，压成单行、截断 ~200 字符；
+    只保留最近 5 条（answer 节点按 [-5:] 兜底同样限制）。
+    """
+    entries: list[str] = []
+    for turn in turns[-_HISTORY_MAX_ENTRIES:]:
+        task = (turn.get("task") or "").replace("\n", " ").strip()
+        answer = (turn.get("answer") or "").replace("\n", " ").strip()
+        entry = f"Q: {task} / A: {answer}"
+        entries.append(entry[:_HISTORY_MAX_ENTRY_CHARS])
+    return entries
 
 
 def create_app(
@@ -97,9 +129,28 @@ def create_app(
         _store().delete_session(session_id)
         return OkResponse()
 
+    @app.get("/history/{session_id}", response_model=HistoryResponse)
+    def history(session_id: str):
+        """List a session's recorded turns (task/answer/created_at, in order)."""
+        store = _store()
+        info = store.get_session(session_id)
+        if info is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return {"session": info.model_dump(), "turns": store.list_turns(session_id)}
+
     @app.post("/chat/stream")
     async def chat_stream(req: ChatRequest):
-        """执行一个用户任务，SSE 返回阶段事件与最终回答。"""
+        """执行一个用户任务，SSE 返回阶段事件与最终回答。
+
+        session_id 非空且配置了 session_store 时：把该会话已记录的轮次
+        格式化为历史摘要注入模型上下文（多轮）；任务完成后把本轮
+        task/answer 记录进 turns 表（持久化失败不破坏 SSE 契约）。
+        """
+
+        def _history_context() -> list[str]:
+            if not req.session_id or session_store is None:
+                return []
+            return _build_history_entries(session_store.list_turns(req.session_id))
 
         async def gen():
             yield _sse({"type": "phase", "phase": "start", "task": req.task[:100]})
@@ -110,12 +161,20 @@ def create_app(
                     executor=executor,
                     tracer=tracer,
                     session_id=req.session_id,
+                    history=_history_context(),
                 )
             except Exception as exc:
                 logger.exception("chat stream failed for task {!r}", req.task[:100])
                 yield _sse({"type": "error", "message": f"任务执行失败：{exc}"})
                 yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
                 return
+            if req.session_id and session_store is not None:
+                try:
+                    session_store.record_turn(
+                        req.session_id, req.task, result.get("final_answer", "")
+                    )
+                except Exception:
+                    logger.exception("record_turn failed for session {!r}", req.session_id)
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
             yield _sse(
                 {

@@ -21,6 +21,9 @@ class ExecutionStep(BaseModel):
 class AgentState(BaseModel):
     task: str = ""
     session_id: str = ""
+    history: list[str] = Field(
+        default_factory=list
+    )  # 历史摘要："Q: … / A: …"，最多 5 条、截断 ~200 字符
     intent: str = ""  # browser_task | chitchat | knowledge_qa
     tier: str = ""  # tier1 | tier2 | tier3
     plan: list[str] = Field(default_factory=list)

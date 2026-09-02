@@ -37,8 +37,10 @@ class StubProvider:
 
     def __init__(self):
         self.structured_calls = 0
+        self.last_user_content = ""
 
     async def chat(self, messages, *, model=None):
+        self.last_user_content = messages[-1].content
         return ChatResult(text=f"answer for {messages[-1].content[:20]}")
 
     async def stream(self, messages, *, model=None):
@@ -123,6 +125,19 @@ async def test_chitchat_routes_straight_to_answer_without_tool_call(tmp_path):
     lines = trace_path.read_text(encoding="utf-8").strip().splitlines()
     events = [json.loads(line) for line in lines]
     assert not [e for e in events if e["event_type"] == "tool_call"]
+
+
+@pytest.mark.asyncio
+async def test_answer_uses_history_context(tmp_path):
+    tracer = JsonlTracer(trace_id="t4", out_dir=tmp_path / "traces")
+    provider = StubProvider()
+    graph = build_graph(StubExecutor(), tracer, provider)
+    result = await graph.ainvoke(
+        AgentState(task="你好", history=["Q: 北京天气 / A: 晴 25°C"])
+    )
+    assert result["final_answer"] != ""
+    # answer 节点必须把历史摘要注入给模型的最后一条 user 消息
+    assert "北京天气" in provider.last_user_content
 
 
 @pytest.mark.asyncio
