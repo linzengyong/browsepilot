@@ -8,6 +8,6 @@
 | 2 | LLM 结构化输出之战：如何让 AI 稳定返回 JSON | P1 实战案例已补 | article-2-notes.md |
 | 3 | Agent 的"大脑"：意图识别系统的设计与演进 | 起草中，素材见 article-3-material.md | article-3-material.md |
 | 4 | Agent 的"体检"：如何构建评测集与评测体系 | P4 阶段产出 | — |
-| 5 | Agent 的"黑匣子"：可观测性系统的设计与实现 | P2 阶段产出 | — |
+| 5 | Agent 的"黑匣子"：可观测性系统的设计与实现 | P2 阶段产出 | article-5-material.md |
 
 > 联动规则：文章 1 的 "before" 数据在 P0 阶段采集（重构刚开始、旧代码状态最新鲜）；其余文章随阶段推进补充素材。
