@@ -72,7 +72,9 @@ export async function streamChat(
   const resp = await fetch(`${API_BASE}/chat/stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ task, session_id: sessionId }),
+    // 匿名会话 sessionId 为 null → 必须序列化为 ""（后端 ChatRequest
+    // session_id: str = ""；显式 null 会被 Pydantic 拒为 422）
+    body: JSON.stringify({ task, session_id: sessionId || '' }),
     signal,
   })
 

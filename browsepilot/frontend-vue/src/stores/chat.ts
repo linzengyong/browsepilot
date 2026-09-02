@@ -151,8 +151,10 @@ export const useChatStore = defineStore('chat', {
       this.humanPrompt = prompt
     },
 
-    async resumeChat(humanResponse: string) {
-      if (!this.sessionId) return
+    // 返回是否成功：失败时 UI 必须回到 waiting_human（HITL 横幅 + 输入重现），
+    // 否则停在 executing 死状态（横幅消失、无任何 pending 可恢复）。
+    async resumeChat(humanResponse: string): Promise<boolean> {
+      if (!this.sessionId) return false
       this.phase = 'executing'
       this.phaseMessage = '继续执行任务...'
       this.processing = true
@@ -161,10 +163,17 @@ export const useChatStore = defineStore('chat', {
         await resumeSession(this.sessionId, humanResponse, (eventType, data) => {
           this.dispatchEvent({ event: eventType, data })
         })
+        return true
       } catch (e: any) {
         const msg = e.message || '未知错误'
         this.error = '恢复失败: ' + msg
         this.messages.push({ role: 'assistant', content: `❌ 恢复失败: ${msg}` })
+        // HTTP 层失败（429 限流等）后服务端仍处于 pending，把阶段恢复为
+        // waiting_human：humanPrompt 未动（来自原 human_pending 事件），
+        // ChatPanel 在成功前不清空输入 —— 横幅重现即可直接重试
+        this.phase = 'waiting_human'
+        this.phaseMessage = ''
+        return false
       } finally {
         this.processing = false
         // resume 成功后后端会 record_turn —— 刷新会话列表（动态 import 避免

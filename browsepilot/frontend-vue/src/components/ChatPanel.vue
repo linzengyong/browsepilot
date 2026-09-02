@@ -96,10 +96,12 @@ function onSubmit(task: string) {
   startTask(task)
 }
 
-function onResume() {
+async function onResume() {
   const response = humanResponse.value.trim()
   if (!response || store.processing) return
-  humanResponse.value = ''
-  store.resumeChat(response)
+  // 成功后才清空输入：失败时 store 会把 phase 恢复为 waiting_human，
+  // 此处保留用户输入，HITL 横幅重现后可直接重试
+  const ok = await store.resumeChat(response)
+  if (ok) humanResponse.value = ''
 }
 </script>
