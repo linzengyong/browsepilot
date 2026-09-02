@@ -19,6 +19,19 @@ def test_session_store_crud(tmp_path):
     assert store.get_session(sid) is None
 
 
+def test_create_session_with_explicit_id(tmp_path):
+    """调用方提供 session_id 时行 id 用给定值（chat/stream 需要行 id ==
+    对外公布的 effective session_id）；缺省时仍自生成短 id（向后兼容）。"""
+    store = SessionStore(tmp_path / "s.sqlite")
+    sid = store.create_session("thread-1", session_id="fixed-session-1")
+    assert sid == "fixed-session-1"
+    info = store.get_session("fixed-session-1")
+    assert info is not None and info.thread_id == "thread-1"
+    # 不传 session_id：行为与旧签名一致（自生成 id，行可查）
+    auto = store.create_session("thread-2")
+    assert store.get_session(auto) is not None
+
+
 def test_record_and_list_turns(tmp_path):
     store = SessionStore(tmp_path / "s.sqlite")
     sid = store.create_session("t")

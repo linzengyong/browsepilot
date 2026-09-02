@@ -224,6 +224,45 @@ def test_multiturn_chat_records_and_feeds_history(tmp_path):
     assert all(t["created_at"] for t in turns)
 
 
+def test_anonymous_first_chat_auto_creates_session_row(tmp_path):
+    """Gap 修复：空 session_id 首聊自动建会话行 —— GET /sessions 从第一轮就
+    列出新会话（id == phase/start 公布的 effective session_id），且
+    /history/{id} 含本轮 task/answer（前端侧栏对全新会话不再为空）。"""
+    store = SessionStore(tmp_path / "s.sqlite")
+    client = TestClient(_make_store_app(tmp_path, FakeProvider(), store))
+
+    events = _stream_chat_events(client, "", "北京天气怎么样？")
+    assert [e["type"] for e in events] == ["phase", "answer", "done"]
+    assert events[-1]["stop_reason"] == "completed"
+    sid = events[0]["session_id"]  # phase/start 公布的 effective session_id
+    assert sid
+
+    # 恰好一个新会话，行 id == 公布 id（thread_id 同值，供 checkpointer 寻址）
+    sessions = client.get("/sessions").json()
+    assert [s["id"] for s in sessions] == [sid]
+    assert sessions[0]["thread_id"] == sid
+
+    # /history/{id} 往返：本轮按 task/answer 落库
+    resp = client.get(f"/history/{sid}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["session"]["id"] == sid
+    assert [t["task"] for t in body["turns"]] == ["北京天气怎么样？"]
+    assert [t["answer"] for t in body["turns"]] == ["合成回答"]
+
+    # 第二轮沿用同一 session_id：不重复建行，只追加一轮
+    # （任务带“天气”关键词，走规则路由，不经 structured fallback）
+    second = _stream_chat_events(client, sid, "那上海呢？天气怎么样？")
+    assert second[-1]["stop_reason"] == "completed"
+    sessions = client.get("/sessions").json()
+    assert [s["id"] for s in sessions] == [sid]
+    body = client.get(f"/history/{sid}").json()
+    assert [t["task"] for t in body["turns"]] == [
+        "北京天气怎么样？",
+        "那上海呢？天气怎么样？",
+    ]
+
+
 def test_chat_error_does_not_record_turn(tmp_path):
     """run_task 抛异常时只发 error/done SSE，且不往会话历史落库。"""
     store = SessionStore(tmp_path / "s.sqlite")
@@ -372,6 +411,51 @@ def test_hitl_interrupt_skips_history_and_resume_records_turn(tmp_path):
     assert [e["type"] for e in events] == ["answer", "done"]
     assert events[0]["text"] == "合成回答"
 
+    turns = client.get(f"/history/{sid}").json()["turns"]
+    assert [t["task"] for t in turns] == ["北京天气"]  # 原始任务（来自 checkpoint）
+    assert [t["answer"] for t in turns] == ["合成回答"]
+
+
+def test_resume_recreates_missing_session_row_before_recording(tmp_path):
+    """H3 落库兜底：会话行缺失（行被删但 checkpoint 仍在）时 /chat/resume 先
+    重建会话行再 record_turn —— /sessions 与 /history 保持一致，不丢本轮。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    store = SessionStore(tmp_path / "s.sqlite")
+    sid = store.create_session("thread-rs")
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="resume-ensure", out_dir=tmp_path),
+        session_store=store,
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+
+    # HITL 暂停后删掉会话行（模拟行缺失但 checkpoint 仍在的遗留状态）
+    first = _stream_chat_events(client, sid, "北京天气")
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert store.get_session(sid) is not None
+    store.delete_session(sid)
+    assert store.get_session(sid) is None
+
+    with client.stream(
+        "POST", "/chat/resume", json={"session_id": sid, "human_response": "确认"}
+    ) as resp:
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+
+    # 行被重建 + 本轮按原始 task 落库；/sessions 与 /history 一致
+    assert store.get_session(sid) is not None
+    sessions = client.get("/sessions").json()
+    assert [s["id"] for s in sessions] == [sid]
     turns = client.get(f"/history/{sid}").json()["turns"]
     assert [t["task"] for t in turns] == ["北京天气"]  # 原始任务（来自 checkpoint）
     assert [t["answer"] for t in turns] == ["合成回答"]

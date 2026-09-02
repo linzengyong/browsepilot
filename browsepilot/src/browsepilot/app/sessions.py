@@ -47,8 +47,14 @@ class SessionStore:
         )
         self._conn.commit()
 
-    def create_session(self, thread_id: str) -> str:
-        sid = str(uuid.uuid4())[:8]
+    def create_session(self, thread_id: str, session_id: str | None = None) -> str:
+        """Create a session row and return its id.
+
+        session_id is None → 自生成短随机 id（历史调用方行为不变）；
+        显式传入 → 行 id 使用给定值（chat/stream 需要行 id == 对外公布的
+        effective_session_id，/sessions 与 /history 才能寻址同一会话）。
+        """
+        sid = session_id or str(uuid.uuid4())[:8]
         now = _now()
         with self._lock:
             self._conn.execute(

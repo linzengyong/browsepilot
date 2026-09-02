@@ -198,16 +198,34 @@ def create_app(
     async def chat_stream(req: ChatRequest):
         """执行一个用户任务，SSE 返回阶段事件与最终回答。
 
-        session_id 非空且配置了 session_store 时：把该会话已记录的轮次
-        格式化为历史摘要注入模型上下文（多轮）；任务完成后把本轮
-        task/answer 记录进 turns 表（持久化失败不破坏 SSE 契约）。
+        配置了 session_store 时：会话行自动创建 —— 新会话（含空 session_id 的
+        匿名首聊）在请求开始时落 sessions 行（行 id == effective_session_id，
+        即 phase/start 公布的 id），客户端凭它对 /chat/resume、/history 寻址；
+        再把该会话已记录的轮次格式化为历史摘要注入模型上下文（多轮）；任务
+        完成后把本轮 task/answer 记录进 turns 表（持久化失败不破坏 SSE 契约）。
 
         P2 预算闸门：已记录 turns 数 × 4000 估算会话累计 token 开销，超
         session_budget_tokens → 429（估算性质，P4 换精确 token 统计）。
         """
+        # Effective session/thread id —— 匿名会话由服务端生成 uuid4，并在
+        # phase/start 与 human_pending 事件中公布，客户端才能凭它寻址
+        # /chat/resume（否则匿名会话的 HITL interrupt 不可恢复）。
+        effective_session_id = req.session_id or str(uuid4())
+
+        # 会话行自动创建：任何会话（含匿名首轮）第一次 chat 时落行，
+        # GET /sessions 与 /history 从第一轮起一致可见。必须先于预算检查 ——
+        # 预算按该会话已记录 turns 估算，行存在时两者口径一致。
+        if (
+            session_store is not None
+            and session_store.get_session(effective_session_id) is None
+        ):
+            session_store.create_session(
+                effective_session_id, session_id=effective_session_id
+            )
+
         # 预算检查必须在启动任务前完成（此处 429 返回 JSON，而非 SSE 错误流）
-        if req.session_id and session_store is not None:
-            turn_count = len(session_store.list_turns(req.session_id))
+        if session_store is not None:
+            turn_count = len(session_store.list_turns(effective_session_id))
             estimated = turn_count * _EST_TOKENS_PER_TURN
             if estimated > settings.session_budget_tokens:
                 raise HTTPException(
@@ -220,15 +238,11 @@ def create_app(
                 )
 
         def _history_context() -> list[str]:
-            if not req.session_id or session_store is None:
+            if session_store is None:
                 return []
-            return _build_history_entries(session_store.list_turns(req.session_id))
+            return _build_history_entries(session_store.list_turns(effective_session_id))
 
         async def gen():
-            # Effective session/thread id —— 匿名会话由服务端生成 uuid4，并在
-            # phase/start 与 human_pending 事件中公布，客户端才能凭它寻址
-            # /chat/resume（否则匿名会话的 HITL interrupt 不可恢复）。
-            effective_session_id = req.session_id or str(uuid4())
             yield _sse(
                 {
                     "type": "phase",
@@ -242,7 +256,7 @@ def create_app(
                 # LangGraph 内部随机（避免不可寻址的孤儿 checkpoint）。
                 config = {"configurable": {"thread_id": effective_session_id}}
                 if req.session_id and await has_pending_human_action(
-                    req.session_id,
+                    effective_session_id,
                     provider=provider,
                     executor=executor,
                     tracer=tracer,
@@ -262,7 +276,7 @@ def create_app(
                     provider=provider,
                     executor=executor,
                     tracer=tracer,
-                    session_id=req.session_id,
+                    session_id=effective_session_id,
                     history=_history_context(),
                     checkpointer=_active_checkpointer(),
                     config=config,
@@ -285,13 +299,17 @@ def create_app(
                     }
                 )
                 return
-            if req.session_id and session_store is not None:
+            # 会话行已在本请求开头 ensure（含匿名首轮）；此处对匿名会话同样
+            # 落库 —— 客户端凭 phase/start 公布的 id 即可在 /history 看到本轮。
+            if session_store is not None:
                 try:
                     session_store.record_turn(
-                        req.session_id, req.task, result.get("final_answer", "")
+                        effective_session_id, req.task, result.get("final_answer", "")
                     )
                 except Exception:
-                    logger.exception("record_turn failed for session {!r}", req.session_id)
+                    logger.exception(
+                        "record_turn failed for session {!r}", effective_session_id
+                    )
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
             yield _sse(
                 {
@@ -325,11 +343,17 @@ def create_app(
                 yield _sse({"type": "error", "message": f"恢复任务失败：{exc}"})
                 yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
                 return
-            # H3：resume 成功也落库（task 为原始任务，来自 checkpoint state values）
+            # H3：resume 成功也落库（task 为原始任务，来自 checkpoint state
+            # values）。会话行缺失时（行被删 / 修复前遗留 checkpoint）先重建行
+            # 再 record_turn，否则 /history 404 且 /sessions 不显示该会话。
             if session_store is not None:
                 task = result.get("task") or ""
                 if task and result.get("final_answer"):
                     try:
+                        if session_store.get_session(req.session_id) is None:
+                            session_store.create_session(
+                                req.session_id, session_id=req.session_id
+                            )
                         session_store.record_turn(
                             req.session_id, task, result.get("final_answer", "")
                         )
