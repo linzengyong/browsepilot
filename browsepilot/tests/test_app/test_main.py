@@ -147,6 +147,8 @@ def test_chat_stream_endpoint(tmp_path):
         phase, answer, done = events
         assert phase["phase"] == "start"
         assert phase["task"] == "北京今天天气怎么样？"
+        # 匿名运行也要在 phase/start 公布服务端生成的 session_id（可寻址句柄）
+        assert phase["session_id"]
         assert answer["text"] == "合成回答"
         assert done["stop_reason"] == "completed"
 
@@ -278,12 +280,52 @@ def test_chat_resume_after_interrupt(tmp_path):
         ]
     assert [e["type"] for e in first] == ["phase", "human_pending"]
     assert first[1]["human_prompt"] == "请确认城市"
+    # phase/start 与 human_pending 都携带有效 session_id（客户端据此寻址 resume）
+    assert first[0]["session_id"] == "s1"
+    assert first[1]["session_id"] == "s1"
 
     # 第二轮 /chat/resume 携带人工确认 → answer + done（无 phase/start）
     with client.stream(
         "POST",
         "/chat/resume",
         json={"session_id": "s1", "human_response": "确认，就北京"},
+    ) as resp:
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+    assert events[1]["stop_reason"] == "completed"
+
+
+def test_anonymous_hitl_surfaces_generated_session_id_for_resume(tmp_path):
+    """匿名会话 + HITL interrupt 不再死胡同：phase/start 先公布服务端生成的
+    session_id，human_pending 复用它 —— 客户端能凭它对 /chat/resume 寻址。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="anon-hitl", out_dir=tmp_path),
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+
+    # 空 session_id → 服务端生成 uuid4；interrupt 后流在 human_pending 终止
+    first = _stream_chat_events(client, "", "北京天气")
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert first[1]["human_prompt"] == "请确认城市"
+    assert first[0]["session_id"]  # phase/start 公布有效句柄
+    assert first[1]["session_id"] == first[0]["session_id"]  # human_pending 复用
+    sid = first[1]["session_id"]
+
+    # 用事件公布的 session_id 恢复 —— 匿名中断从此可寻址
+    with client.stream(
+        "POST", "/chat/resume", json={"session_id": sid, "human_response": "确认"}
     ) as resp:
         assert resp.status_code == 200
         events = [
@@ -315,6 +357,8 @@ def test_hitl_interrupt_skips_history_and_resume_records_turn(tmp_path):
     first = _stream_chat_events(client, sid, "北京天气")
     assert [e["type"] for e in first] == ["phase", "human_pending"]
     assert first[1]["human_prompt"] == "请确认城市"
+    assert first[0]["session_id"] == sid
+    assert first[1]["session_id"] == sid
     assert client.get(f"/history/{sid}").json()["turns"] == []  # 暂停轮不落库
 
     with client.stream(
@@ -348,6 +392,8 @@ def test_new_chat_on_pending_thread_rejected_with_clear_error(tmp_path):
 
     first = _stream_chat_events(client, "s1", "北京天气")
     assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert first[0]["session_id"] == "s1"
+    assert first[1]["session_id"] == "s1"
 
     blocked = _stream_chat_events(client, "s1", "上海天气")
     assert [e["type"] for e in blocked] == ["phase", "error", "done"]
@@ -382,11 +428,16 @@ def test_lifespan_wires_checkpointer_from_settings(tmp_path):
         first = _stream_chat_events(client, "s1", "北京天气")
         assert [e["type"] for e in first] == ["phase", "human_pending"]
         assert first[1]["human_prompt"] == "请确认城市"
+        assert first[0]["session_id"] == "s1"
+        assert first[1]["session_id"] == "s1"
 
         # 空 session_id → 服务端生成 uuid4 thread_id，正常跑完整流程
         empty = _stream_chat_events(client, "", "你好")
         assert [e["type"] for e in empty] == ["phase", "answer", "done"]
         assert empty[1]["text"] == "合成回答"
+        # 匿名运行的 phase/start 公布生成的 uuid4，且不与具名会话混淆
+        assert empty[0]["session_id"]
+        assert empty[0]["session_id"] != "s1"
 
         # resume 跨请求恢复 → 证明 saver 在整个 app 生命周期存活
         with client.stream(

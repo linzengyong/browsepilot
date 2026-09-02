@@ -183,12 +183,22 @@ def create_app(
             return _build_history_entries(session_store.list_turns(req.session_id))
 
         async def gen():
-            yield _sse({"type": "phase", "phase": "start", "task": req.task[:100]})
+            # Effective session/thread id —— 匿名会话由服务端生成 uuid4，并在
+            # phase/start 与 human_pending 事件中公布，客户端才能凭它寻址
+            # /chat/resume（否则匿名会话的 HITL interrupt 不可恢复）。
+            effective_session_id = req.session_id or str(uuid4())
+            yield _sse(
+                {
+                    "type": "phase",
+                    "phase": "start",
+                    "task": req.task[:100],
+                    "session_id": effective_session_id,
+                }
+            )
             try:
                 # H1：空 session_id 时服务端生成 uuid4 thread_id，不依赖
                 # LangGraph 内部随机（避免不可寻址的孤儿 checkpoint）。
-                thread_id = req.session_id or str(uuid4())
-                config = {"configurable": {"thread_id": thread_id}}
+                config = {"configurable": {"thread_id": effective_session_id}}
                 if req.session_id and await has_pending_human_action(
                     req.session_id,
                     provider=provider,
@@ -228,6 +238,7 @@ def create_app(
                 yield _sse(
                     {
                         "type": "human_pending",
+                        "session_id": effective_session_id,
                         "human_prompt": result.get("human_prompt") or "",
                     }
                 )
