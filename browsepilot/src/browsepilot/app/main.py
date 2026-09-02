@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field
@@ -15,12 +15,25 @@ from browsepilot.agent.api import run_task
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
 from browsepilot.app.config import Settings
+from browsepilot.app.sessions import SessionInfo, SessionStore
 from browsepilot.model.provider import ModelProvider
 
 
 class ChatRequest(BaseModel):
     task: str = Field(min_length=1)
     session_id: str = ""
+
+
+class RenameRequest(BaseModel):
+    name: str = Field(min_length=1)
+
+
+class OkResponse(BaseModel):
+    ok: bool = True
+
+
+class PinResponse(BaseModel):
+    pinned: bool
 
 
 def _sse(payload: dict) -> str:
@@ -33,6 +46,7 @@ def create_app(
     provider: ModelProvider,
     executor: ToolExecutor,
     tracer: Tracer,
+    session_store: SessionStore | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
 
@@ -52,6 +66,36 @@ def create_app(
     @app.get("/health")
     async def health():
         return {"status": "ok", "version": __version__, "model": settings.default_model}
+
+    # ── Session metadata CRUD ──────────────────────────────────────────────
+    # Endpoints run on the injected store; a store-less app (only possible in
+    # direct unit calls) answers 503 instead of crashing.
+    def _store() -> SessionStore:
+        if session_store is None:
+            raise HTTPException(status_code=503, detail="session store is not configured")
+        return session_store
+
+    @app.get("/sessions", response_model=list[SessionInfo])
+    def list_sessions():
+        """List sessions — pinned first, then most recently updated."""
+        return _store().list_sessions()
+
+    @app.patch("/sessions/{session_id}/rename", response_model=OkResponse)
+    def rename_session(session_id: str, body: RenameRequest):
+        """Rename a session."""
+        _store().rename_session(session_id, body.name)
+        return OkResponse()
+
+    @app.patch("/sessions/{session_id}/pin", response_model=PinResponse)
+    def toggle_pin(session_id: str):
+        """Toggle a session's pinned state; returns the new state."""
+        return PinResponse(pinned=_store().toggle_pin(session_id))
+
+    @app.delete("/sessions/{session_id}", response_model=OkResponse)
+    def delete_session(session_id: str):
+        """Delete a session (idempotent)."""
+        _store().delete_session(session_id)
+        return OkResponse()
 
     @app.post("/chat/stream")
     async def chat_stream(req: ChatRequest):
@@ -105,7 +149,14 @@ def _default_app() -> FastAPI:
     )
     executor = AppToolExecutor(WeatherService(), SearchService(), PageFetchService())
     tracer = JsonlTracer(out_dir=Path(settings.trace_dir))
-    return create_app(settings, provider=provider, executor=executor, tracer=tracer)
+    session_store = SessionStore(Path(settings.session_db_path))
+    return create_app(
+        settings,
+        provider=provider,
+        executor=executor,
+        tracer=tracer,
+        session_store=session_store,
+    )
 
 
 app = _default_app()

@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     model_api_key: str = ""
     model_base_url: str = ""
     trace_dir: str = "data/traces"
+    session_db_path: str = "data/sessions.sqlite"
     navigation_policy: str = "allow_https"  # allow_https | allowlist
     allowed_domains: list[str] = []
     session_timeout_seconds: int = 300
