@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     model_base_url: str = ""
     trace_dir: str = "data/traces"
     session_db_path: str = "data/sessions.sqlite"
+    checkpoint_db_path: str = "data/checkpoints.sqlite"
     navigation_policy: str = "allow_https"  # allow_https | allowlist
     allowed_domains: list[str] = []
     session_timeout_seconds: int = 300

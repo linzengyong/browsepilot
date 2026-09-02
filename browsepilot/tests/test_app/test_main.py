@@ -109,6 +109,7 @@ def test_settings_defaults():
     assert s.navigation_policy == "allow_https"
     assert s.allowed_domains == []
     assert s.max_steps == 30
+    assert s.checkpoint_db_path == "data/checkpoints.sqlite"
 
 
 def test_health_endpoint(tmp_path):
@@ -264,9 +265,8 @@ def test_chat_resume_after_interrupt(tmp_path):
     )
     client = TestClient(app)
 
-    # 第一轮 /chat/stream 触发 interrupt：状态暂停在 checkpointer 中
-    # （LangGraph 1.1.x ainvoke 不抛异常，直接返回带 __interrupt__ 的暂停态；
-    # T4 骨架 answer 为空，T5 会给 chat 加 human-pending 事件）
+    # 第一轮 /chat/stream 触发 interrupt：发 human_pending 事件并停止
+    #（T5 H2：不发空 answer/done、不落库；客户端随后转 /chat/resume）
     with client.stream(
         "POST", "/chat/stream", json={"task": "北京天气", "session_id": "s1"}
     ) as resp:
@@ -276,8 +276,8 @@ def test_chat_resume_after_interrupt(tmp_path):
             for line in resp.iter_lines()
             if line.startswith("data: ")
         ]
-    assert [e["type"] for e in first] == ["phase", "answer", "done"]
-    assert first[1]["text"] == ""  # answer 节点未执行，interrupt 暂停中
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert first[1]["human_prompt"] == "请确认城市"
 
     # 第二轮 /chat/resume 携带人工确认 → answer + done（无 phase/start）
     with client.stream(
@@ -294,6 +294,112 @@ def test_chat_resume_after_interrupt(tmp_path):
     assert [e["type"] for e in events] == ["answer", "done"]
     assert events[0]["text"] == "合成回答"
     assert events[1]["stop_reason"] == "completed"
+
+
+def test_hitl_interrupt_skips_history_and_resume_records_turn(tmp_path):
+    """H2+H3：interrupt 暂停不发空回答、不落库；resume 成功后按原始 task 落库。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    store = SessionStore(tmp_path / "s.sqlite")
+    sid = store.create_session("thread-h2")
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="h2", out_dir=tmp_path),
+        session_store=store,
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+
+    first = _stream_chat_events(client, sid, "北京天气")
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert first[1]["human_prompt"] == "请确认城市"
+    assert client.get(f"/history/{sid}").json()["turns"] == []  # 暂停轮不落库
+
+    with client.stream(
+        "POST", "/chat/resume", json={"session_id": sid, "human_response": "确认"}
+    ) as resp:
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+
+    turns = client.get(f"/history/{sid}").json()["turns"]
+    assert [t["task"] for t in turns] == ["北京天气"]  # 原始任务（来自 checkpoint）
+    assert [t["answer"] for t in turns] == ["合成回答"]
+
+
+def test_new_chat_on_pending_thread_rejected_with_clear_error(tmp_path):
+    """H4：已有待人工确认的线程上再发 /chat/stream → 明确报错，不静默 resume。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="h4", out_dir=tmp_path),
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+
+    first = _stream_chat_events(client, "s1", "北京天气")
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+
+    blocked = _stream_chat_events(client, "s1", "上海天气")
+    assert [e["type"] for e in blocked] == ["phase", "error", "done"]
+    assert "pending human action" in blocked[1]["message"]
+    assert blocked[-1]["stop_reason"] == "error"
+
+    # 线程仍可正常 resume
+    with client.stream(
+        "POST", "/chat/resume", json={"session_id": "s1", "human_response": "确认"}
+    ) as resp:
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+
+
+def test_lifespan_wires_checkpointer_from_settings(tmp_path):
+    """H1：未显式传 checkpointer 时，lifespan 按 checkpoint_db_path 创建共享
+    AsyncSqliteSaver —— interrupt 状态跨请求存活，shutdown 时回收。"""
+    ckpt_db = tmp_path / "ckpt.sqlite"
+    app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=str(ckpt_db)),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="h1", out_dir=tmp_path),
+    )
+    with TestClient(app) as client:
+        # 第一轮 interrupt（checkpointer 由 lifespan 创建并跨请求共享）
+        first = _stream_chat_events(client, "s1", "北京天气")
+        assert [e["type"] for e in first] == ["phase", "human_pending"]
+        assert first[1]["human_prompt"] == "请确认城市"
+
+        # 空 session_id → 服务端生成 uuid4 thread_id，正常跑完整流程
+        empty = _stream_chat_events(client, "", "你好")
+        assert [e["type"] for e in empty] == ["phase", "answer", "done"]
+        assert empty[1]["text"] == "合成回答"
+
+        # resume 跨请求恢复 → 证明 saver 在整个 app 生命周期存活
+        with client.stream(
+            "POST", "/chat/resume", json={"session_id": "s1", "human_response": "确认"}
+        ) as resp:
+            events = [
+                json.loads(line[len("data: ") :])
+                for line in resp.iter_lines()
+                if line.startswith("data: ")
+            ]
+        assert [e["type"] for e in events] == ["answer", "done"]
+        assert events[0]["text"] == "合成回答"
+    assert ckpt_db.exists()  # checkpoint 已落盘
 
 
 def test_resume_without_pending_interrupt_errors(tmp_path):

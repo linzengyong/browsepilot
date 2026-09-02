@@ -7,6 +7,13 @@ def test_state_defaults():
     assert s.plan == []
     assert s.total_steps == 0
     assert s.stop_reason == ""
+    assert s.degradation_log == []
+
+
+def test_state_degradation_log_roundtrip():
+    entry = {"strategy": "weather", "error": "city_not_found", "message": "无此城市"}
+    s = AgentState(degradation_log=[entry])
+    assert s.degradation_log == [entry]
 
 
 def test_state_with_task_and_fields():

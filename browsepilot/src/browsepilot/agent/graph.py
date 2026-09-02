@@ -2,9 +2,12 @@
 
 classify is hybrid rules-first (article 3): cheap keyword/regex rules win;
 the small model is the fallback via provider.structured; a final fallback
-defaults to tier1/search. execute extracts tool params via
-provider.structured and calls the ToolExecutor; answer synthesizes the
-final reply from result_data (chitchat/knowledge_qa answer directly;
+defaults to tier1/search. execute runs a per-intent strategy chain
+(_STRATEGY_CHAIN): each attempt extracts params via provider.structured
+(weather→search fallback reuses the raw task text as query), calls the
+ToolExecutor, and records every failed attempt in degradation_log until a
+strategy succeeds or all fail (all_strategies_failed). answer synthesizes
+the final reply from result_data (chitchat/knowledge_qa answer directly;
 tool failures are explained explicitly, never fabricated).
 """
 
@@ -20,7 +23,7 @@ from pydantic import BaseModel
 from browsepilot.agent.params import ReadPageParams, SearchParams, WeatherParams
 from browsepilot.agent.router import IntentResult, RouteDecision, classify_by_rules
 from browsepilot.agent.state import AgentState
-from browsepilot.agent.tools import ToolExecutor, ToolResult
+from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import TraceEvent, Tracer
 from browsepilot.model.messages import ChatResult, Message
 from browsepilot.model.provider import ModelProvider
@@ -37,10 +40,18 @@ def build_graph(
 ):
     workflow = StateGraph(AgentState)
 
-    _TOOL_BY_INTENT: dict[str, tuple[str, type[BaseModel]]] = {
-        "weather": ("weather", WeatherParams),
-        "search": ("search", SearchParams),
-        "read_page": ("fetch_page", ReadPageParams),
+    # 降级策略链：weather 城市未命中 → 用 task 原文搜索兑底；
+    # search/read_page 无有意义回退，失败即明确降级（all_strategies_failed）。
+    _STRATEGY_CHAIN: dict[str, list[str]] = {
+        "weather": ["weather", "search"],
+        "search": ["search"],
+        "read_page": ["fetch_page"],
+    }
+
+    _PARAM_MODELS: dict[str, type[BaseModel]] = {
+        "weather": WeatherParams,
+        "search": SearchParams,
+        "fetch_page": ReadPageParams,
     }
 
     async def classify(state: AgentState) -> dict:
@@ -75,45 +86,73 @@ def build_graph(
             return {"intent": decision.intent, "tier": decision.tier}
 
     async def execute(state: AgentState) -> dict:
+        """策略链循环：按 intent 的顺序尝试工具，每次失败记 degradation。
+
+        首次尝试按 intent 的 Params 结构化提取；天气回退到 search 时不再
+        结构化提取，直接用 task 原文作 query。全败 → result_data 返回
+        all_strategies_failed + degradation；全程 tool_call trace 可追溯。
+        """
         with tracer.span("execute", intent=state.intent):
-            tool_name, params_model = _TOOL_BY_INTENT[state.intent]
-            try:
-                params = await provider.structured(
-                    [
-                        Message(role="system", content="从用户任务中提取参数。"),
-                        Message(role="user", content=state.task),
-                    ],
-                    schema=params_model,
-                    model=small_model,
-                )
+            chain = _STRATEGY_CHAIN.get(state.intent, ["search"])
+            degradation: list[dict] = []
+            for tool_name in chain:
+                params_model = _PARAM_MODELS[tool_name]
+                try:
+                    if tool_name == "search" and state.intent == "weather" and degradation:
+                        # 天气城市未命中 → 用 task 原文搜索兑底，不再结构化提取
+                        params: BaseModel = SearchParams(query=state.task)
+                    else:
+                        params = await provider.structured(
+                            [
+                                Message(role="system", content="从用户任务中提取参数。"),
+                                Message(role="user", content=state.task),
+                            ],
+                            schema=params_model,
+                            model=small_model,
+                        )
+                except StructuredOutputError as exc:
+                    degradation.append(
+                        {
+                            "strategy": tool_name,
+                            "error": "param_extraction_failed",
+                            "message": str(exc),
+                        }
+                    )
+                    continue
                 tool_result = await executor.call(tool_name, params.model_dump())
-            except StructuredOutputError as exc:
-                tool_result = ToolResult(
-                    status="error", error_type="param_extraction_failed", error_message=str(exc)
+                tracer.emit(
+                    TraceEvent(
+                        trace_id=tracer.trace_id,
+                        span_id=tracer.new_span_id(),
+                        node="execute",
+                        event_type="tool_call",
+                        data={"tool": tool_name, "status": tool_result.status},
+                    )
                 )
-            tracer.emit(
-                TraceEvent(
-                    trace_id=tracer.trace_id,
-                    span_id=tracer.new_span_id(),
-                    node="execute",
-                    event_type="tool_call",
-                    data={"tool": tool_name, "status": tool_result.status},
-                )
-            )
-            if tool_result.status == "success":
-                if tool_result.data.get("needs_human"):
-                    # HITL：工具需要人工确认 → 交给 hitl 节点 interrupt
+                if tool_result.status == "success":
+                    if tool_result.data.get("needs_human"):
+                        # HITL：工具需要人工确认 → 交给 hitl 节点 interrupt
+                        return {
+                            "result_data": tool_result.data,
+                            "pending_human_action": True,
+                            "human_prompt": str(tool_result.data.get("human_prompt", "")),
+                            "degradation_log": state.degradation_log + degradation,
+                        }
                     return {
                         "result_data": tool_result.data,
-                        "pending_human_action": True,
-                        "human_prompt": str(tool_result.data.get("human_prompt", "")),
+                        "stop_reason": "",
+                        "degradation_log": state.degradation_log + degradation,
                     }
-                return {"result_data": tool_result.data, "stop_reason": ""}
+                degradation.append(
+                    {
+                        "strategy": tool_name,
+                        "error": tool_result.error_type,
+                        "message": tool_result.error_message,
+                    }
+                )
             return {
-                "result_data": {
-                    "error": tool_result.error_type,
-                    "message": tool_result.error_message,
-                }
+                "result_data": {"error": "all_strategies_failed", "degradation": degradation},
+                "degradation_log": state.degradation_log + degradation,
             }
 
     async def answer(state: AgentState) -> dict:
@@ -130,7 +169,14 @@ def build_graph(
                 )
                 text = chat_result.text
             elif state.result_data.get("error"):
-                text = f"抱歉，这个任务暂时无法完成：{state.result_data['message']}。可以换个说法试试。"
+                message = state.result_data.get("message")
+                if not message:
+                    # all_strategies_failed 形状：逐条拼出降级原因
+                    message = "；".join(
+                        f"{d.get('strategy', '')}: {d.get('message', '')}"
+                        for d in state.result_data.get("degradation", [])
+                    ) or state.result_data["error"]
+                text = f"抱歉，这个任务暂时无法完成：{message}。可以换个说法试试。"
             else:
                 history_text = "\n".join(state.history[-5:]) if state.history else "（无历史）"
                 answer_result: ChatResult = await provider.chat(

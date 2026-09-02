@@ -36,6 +36,9 @@ class AgentState(BaseModel):
     result_data: dict[str, Any] = Field(
         default_factory=dict
     )  # structured payload from the last tool call
+    degradation_log: list[dict[str, Any]] = Field(
+        default_factory=list
+    )  # 策略链每次失败的降级记录：{"strategy", "error", "message"}
     pending_human_action: bool = False  # HITL：工具返回 needs_human 后置位
     human_prompt: str = ""  # 待人工确认的问题（interrupt 载荷）
     human_response: str = ""  # resume 后人工确认的内容

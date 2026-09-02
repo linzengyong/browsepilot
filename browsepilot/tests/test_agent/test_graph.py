@@ -3,11 +3,13 @@ import json
 import pytest
 
 from browsepilot.agent.graph import build_graph
+from browsepilot.agent.params import WeatherParams
 from browsepilot.agent.router import IntentResult
 from browsepilot.agent.state import AgentState
 from browsepilot.agent.tools import ToolResult, ToolSpec
 from browsepilot.agent.tracer import JsonlTracer
 from browsepilot.model.messages import ChatResult
+from browsepilot.model.structured import StructuredOutputError
 
 
 class StubExecutor:
@@ -63,6 +65,57 @@ class StubProvider:
         if schema is IntentResult:
             return IntentResult(intent="weather", tier="tier1")
         return schema(city="北京", query="北京天气", url="https://example.com")
+
+
+class FlakyExecutor(StubExecutor):
+    """weather 城市未命中失败一次，search 兜底成功。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = []
+        self.fail_weather = True
+
+    async def call(self, name, arguments):
+        self.calls.append(name)
+        if name == "weather" and self.fail_weather:
+            return ToolResult(status="error", error_type="city_not_found", error_message="无此城市")
+        if name == "search":
+            return ToolResult(status="success", data={"results": []}, content="搜索结果")
+        return await super().call(name, arguments)
+
+
+class SearchFailingExecutor(StubExecutor):
+    """search 工具失败（search 意图只有单一策略，失败即最终降级）。"""
+
+    async def call(self, name, arguments):
+        if name == "search":
+            return ToolResult(status="error", error_type="search_timeout", error_message="搜索超时")
+        return await super().call(name, arguments)
+
+
+class RecordingExecutor(StubExecutor):
+    """记录每次工具调用的参数，search 返回空结果页。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "search":
+            return ToolResult(status="success", data={"results": []}, content="无结果")
+        return await super().call(name, arguments)
+
+
+class ParamFailingProvider(StubProvider):
+    """天气参数提取失败，其余 schema 正常。"""
+
+    async def structured(self, messages, *, schema, model=None, max_retries=3):
+        if schema is WeatherParams:
+            raise StructuredOutputError("无法解析城市参数")
+        return await super().structured(
+            messages, schema=schema, model=model, max_retries=max_retries
+        )
 
 
 @pytest.mark.asyncio
@@ -196,6 +249,7 @@ async def test_hitl_interrupt_then_resume(tmp_path):
     assert result["pending_human_action"] is True
     assert result["human_prompt"] == "请确认城市"
     assert result["final_answer"] == ""  # answer 节点尚未执行
+    assert result["degradation_log"] == []  # 链上首次尝试即命中 needs_human，无降级
     snap = await graph.aget_state(config)
     assert snap.next == ("hitl",)  # 暂停在 hitl 节点，等待 resume
     assert snap.values["pending_human_action"] is True
@@ -208,10 +262,66 @@ async def test_hitl_interrupt_then_resume(tmp_path):
 
 @pytest.mark.asyncio
 async def test_tool_failure_degrades_with_explicit_reason(tmp_path):
+    """全策略失败：result_data 报 all_strategies_failed，degradation 逐次可追溯。"""
     tracer = JsonlTracer(trace_id="t4", out_dir=tmp_path / "traces")
     graph = build_graph(FailingExecutor(), tracer, StubProvider())
     result = await graph.ainvoke(AgentState(task="北京天气怎么样？"))
     assert result["intent"] == "weather"
-    assert result["result_data"]["error"] == "service_error"
+    assert result["result_data"]["error"] == "all_strategies_failed"
+    degradation = result["result_data"]["degradation"]
+    assert [d["strategy"] for d in degradation] == ["weather", "search"]
+    assert all(d["error"] == "service_error" for d in degradation)
+    assert all(d["message"] == "boom" for d in degradation)
+    assert result["degradation_log"] == degradation
     assert "无法完成" in result["final_answer"]
     assert "boom" in result["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_weather_falls_back_to_search(tmp_path):
+    """天气城市未命中 → search 用 task 原文兜底；每次尝试都记 degradation + trace。"""
+    tracer = JsonlTracer(trace_id="t6", out_dir=tmp_path / "traces")
+    ex = FlakyExecutor()
+    graph = build_graph(ex, tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="北京天气"))
+    assert ex.calls == ["weather", "search"]
+    assert result["degradation_log"][0]["strategy"] == "weather"
+    assert result["degradation_log"][0]["error"] == "city_not_found"
+    assert result["result_data"]["results"] == []
+    # 两次尝试都有 tool_call 跟踪（status 一次 error 一次 success）
+    lines = (tmp_path / "traces" / "t6.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    events = [json.loads(line) for line in lines]
+    tool_calls = [e for e in events if e["event_type"] == "tool_call"]
+    assert [(e["data"]["tool"], e["data"]["status"]) for e in tool_calls] == [
+        ("weather", "error"),
+        ("search", "success"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_param_extraction_failure_falls_back_to_task_text_search(tmp_path):
+    """参数提取失败 → degradation 记录 param_extraction_failed；
+    search 兜底不再结构化提取，直接用 task 原文作 query。"""
+    tracer = JsonlTracer(trace_id="t7", out_dir=tmp_path / "traces")
+    ex = RecordingExecutor()
+    graph = build_graph(ex, tracer, ParamFailingProvider())
+    result = await graph.ainvoke(AgentState(task="北京天气"))
+    assert [name for name, _ in ex.calls] == ["search"]
+    assert ex.calls[0][1] == {"query": "北京天气"}  # 原文兜底，不重新结构化
+    assert result["degradation_log"] == [
+        {"strategy": "weather", "error": "param_extraction_failed", "message": "无法解析城市参数"}
+    ]
+    assert result["result_data"]["results"] == []
+
+
+@pytest.mark.asyncio
+async def test_search_intent_single_strategy_failure_is_final(tmp_path):
+    """search 意图无回退链：失败即 all_strategies_failed，degradation 只有一条。"""
+    tracer = JsonlTracer(trace_id="t8", out_dir=tmp_path / "traces")
+    graph = build_graph(SearchFailingExecutor(), tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="搜索 Python 教程"))
+    assert result["intent"] == "search"
+    assert result["result_data"]["error"] == "all_strategies_failed"
+    assert [d["strategy"] for d in result["result_data"]["degradation"]] == ["search"]
+    assert [d["strategy"] for d in result["degradation_log"]] == ["search"]
+    assert "搜索超时" in result["final_answer"]

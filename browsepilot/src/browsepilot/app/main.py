@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from browsepilot import __version__
-from browsepilot.agent.api import resume_task, run_task
+from browsepilot.agent.api import has_pending_human_action, resume_task, run_task
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
 from browsepilot.app.config import Settings
@@ -92,6 +95,21 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        # H1：生产接线——未显式传 checkpointer 时按 settings.checkpoint_db_path
+        # 创建共享 AsyncSqliteSaver（跨请求存活），shutdown 时随 async-with 关闭。
+        # 显式传入（测试）的 checkpointer 由调用方管理生命周期。
+        if checkpointer is None and settings.checkpoint_db_path:
+            db_path = Path(settings.checkpoint_db_path)
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+                await saver.setup()
+                app.state.checkpointer = saver
+                logger.info(
+                    "browsepilot v2.0 app starting (model={})", settings.default_model
+                )
+                yield
+                logger.info("browsepilot app shutting down (checkpointer closed)")
+            return
         logger.info("browsepilot v2.0 app starting (model={})", settings.default_model)
         yield
         logger.info("browsepilot app shutting down")
@@ -102,6 +120,10 @@ def create_app(
         version=__version__,
         lifespan=lifespan,
     )
+
+    def _active_checkpointer():
+        """请求期实际使用的 checkpointer：优先显式传入，否则 lifespan 创建的。"""
+        return checkpointer or getattr(app.state, "checkpointer", None)
 
     @app.get("/health")
     async def health():
@@ -163,6 +185,26 @@ def create_app(
         async def gen():
             yield _sse({"type": "phase", "phase": "start", "task": req.task[:100]})
             try:
+                # H1：空 session_id 时服务端生成 uuid4 thread_id，不依赖
+                # LangGraph 内部随机（避免不可寻址的孤儿 checkpoint）。
+                thread_id = req.session_id or str(uuid4())
+                config = {"configurable": {"thread_id": thread_id}}
+                if req.session_id and await has_pending_human_action(
+                    req.session_id,
+                    provider=provider,
+                    executor=executor,
+                    tracer=tracer,
+                    checkpointer=_active_checkpointer(),
+                ):
+                    # H4：线程已暂停在 HITL interrupt —— 拒绝新任务，不静默 resume
+                    yield _sse(
+                        {
+                            "type": "error",
+                            "message": "session has a pending human action; call /chat/resume",
+                        }
+                    )
+                    yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
+                    return
                 result = await run_task(
                     req.task,
                     provider=provider,
@@ -170,17 +212,25 @@ def create_app(
                     tracer=tracer,
                     session_id=req.session_id,
                     history=_history_context(),
-                    checkpointer=checkpointer,
-                    config=(
-                        {"configurable": {"thread_id": req.session_id}}
-                        if req.session_id
-                        else None
-                    ),
+                    checkpointer=_active_checkpointer(),
+                    config=config,
                 )
             except Exception as exc:
                 logger.exception("chat stream failed for task {!r}", req.task[:100])
                 yield _sse({"type": "error", "message": f"任务执行失败：{exc}"})
                 yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
+                return
+            if (
+                not result.get("final_answer")
+                and (result.get("__interrupt__") or result.get("pending_human_action"))
+            ):
+                # H2：HITL 暂停 —— 不发空 answer/done、不落库；告知客户端转 /chat/resume
+                yield _sse(
+                    {
+                        "type": "human_pending",
+                        "human_prompt": result.get("human_prompt") or "",
+                    }
+                )
                 return
             if req.session_id and session_store is not None:
                 try:
@@ -215,13 +265,25 @@ def create_app(
                     provider=provider,
                     executor=executor,
                     tracer=tracer,
-                    checkpointer=checkpointer,
+                    checkpointer=_active_checkpointer(),
                 )
             except Exception as exc:
                 logger.exception("chat resume failed for session {!r}", req.session_id)
                 yield _sse({"type": "error", "message": f"恢复任务失败：{exc}"})
                 yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
                 return
+            # H3：resume 成功也落库（task 为原始任务，来自 checkpoint state values）
+            if session_store is not None:
+                task = result.get("task") or ""
+                if task and result.get("final_answer"):
+                    try:
+                        session_store.record_turn(
+                            req.session_id, task, result.get("final_answer", "")
+                        )
+                    except Exception:
+                        logger.exception(
+                            "record_turn failed for session {!r}", req.session_id
+                        )
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
             yield _sse(
                 {
@@ -237,9 +299,11 @@ def create_app(
 
 
 def _default_app() -> FastAPI:
-    """Assemble the production wiring from Settings (BP_ env vars / .env)."""
-    from pathlib import Path
+    """Assemble the production wiring from Settings (BP_ env vars / .env).
 
+    checkpointer 不在此同步构造（aiosqlite 连接是异步的）：create_app 的
+    lifespan 会按 settings.checkpoint_db_path 创建共享 AsyncSqliteSaver。
+    """
     from browsepilot.agent.tracer import JsonlTracer
     from browsepilot.app.executor import AppToolExecutor
     from browsepilot.app.services.fetch import PageFetchService
