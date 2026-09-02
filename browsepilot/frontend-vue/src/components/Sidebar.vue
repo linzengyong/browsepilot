@@ -165,7 +165,7 @@ onMounted(() => {
 })
 
 function displayName(s: SessionSummary): string {
-  return s.custom_name || s.task_summary || s.id
+  return s.name || s.id
 }
 
 function toggleMenu(id: string) {
@@ -187,7 +187,7 @@ function onNewSession() {
 async function onRename(s: SessionSummary) {
   openMenuId.value = null
   renameTarget.value = s
-  renameValue.value = s.custom_name || s.task_summary || ''
+  renameValue.value = s.name || ''
   await nextTick()
   renameInput.value?.focus()
 }
@@ -202,7 +202,7 @@ async function onRenameConfirm() {
 
 async function onTogglePin(s: SessionSummary) {
   openMenuId.value = null
-  await sessionStore.togglePin(s.id, !s.pinned)
+  await sessionStore.togglePin(s.id)
 }
 
 function onDeleteClick(s: SessionSummary) {

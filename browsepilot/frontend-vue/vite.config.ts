@@ -13,7 +13,8 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': {
-        target: 'http://127.0.0.1:8000',
+        // V2 backend (src/browsepilot) — old :8000 backend is frozen and unused
+        target: 'http://127.0.0.1:8001',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
       },

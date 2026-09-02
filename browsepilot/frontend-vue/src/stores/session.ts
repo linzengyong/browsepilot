@@ -46,19 +46,18 @@ export const useSessionStore = defineStore('session', {
         })
         if (resp.ok) {
           const s = this.sessions.find(s => s.id === id)
-          if (s) s.custom_name = name
+          if (s) s.name = name
         }
       } catch {
         // Silently ignore
       }
     },
 
-    async togglePin(id: string, pinned: boolean) {
+    async togglePin(id: string) {
       try {
+        // v2：无请求体，后端翻转 pinned 并返回新状态 {pinned: bool}
         const resp = await fetch(`${API_BASE}/sessions/${id}/pin`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ pinned }),
         })
         if (resp.ok) {
           // Re-fetch from backend for correct sort order
@@ -72,18 +71,20 @@ export const useSessionStore = defineStore('session', {
 
     async loadSessionHistory(sessionId: string) {
       try {
+        // v2: GET /history/{id} → {session: SessionInfo, turns: [{task, answer, created_at}]}
         const resp = await fetch(`${API_BASE}/history/${sessionId}`)
         if (!resp.ok) return
         const data = await resp.json()
         const chatStore = useChatStore()
-        // Read from turns (new format) with fallback to top-level (old format)
-        const turns = data.turns || []
-        const lastTurn = turns.length ? turns[turns.length - 1] : {}
-        const task = lastTurn.task || data.task || ''
-        const answer = lastTurn.final_answer || data.final_answer || ''
-        const tokenUsage = lastTurn.token_usage || data.token_usage || undefined
-        chatStore.viewHistory(sessionId, task, answer, tokenUsage)
-        chatStore.turns = turns.map((t: any) => ({ turn_index: t.turn_index, task: t.task }))
+        const turns: Array<{ task: string; answer: string; created_at: string }> =
+          data.turns || []
+        const lastTurn = turns.length ? turns[turns.length - 1] : null
+        chatStore.viewHistory(
+          sessionId,
+          lastTurn ? lastTurn.task : '',
+          lastTurn ? lastTurn.answer : '',
+        )
+        chatStore.turns = turns.map((t, i) => ({ turn_index: i, task: t.task }))
         chatStore.currentTurnIndex = turns.length ? turns.length - 1 : 0
       } catch {
         // Silently ignore

@@ -4,18 +4,27 @@
     <!-- HITL banner -->
     <div v-if="store.phase === 'waiting_human'"
          class="bg-amber-50 border-b border-amber-300 px-4 py-3">
-      <div class="flex items-center justify-between">
-        <div class="flex items-center gap-2">
-          <span class="text-amber-600 text-sm">⏸</span>
-          <div>
-            <p class="text-amber-800 font-semibold text-sm">等待人工操作</p>
-            <p class="text-amber-600 text-xs mt-0.5">{{ store.humanPrompt }}</p>
-          </div>
+      <div class="flex items-center gap-2">
+        <span class="text-amber-600 text-sm">⏸</span>
+        <div>
+          <p class="text-amber-800 font-semibold text-sm">等待人工操作</p>
+          <p class="text-amber-600 text-xs mt-0.5">{{ store.humanPrompt }}</p>
         </div>
-        <button @click="store.resumeChat()"
-                :disabled="store.processing"
+      </div>
+      <!-- v2 HITL：人工结果经 POST /chat/resume {session_id, human_response} 回传 -->
+      <div class="flex items-center gap-2 mt-2">
+        <input
+          v-model="humanResponse"
+          type="text"
+          :disabled="store.processing"
+          placeholder="输入人工操作结果，例如：登录验证码是 1234"
+          class="flex-1 border border-amber-300 rounded bg-white px-2 py-1.5 text-[13px] outline-none disabled:opacity-50"
+          @keydown.enter="onResume"
+        />
+        <button @click="onResume"
+                :disabled="store.processing || !humanResponse.trim()"
                 class="bg-amber-500 text-white px-4 py-1.5 rounded text-sm hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors">
-          继续
+          提交并继续
         </button>
       </div>
     </div>
@@ -48,9 +57,9 @@
         正在查看历史会话 — 发送消息将继续此会话
       </div>
     </div>
-    <!-- Input — always shown -->
+    <!-- Input — always shown (disabled while processing or awaiting human input) -->
     <div class="px-4 pb-3">
-      <ChatInput :disabled="processing" @submit="onSubmit" />
+      <ChatInput :disabled="processing || store.phase === 'waiting_human'" @submit="onSubmit" />
     </div>
   </div>
 </template>
@@ -66,6 +75,7 @@ import ThinkingIndicator from './ThinkingIndicator.vue'
 const store = useChatStore()
 const { startTask } = useSSE()
 const scrollRef = ref<HTMLDivElement>()
+const humanResponse = ref('')
 
 const messages = computed(() => store.messages)
 const processing = computed(() => store.processing)
@@ -84,5 +94,12 @@ watch(
 
 function onSubmit(task: string) {
   startTask(task)
+}
+
+function onResume() {
+  const response = humanResponse.value.trim()
+  if (!response || store.processing) return
+  humanResponse.value = ''
+  store.resumeChat(response)
 }
 </script>

@@ -13,22 +13,14 @@ export interface SSEEvent {
   data: Record<string, any>
 }
 
+/** GET /sessions 条目 —— 与 v2 后端 SessionInfo 对齐 */
 export interface SessionSummary {
   id: string
-  task_summary: string
+  thread_id: string
+  name: string
+  pinned: boolean
   created_at: string
-  status: string
-  custom_name?: string
-  pinned?: boolean
-  turn_count?: number
-}
-
-export interface ReplayStep {
-  step_index: number
-  step: string
-  screenshot_path: string
-  timestamp: string
-  result: Record<string, any>
+  updated_at: string
 }
 
 export interface ChatState {

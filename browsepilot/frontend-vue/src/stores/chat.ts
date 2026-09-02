@@ -46,108 +46,70 @@ export const useChatStore = defineStore('chat', {
       this.humanPrompt = ''
     },
 
+    // v2 SSE 事件分发：phase(start) / answer / done / error / human_pending。
+    // 事件对象整体作为 data 传入（含 type 字段，见 api/chat.ts）。
     dispatchEvent(event: SSEEvent) {
       const d = event.data
       switch (event.event) {
-        case 'session_created':
-          this.sessionId = d.session_id
-          this.turns = [{ turn_index: d.turn_index || 0, task: '' }]
-          this.currentTurnIndex = 0
-          break
-
-        case 'turn_started':
-          this.turns.push({ turn_index: d.turn_index, task: '' })
-          this.currentTurnIndex = d.turn_index
-          // Reset step tracking for new turn
-          this.currentStepIndex = 0
-          this.totalSteps = 0
-          this.planSteps = []
-          break
-
-        case 'thinking_status':
-          this.phase = d.phase
-          this.phaseMessage = d.message || ''
-          // Don't set currentStepIndex here — thinking_status step_index is
-          // global across replans. step_start handles plan-relative increment.
-          break
-
-        case 'plan_generated':
-          this.planSteps = d.steps || []
-          this.totalSteps = this.planSteps.length
-          this.currentStepIndex = 0
-          this.phase = 'executing'
-          if (d.token_usage) {
-            this.promptTokens = d.token_usage.prompt || 0
-            this.completionTokens = d.token_usage.completion || 0
+        case 'phase':
+          // phase/start 公布 effective session_id（匿名会话由服务端生成），
+          // 客户端必须采纳它才能寻址 /history 与 /chat/resume。
+          if (d.phase === 'start') {
+            this.sessionId = d.session_id || this.sessionId
+            this.turns = [{ turn_index: 0, task: d.task || '' }]
+            this.currentTurnIndex = 0
+            this.phase = 'executing'
+            this.phaseMessage = '任务执行中...'
           }
           break
 
-        case 'step_start':
-          // Cap at totalSteps to handle retries pushing count past plan length
-          this.currentStepIndex = Math.min(
-            this.currentStepIndex + 1,
-            this.totalSteps,
-          )
-          break
-
-        case 'screenshot':
-          if (d.base64) this.screenshot = d.base64
-          break
-
-        case 'step_end':
-          break
-
-        case 'reflection':
-          if (d.decision === 'replan') this.phase = 'replanning'
-          break
-
-        case 'replan':
-          if (d.new_steps) {
-            this.planSteps = d.new_steps
-            this.totalSteps = this.planSteps.length
-            this.currentStepIndex = 0
+        case 'answer':
+          // v2 一次性给出完整回答（无 answer_chunk 流式分片）
+          {
+            const lastMsg = this.messages[this.messages.length - 1]
+            if (lastMsg && lastMsg.role === 'assistant' && lastMsg._streaming) {
+              lastMsg.content = d.text || ''
+              lastMsg._streaming = false
+            } else {
+              this.messages.push({ role: 'assistant', content: d.text || '' })
+            }
           }
+          this.phase = null
+          this.phaseMessage = ''
           break
 
-        case 'token_update':
-          this.promptTokens = d.prompt || 0
-          this.completionTokens = d.completion || 0
-          this.tokenEstimated = d.estimated || false
-          break
-
-        case 'answer_chunk':
-          // Streaming answer — append to last assistant message
-          const lastMsg = this.messages[this.messages.length - 1]
-          if (lastMsg && lastMsg.role === 'assistant' && lastMsg._streaming) {
-            lastMsg.content += d.content || ''
-          } else {
-            const msg: ChatMessage = { role: 'assistant', content: d.content || '', _streaming: true }
-            this.messages.push(msg)
-          }
-          break
-
-        case 'final_answer':
-          // Finalize streaming — mark message as complete
+        case 'done': {
+          // 结束帧：stop_reason ∈ {"", "completed", "error", ...}；
+          // error 情况 message 已由 error 事件展示，这里只收尾。
           const last = this.messages[this.messages.length - 1]
           if (last && last.role === 'assistant' && (last as any)._streaming) {
             (last as any)._streaming = false
-            // Update content if final_answer provides the full text
-            if (d.content && d.content !== last.content) {
-              last.content = d.content
-            }
-          } else if (d.content) {
-            this.messages.push({ role: 'assistant', content: d.content || '' })
+          }
+          if (d.stop_reason === 'error' && !this.error) {
+            // 防御：error 事件缺失时（done 单独携带 stop_reason=error）也给出可见提示
+            this.error = (d.result_data && d.result_data.message) || '任务失败'
+            this.messages.push({ role: 'assistant', content: `❌ 错误: ${this.error}` })
           }
           this.phase = null
+          this.phaseMessage = ''
           break
+        }
 
         case 'error':
-          this.messages.push({ role: 'assistant', content: `❌ 错误: ${d.message || '未知错误'}` })
+          this.error = d.message || '未知错误'
+          this.messages.push({
+            role: 'assistant',
+            content: `❌ 错误: ${d.message || '未知错误'}`,
+          })
           break
 
-        case 'human_intervention_needed':
+        case 'human_pending':
+          // HITL 暂停：流在此结束（无 answer/done）。采纳事件携带的
+          // session_id（服务端生成的匿名会话 id 只在 phase/start 与
+          // human_pending 中公布）。
           this.phase = 'waiting_human'
-          this.humanPrompt = d.prompt || ''
+          this.humanPrompt = d.human_prompt || ''
+          if (d.session_id) this.sessionId = d.session_id
           break
 
         default:
@@ -189,19 +151,26 @@ export const useChatStore = defineStore('chat', {
       this.humanPrompt = prompt
     },
 
-    async resumeChat() {
+    async resumeChat(humanResponse: string) {
       if (!this.sessionId) return
       this.phase = 'executing'
+      this.phaseMessage = '继续执行任务...'
       this.processing = true
 
       try {
-        await resumeSession(this.sessionId, (eventType, data) => {
+        await resumeSession(this.sessionId, humanResponse, (eventType, data) => {
           this.dispatchEvent({ event: eventType, data })
         })
       } catch (e: any) {
-        this.error = '恢复失败: ' + (e.message || '未知错误')
+        const msg = e.message || '未知错误'
+        this.error = '恢复失败: ' + msg
+        this.messages.push({ role: 'assistant', content: `❌ 恢复失败: ${msg}` })
       } finally {
         this.processing = false
+        // resume 成功后后端会 record_turn —— 刷新会话列表（动态 import 避免
+        // 与 session store 的静态 import 形成循环依赖）
+        const { useSessionStore } = await import('./session')
+        useSessionStore().fetchList()
       }
     },
   },
