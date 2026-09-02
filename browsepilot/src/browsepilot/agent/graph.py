@@ -32,6 +32,7 @@ def build_graph(
     provider: ModelProvider,
     *,
     small_model: str | None = None,
+    checkpointer=None,
 ):
     workflow = StateGraph(AgentState)
 
@@ -144,4 +145,4 @@ def build_graph(
     )
     workflow.add_edge("execute", "answer")
     workflow.add_edge("answer", END)
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

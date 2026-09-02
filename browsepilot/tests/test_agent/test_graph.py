@@ -126,6 +126,29 @@ async def test_chitchat_routes_straight_to_answer_without_tool_call(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_graph_with_sqlite_checkpointer_persists_state(tmp_path):
+    """Checkpointed run persists final state so aget_state can resume it.
+
+    Installed langgraph-checkpoint-sqlite (3.x) API: from_conn_string is an
+    async context manager that closes the underlying aiosqlite connection on
+    exit; setup() is idempotent and safe to call explicitly.
+    """
+    from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+
+    async with AsyncSqliteSaver.from_conn_string(str(tmp_path / "ckpt.sqlite")) as saver:
+        await saver.setup()
+        tracer = JsonlTracer(trace_id="t3", out_dir=tmp_path / "traces")
+        graph = build_graph(StubExecutor(), tracer, StubProvider(), checkpointer=saver)
+        config = {"configurable": {"thread_id": "session-1"}}
+        await graph.ainvoke(
+            AgentState(task="北京今天天气怎么样？", session_id="session-1"), config=config
+        )
+        state_snapshot = await graph.aget_state(config)
+        assert state_snapshot.values["intent"] == "weather"
+        assert state_snapshot.values["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
 async def test_tool_failure_degrades_with_explicit_reason(tmp_path):
     tracer = JsonlTracer(trace_id="t4", out_dir=tmp_path / "traces")
     graph = build_graph(FailingExecutor(), tracer, StubProvider())

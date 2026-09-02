@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn>=0.29",
     "sse-starlette>=1.8",
     "langgraph>=0.2",
+    "langgraph-checkpoint-sqlite>=2.0",
     "langchain>=0.3",
     "langchain-openai>=0.2",
     "mcp>=1.25.0",
