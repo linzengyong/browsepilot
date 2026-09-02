@@ -24,6 +24,18 @@ class StubExecutor:
         return ToolResult(content="stub")
 
 
+class HumanNeedingExecutor(StubExecutor):
+    """Executor whose weather tool needs human confirmation before answering."""
+
+    async def call(self, name, arguments):
+        if name == "weather":
+            return ToolResult(
+                status="success",
+                data={"needs_human": True, "human_prompt": "请确认城市"},
+            )
+        return await super().call(name, arguments)
+
+
 class FailingExecutor:
     async def list_tools(self):
         return [ToolSpec(name="echo", description="echo back")]
@@ -161,6 +173,37 @@ async def test_graph_with_sqlite_checkpointer_persists_state(tmp_path):
         state_snapshot = await graph.aget_state(config)
         assert state_snapshot.values["intent"] == "weather"
         assert state_snapshot.values["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_hitl_interrupt_then_resume(tmp_path):
+    """HITL 骨架：execute 返回 needs_human → hitl 节点 interrupt 暂停；
+    Command(resume=…) 继续并把 human_response 带回最终状态。
+
+    LangGraph 1.1.x 实测：ainvoke 不抛 GraphInterrupt，而是直接返回
+    带 __interrupt__ 的暂停状态（checkpoint 里 next=('hitl',)）。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+
+    tracer = JsonlTracer(trace_id="t5", out_dir=tmp_path / "traces")
+    graph = build_graph(
+        HumanNeedingExecutor(), tracer, StubProvider(), checkpointer=MemorySaver()
+    )
+    config = {"configurable": {"thread_id": "s1"}}
+    result = await graph.ainvoke(AgentState(task="北京天气"), config=config)
+    assert result.get("__interrupt__")  # interrupt 已触发，运行暂停
+    assert result["pending_human_action"] is True
+    assert result["human_prompt"] == "请确认城市"
+    assert result["final_answer"] == ""  # answer 节点尚未执行
+    snap = await graph.aget_state(config)
+    assert snap.next == ("hitl",)  # 暂停在 hitl 节点，等待 resume
+    assert snap.values["pending_human_action"] is True
+    resumed = await graph.ainvoke(Command(resume="确认，就北京"), config=config)
+    assert resumed["human_response"] == "确认，就北京"
+    assert resumed["pending_human_action"] is False
+    assert resumed["hitl_triggered_count"] == 1
+    assert resumed["stop_reason"] == "completed"
 
 
 @pytest.mark.asyncio

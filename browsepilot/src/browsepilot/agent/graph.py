@@ -14,6 +14,7 @@ import json
 from typing import cast
 
 from langgraph.graph import END, StateGraph
+from langgraph.types import interrupt
 from pydantic import BaseModel
 
 from browsepilot.agent.params import ReadPageParams, SearchParams, WeatherParams
@@ -100,6 +101,13 @@ def build_graph(
                 )
             )
             if tool_result.status == "success":
+                if tool_result.data.get("needs_human"):
+                    # HITL：工具需要人工确认 → 交给 hitl 节点 interrupt
+                    return {
+                        "result_data": tool_result.data,
+                        "pending_human_action": True,
+                        "human_prompt": str(tool_result.data.get("human_prompt", "")),
+                    }
                 return {"result_data": tool_result.data, "stop_reason": ""}
             return {
                 "result_data": {
@@ -143,16 +151,35 @@ def build_graph(
                 text = answer_result.text
             return {"final_answer": text, "stop_reason": "completed"}
 
+    async def hitl(state: AgentState) -> dict:
+        """Human-in-the-loop：interrupt 暂停执行，resume 后带上人工确认回 answer。"""
+        with tracer.span("hitl"):
+            response = interrupt({"human_prompt": state.human_prompt})
+            return {
+                "human_response": str(response),
+                "pending_human_action": False,
+                "hitl_triggered_count": state.hitl_triggered_count + 1,
+            }
+
+    def _route_execute_result(state: AgentState) -> str:
+        if state.pending_human_action and state.hitl_triggered_count == 0:
+            return "hitl"
+        return "answer"
+
     def _route_after_classify(state: AgentState) -> str:
         return "answer" if state.intent in ("chitchat", "knowledge_qa") else "execute"
 
     workflow.add_node("classify", classify)
     workflow.add_node("execute", execute)
+    workflow.add_node("hitl", hitl)
     workflow.add_node("answer", answer)
     workflow.set_entry_point("classify")
     workflow.add_conditional_edges(
         "classify", _route_after_classify, {"execute": "execute", "answer": "answer"}
     )
-    workflow.add_edge("execute", "answer")
+    workflow.add_conditional_edges(
+        "execute", _route_execute_result, {"hitl": "hitl", "answer": "answer"}
+    )
+    workflow.add_edge("hitl", "answer")
     workflow.add_edge("answer", END)
     return workflow.compile(checkpointer=checkpointer)

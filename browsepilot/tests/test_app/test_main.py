@@ -54,6 +54,18 @@ class FakeExecutor:
         return ToolResult(status="success", data={"city": "北京", "temperature_c": 25.0})
 
 
+class HumanNeedingExecutor(FakeExecutor):
+    """weather 工具返回 needs_human → 需要人工确认（HITL interrupt）。"""
+
+    async def call(self, name, arguments):
+        if name == "weather":
+            return ToolResult(
+                status="success",
+                data={"needs_human": True, "human_prompt": "请确认城市"},
+            )
+        return await super().call(name, arguments)
+
+
 def _make_app(tmp_path, settings=None):
     return create_app(
         settings,
@@ -236,6 +248,81 @@ def test_history_404_for_missing_session(tmp_path):
     resp = client.get("/history/no-such-session")
     assert resp.status_code == 404
     assert resp.json()["detail"] == "session not found"
+
+
+def test_chat_resume_after_interrupt(tmp_path):
+    """POST /chat/resume 恢复被 HITL interrupt 暂停的任务（SSE 同 chat）。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    checkpointer = MemorySaver()
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=HumanNeedingExecutor(),
+        tracer=JsonlTracer(trace_id="api-test", out_dir=tmp_path),
+        checkpointer=checkpointer,
+    )
+    client = TestClient(app)
+
+    # 第一轮 /chat/stream 触发 interrupt：状态暂停在 checkpointer 中
+    # （LangGraph 1.1.x ainvoke 不抛异常，直接返回带 __interrupt__ 的暂停态；
+    # T4 骨架 answer 为空，T5 会给 chat 加 human-pending 事件）
+    with client.stream(
+        "POST", "/chat/stream", json={"task": "北京天气", "session_id": "s1"}
+    ) as resp:
+        assert resp.status_code == 200
+        first = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in first] == ["phase", "answer", "done"]
+    assert first[1]["text"] == ""  # answer 节点未执行，interrupt 暂停中
+
+    # 第二轮 /chat/resume 携带人工确认 → answer + done（无 phase/start）
+    with client.stream(
+        "POST",
+        "/chat/resume",
+        json={"session_id": "s1", "human_response": "确认，就北京"},
+    ) as resp:
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+    assert events[1]["stop_reason"] == "completed"
+
+
+def test_resume_without_pending_interrupt_errors(tmp_path):
+    """无待处理 interrupt 时 resume 必须明确报错，而不是静默开新任务。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    app = create_app(
+        Settings(_env_file=None),
+        provider=FakeProvider(),
+        executor=FakeExecutor(),
+        tracer=JsonlTracer(trace_id="api-test", out_dir=tmp_path),
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+    with client.stream(
+        "POST", "/chat/resume", json={"session_id": "s1", "human_response": "确认"}
+    ) as resp:
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    types = [e["type"] for e in events]
+    assert "error" in types
+    assert types[-1] == "done"
+    assert events[-1]["stop_reason"] == "error"
+    assert "answer" not in types
+    assert "no pending human action" in events[types.index("error")]["message"]
 
 
 def test_history_feed_only_last_five_turns(tmp_path):

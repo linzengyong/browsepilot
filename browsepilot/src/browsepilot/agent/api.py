@@ -17,13 +17,46 @@ async def run_task(
     tracer: Tracer,
     session_id: str = "",
     history: list[str] | None = None,
+    checkpointer=None,
+    config: dict | None = None,
 ) -> dict:
     """Run one user task through the graph. Returns the state as a dict.
 
     history: 已格式化的历史摘要（"Q: … / A: …"，最多 5 条、截断 ~200 字符），
     注入本轮 AgentState，让 answer 节点带多轮上下文合成回答。
+
+    checkpointer: 传入时按 checkpoint 持久化（HITL interrupt 暂停必需）；
+    config 携带 thread_id（通常 = session_id）供后续 resume_task 续跑。
     """
-    graph = build_graph(executor, tracer, provider)
+    graph = build_graph(executor, tracer, provider, checkpointer=checkpointer)
     return await graph.ainvoke(
-        AgentState(task=task, session_id=session_id, history=history or [])
+        AgentState(task=task, session_id=session_id, history=history or []),
+        config=config,
     )
+
+
+async def resume_task(
+    session_id: str,
+    human_response: str,
+    *,
+    provider: ModelProvider,
+    executor: ToolExecutor,
+    tracer: Tracer,
+    checkpointer=None,
+) -> dict:
+    """Resume a run paused at a HITL interrupt. Returns the state as a dict.
+
+    Guard: 无待处理 interrupt 时 LangGraph 会用 resume 值静默开一次全新运行，
+    所以这里先 aget_state 校验（next 非空且 pending_human_action 为真），
+    否则抛 RuntimeError，而不是误开新任务。
+    """
+    from langgraph.types import Command
+
+    graph = build_graph(executor, tracer, provider, checkpointer=checkpointer)
+    config = {"configurable": {"thread_id": session_id}}
+    snapshot = await graph.aget_state(config)
+    if not snapshot.next or not snapshot.values.get("pending_human_action"):
+        raise RuntimeError(
+            f"session {session_id!r} has no pending human action to resume"
+        )
+    return await graph.ainvoke(Command(resume=human_response), config=config)

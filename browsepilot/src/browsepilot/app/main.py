@@ -11,7 +11,7 @@ from loguru import logger
 from pydantic import BaseModel, Field
 
 from browsepilot import __version__
-from browsepilot.agent.api import run_task
+from browsepilot.agent.api import resume_task, run_task
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
 from browsepilot.app.config import Settings
@@ -22,6 +22,13 @@ from browsepilot.model.provider import ModelProvider
 class ChatRequest(BaseModel):
     task: str = Field(min_length=1)
     session_id: str = ""
+
+
+class ResumeRequest(BaseModel):
+    """POST /chat/resume：恢复被 HITL interrupt 暂停的任务。"""
+
+    session_id: str = Field(min_length=1)
+    human_response: str = Field(min_length=1)
 
 
 class RenameRequest(BaseModel):
@@ -79,6 +86,7 @@ def create_app(
     executor: ToolExecutor,
     tracer: Tracer,
     session_store: SessionStore | None = None,
+    checkpointer=None,
 ) -> FastAPI:
     settings = settings or Settings()
 
@@ -162,6 +170,12 @@ def create_app(
                     tracer=tracer,
                     session_id=req.session_id,
                     history=_history_context(),
+                    checkpointer=checkpointer,
+                    config=(
+                        {"configurable": {"thread_id": req.session_id}}
+                        if req.session_id
+                        else None
+                    ),
                 )
             except Exception as exc:
                 logger.exception("chat stream failed for task {!r}", req.task[:100])
@@ -175,6 +189,39 @@ def create_app(
                     )
                 except Exception:
                     logger.exception("record_turn failed for session {!r}", req.session_id)
+            yield _sse({"type": "answer", "text": result.get("final_answer", "")})
+            yield _sse(
+                {
+                    "type": "done",
+                    "stop_reason": result.get("stop_reason", ""),
+                    "result_data": result.get("result_data", {}),
+                }
+            )
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
+
+    @app.post("/chat/resume")
+    async def chat_resume(req: ResumeRequest):
+        """恢复被 HITL interrupt 暂停的任务，SSE 返回最终回答（无 phase/start）。
+
+        校验失败（无待处理 interrupt）时发 error/done，不静默开新任务。
+        """
+
+        async def gen():
+            try:
+                result = await resume_task(
+                    req.session_id,
+                    req.human_response,
+                    provider=provider,
+                    executor=executor,
+                    tracer=tracer,
+                    checkpointer=checkpointer,
+                )
+            except Exception as exc:
+                logger.exception("chat resume failed for session {!r}", req.session_id)
+                yield _sse({"type": "error", "message": f"恢复任务失败：{exc}"})
+                yield _sse({"type": "done", "stop_reason": "error", "result_data": {}})
+                return
             yield _sse({"type": "answer", "text": result.get("final_answer", "")})
             yield _sse(
                 {

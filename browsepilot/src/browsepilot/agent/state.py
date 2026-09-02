@@ -36,3 +36,7 @@ class AgentState(BaseModel):
     result_data: dict[str, Any] = Field(
         default_factory=dict
     )  # structured payload from the last tool call
+    pending_human_action: bool = False  # HITL：工具返回 needs_human 后置位
+    human_prompt: str = ""  # 待人工确认的问题（interrupt 载荷）
+    human_response: str = ""  # resume 后人工确认的内容
+    hitl_triggered_count: int = 0  # 本线程已触发 interrupt 的次数（防循环）
