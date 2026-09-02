@@ -59,7 +59,7 @@ Langfuse/LangSmith 至今一个都没实现——**这正是设计要证明的�
 要点：
 
 - **降级链可追溯**（文章 3 主题的观测面）：`execute` 的策略链循环每尝试一个策略就发一条 `tool_call`，失败与成功一样留痕。一次"天气城市未命中 → 用任务原文搜索兑底"的降级，在 trace 里就是同一个 `execute` span 内两条 `tool_call`（`weather` error → `search` success）。触发实验见"样例 demo-a"。
-- **`tool_call` 只带 `status`，不带失败原因**：`error_type`/`error_message`（如 `city_not_found`）只进 `degradation_log`（AgentState）与最终回答文案，不进事件。trace 记"发生了什么"，状态记"为什么"，用户看到"怎么解释"——三层分工，可作文章讨论点（要不要给 `tool_call.data` 补 `error_type`，或引入真正的 `error` 事件）。
+- **`tool_call` 只带 `status`，不带失败原因**：`error_type`/`error_message`（如 `city_not_found`）只进 `AgentState`（degradation_log / result_data）与回答文案，不进事件。trace 记"发生了什么"，状态记"为什么"，用户看到"怎么解释"——三层分工，可作文章讨论点（要不要给 `tool_call.data` 补 `error_type`，或引入真正的 `error` 事件）。
 - **`llm_call` 是唯一"非节点"事件**：node=`llm`，独立 span_id、无 `node_end` 配对、无父 span（见"开放问题 1"）。
 - **classify 规则命中时 span 内没有 `llm_call`**——文章 3 的"规则优先省调用"在观测数据里直接可见（语料 167 次决策全部规则命中、confidence 1.0，见数据节）。
 - 全图四个节点 classify/execute/answer/hitl 都有 span 包着，但 **hitl 在既有语料里零样本**（见数据节缺口）。
@@ -68,7 +68,7 @@ Langfuse/LangSmith 至今一个都没实现——**这正是设计要证明的�
 
 ### Bug 形态：start/end 各拿一个新鲜 span_id
 
-Tracer 诞生（`a51d011`，2026-08-03）时 `TraceEvent` 就有 `parent_span_id` 字段，但**从第一天起没有任何生产者给它赋值**——一个空转的设计字段。更糟的是 `TraceSpan` 的实现让 span 根本拼不起来（`git show 0a20ea2^` 的原文）：
+Tracer 诞生（`a51d011`，2026-08-03）时 `TraceEvent` 就有 `parent_span_id` 字段，但**从第一天起没有任何生产者给它赋值**——一个空转的设计字段。更糟的是 `TraceSpan` 的实现让 span 根本拼不起来（`git show 0a20ea2^` 的原文 + 注解，`# ←` 注释为注解）：
 
 ```python
 def __enter__(self) -> "TraceSpan":
@@ -115,7 +115,7 @@ def __exit__(self, exc_type, exc, tb) -> None:
 - **进出栈用 contextvar token**：`__enter__` 里 `self._stack_token = self._stack.set(current + (self._span_id,))`，`__exit__` 里 `self._stack.reset(self._stack_token)`。用 token 复位而不是"弹栈"，异常路径也安全（`__exit__` 无论成败都会执行）。
 - **栈是 task-local 的**：`JsonlTracer.__init__` 里 `self._span_stack: ContextVar[tuple[str, ...]] = ContextVar(f"bp_span_stack_{id(self)}", default=())`。名字带实例 id，多 tracer 实例互不串栈。
 
-为什么非得 contextvar 而不是实例属性 `self._current_span`？因为生产组装里 **JsonlTracer 是进程级的单例**（`app/main.py::_default_app` 每个进程一个），而 FastAPI 是并发处理请求的——两个用户的任务可以交错执行。若用实例属性记"当前 span"，请求 A 的 classify 会把请求 B 的 execute 认成自己的子节点；contextvar 让每个 asyncio 任务看到自己的栈快照，互不污染。这是"并发安全不是加分项而是必须项"的典型例子：单测里顺序跑看不出来，上服务器并发才炸。
+为什么非得 contextvar 而不是实例属性 `self._current_span`？因为生产组装里 **JsonlTracer 是进程级的单例**（`src/browsepilot/app/main.py::_default_app` 每个进程一个），而 FastAPI 是并发处理请求的——两个用户的任务可以交错执行。若用实例属性记"当前 span"，请求 A 的 classify 会把请求 B 的 execute 认成自己的子节点；contextvar 让每个 asyncio 任务看到自己的栈快照，互不污染。这是"并发安全不是加分项而是必须项"的典型例子：单测里顺序跑看不出来，上服务器并发才炸。
 
 修复同 commit 补的测试（`tests/test_agent/test_tracer.py`）把语义钉死：
 
@@ -143,7 +143,7 @@ class TracingModelProvider:
 
 三个方法 `chat` / `stream` / `structured` 同构：`time.monotonic()` 起表 → 委托 `inner` → 完成后 `_emit("chat"|"stream"|"structured", model, start)`。`_emit` 发一条 `llm_call` 事件（node=`llm`），data 带 `kind`/`model`/`session_id`，`duration_ms` 填单调钟耗时。
 
-包装发生在装配处（`agent/api.py::run_task` / `resume_task`）：构图时把 provider 包一层再传进 `build_graph`。效果：
+包装发生在装配处（`src/browsepilot/agent/api.py::run_task` / `api.py::resume_task`）：构图时把 provider 包一层再传进 `build_graph`。效果：
 
 - **图代码零改动**：classify 的意图分类、execute 的参数提取、answer 的回答合成——每一处 LLM 调用自动留痕，无需在 graph.py 加任何埋点。
 - **想拆掉观测 = 少包一层**：装饰器嵌套是纯加法，A/B 对比"带观测 vs 不带"的延迟/成本影响很容易做。
@@ -177,11 +177,11 @@ def emit(self, event: TraceEvent) -> None:
 
 > Deserializing unregistered type browsepilot.agent.state.AgentState from checkpoint. This will be blocked in a future version...
 
-即：未来的 strict-msgpack（`LANGGRAPH_STRICT_MSGPACK`）会拒绝未注册的自定义类型，需要显式注册 `allowed_msgpack_modules=["browsepilot.agent.state"]`，注册点应在 saver 构造处（`app/main.py::lifespan` 的 `AsyncSqliteSaver.from_conn_string(...)`）。截至本素材采集，该注册**尚未落地**（源码中无 `allowed_msgpack_modules`）——这是"模型层契约稳定、序列化格式演进"主题的真实案例，与 trace 事件模型的"格式无关"是同一枚硬币的两面：TraceEvent 用纯 dict + JSON 保住可迁移性，checkpoint 用 pydantic 模型 + msgpack 但欠着一笔格式升级的债。
+即：未来的 strict-msgpack（`LANGGRAPH_STRICT_MSGPACK`）会拒绝未注册的自定义类型，需要显式注册 `allowed_msgpack_modules=["browsepilot.agent.state"]`，注册点应在 saver 构造处（`src/browsepilot/app/main.py::lifespan` 的 `AsyncSqliteSaver.from_conn_string(...)`）。截至本素材采集，该注册**尚未落地**（源码中无 `allowed_msgpack_modules`）——这是"模型层契约稳定、序列化格式演进"主题的真实案例，与 trace 事件模型的"格式无关"是同一枚硬币的两面：TraceEvent 用纯 dict + JSON 保住可迁移性，checkpoint 用 pydantic 模型 + msgpack 但欠着一笔格式升级的债。
 
 ## session_id 关联链与 trace_id 粒度（诚实观察）
 
-**关联链（代码路径）**：HTTP 层推导 `effective_session_id`（`app/main.py::/chat/stream`：`req.session_id or str(uuid4())`）→ `agent/api.py::run_task(session_id=...)` → 同时喂给 `AgentState(session_id=...)`（进图、随 checkpoint 持久化、当 thread_id 用）和 `TracingModelProvider(..., session_id)`（进 `llm_call.data.session_id`）。所以 trace 里能按 `data.session_id` 把一个会话的所有 LLM 调用捞出来——**但只有 llm_call 事件带会话号**，node/tool 事件不带。
+**关联链（代码路径）**：HTTP 层推导 `effective_session_id`（`src/browsepilot/app/main.py::/chat/stream`：`req.session_id or str(uuid4())`）→ `src/browsepilot/agent/api.py::run_task(session_id=...)` → 同时喂给 `AgentState(session_id=...)`（进图、随 checkpoint 持久化、当 thread_id 用）和 `TracingModelProvider(..., session_id)`（进 `llm_call.data.session_id`）。所以 trace 里能按 `data.session_id` 把一个会话的所有 LLM 调用捞出来——**但只有 llm_call 事件带会话号**，node/tool 事件不带。
 
 **trace_id 粒度 = tracer 生命周期**（写文章最值得讲透的一点）：
 
@@ -301,11 +301,11 @@ uv run uvicorn browsepilot.app.main:app --port 8001
 | span 语义测试 | `tests/test_agent/test_tracer.py`（share_span_id / nested / sibling 三个用例） |
 | llm_call 测试 | `tests/test_agent/test_tracer_provider.py` |
 | 图事件形状断言（decision/tool_call 的 data 契约） | `tests/test_agent/test_graph.py`（含 chitchat 无 tool_call 断言） |
-| 进程级 tracer 组装 / trace_dir 配置 | `app/main.py::_default_app`；`app/config.py::Settings.trace_dir`（默认 `data/traces`） |
-| session_id 推导与传入 | `app/main.py::/chat/stream` → `api.py::run_task` |
+| 进程级 tracer 组装 / trace_dir 配置 | `src/browsepilot/app/main.py::_default_app`；`src/browsepilot/app/config.py::Settings.trace_dir`（默认 `data/traces`） |
+| session_id 推导与传入 | `src/browsepilot/app/main.py::/chat/stream` → `api.py::run_task` |
 | eval 采集（每次一个 tracer、3 场景一文件） | `eval/run_eval.py::main`、`run_eval.py::run_all` |
 | 场景定义 | `eval/scenarios/p0_weather.yaml`、`p0_search.yaml`、`p0_read_page.yaml` |
-| checkpoint saver 构造（msgpack 注册点，未落地） | `app/main.py::lifespan`（`AsyncSqliteSaver.from_conn_string`） |
+| checkpoint saver 构造（msgpack 注册点，未落地） | `src/browsepilot/app/main.py::lifespan`（`AsyncSqliteSaver.from_conn_string`） |
 | 真实语料 / 本次 demo 文件 | `data/traces/*.jsonl`（gitignored）；`demo-a-weather-city-miss.jsonl`、`demo-b-search-all-fail.jsonl`、`demo-c-rule-miss-model-fallback.jsonl` |
 
 ## 一句话素材（供作者选用）
