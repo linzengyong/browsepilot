@@ -6,6 +6,7 @@ from browsepilot.agent.graph import build_graph
 from browsepilot.agent.state import AgentState
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
+from browsepilot.agent.tracer_provider import TracingModelProvider
 from browsepilot.model.provider import ModelProvider
 
 
@@ -28,7 +29,12 @@ async def run_task(
     checkpointer: 传入时按 checkpoint 持久化（HITL interrupt 暂停必需）；
     config 携带 thread_id（通常 = session_id）供后续 resume_task 续跑。
     """
-    graph = build_graph(executor, tracer, provider, checkpointer=checkpointer)
+    graph = build_graph(
+        executor,
+        tracer,
+        TracingModelProvider(provider, tracer, session_id),
+        checkpointer=checkpointer,
+    )
     return await graph.ainvoke(
         AgentState(task=task, session_id=session_id, history=history or []),
         config=config,
@@ -55,7 +61,12 @@ async def resume_task(
     """
     from langgraph.types import Command
 
-    graph = build_graph(executor, tracer, provider, checkpointer=checkpointer)
+    graph = build_graph(
+        executor,
+        tracer,
+        TracingModelProvider(provider, tracer, session_id),
+        checkpointer=checkpointer,
+    )
     config = {"configurable": {"thread_id": session_id}}
     snapshot = await graph.aget_state(config)
     if not snapshot.next or not snapshot.values.get("pending_human_action"):
