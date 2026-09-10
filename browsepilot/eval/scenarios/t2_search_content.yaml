@@ -1,0 +1,14 @@
+# p0-search 的内容断言（原语义）——**fragile**：
+# "答案含 2024"依赖 ddgs 返回的具体内容；P1 通过 → P2 漂移的教训（P4-D6）。
+# 失败照实打 FAIL，但**不计入门禁 exit code**（run_eval 单独计数，报告里引用）。
+# T5 会把 p0-search 正式拆成"结构版 + 内容版"，本文件先承接内容版语义。
+id: t2_search_content
+name: 搜索结果内容（fragile：依赖 ddgs 返回的具体内容）
+prompt: "搜索一下 Python 3.13 正式发布时间"
+tier: tier1
+tags: [acceptance]
+mode: both
+fragile: true
+checks:
+  - type: contains_keyword
+    keywords: ["2024"]

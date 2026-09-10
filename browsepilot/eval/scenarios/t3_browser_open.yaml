@@ -1,0 +1,19 @@
+# Tier3（真浏览器，mode: real —— mock 的 fake 依赖没有浏览器 → SKIP 不计失败）。
+#
+# 提示词必须绕过 read_page 规则才能落到 browser_task：
+# - 任务里**不能**出现 http(s)://（_URL_RE 优先 → tier2 read_page）
+# - 不能出现 打开/访问/读/阅读/摘要（read_page 关键字规则排在 browser_task 之前）
+# - "浏览器" / "搜索框" / 电商站点词是 browser_task 的强触发词
+id: t3_browser_open
+name: 浏览器打开页面并说清看到什么（Tier3，需真浏览器）
+prompt: "用浏览器看看 example.com 页面上有什么内容"
+tier: tier3
+tags: [browser, acceptance]
+mode: real
+checks:
+  - type: tier_is
+    expected: tier3
+  - type: tools_called
+    tools: [browser_open]
+  - type: contains_keyword
+    keywords: ["Example", "example.com"]

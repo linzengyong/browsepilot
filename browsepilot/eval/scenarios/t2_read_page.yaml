@@ -1,0 +1,13 @@
+# 任务里带 URL → 路由规则直接判 tier2 read_page（_URL_RE 优先于其他规则）；
+# 正常路径 = fetch_page 拿到正文（HTTP 抓取失败时策略链会升级到 browser_open）。
+id: t2_read_page
+name: 网页正文获取（Tier2：fetch_page + 正文关键字）
+prompt: "打开 https://www.python.org 告诉我页面的主要内容"
+tier: tier2
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: tools_called
+    tools: [fetch_page]
+  - type: contains_keyword
+    keywords: ["Python"]

@@ -1,7 +1,11 @@
+# P0 场景（保留）：任务里带 URL → tier2 read_page；内容断言与 t2_read_page 重叠
+# （T5 迁移时会去重，这里先保留 P0 的原始语义与 id）。
 id: p0-read-page
 name: 网页内容获取（Tier2）
 prompt: "打开 https://www.python.org 告诉我页面主要内容"
 tier: tier2
+tags: [acceptance]
+mode: both
 checks:
   - type: contains_keyword
     keywords: ["Python"]

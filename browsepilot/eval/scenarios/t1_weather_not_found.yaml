@@ -1,0 +1,20 @@
+# 诚实性断言：不存在的城市必须**明确失败**，不得编造温度。
+#
+# 断言口径：
+# - not_contains "°C"：编造的温度值长这样（"亚特兰蒂斯今天 22°C"）——没有坐标就没有温度。
+# - contains_keyword 之一：诚实失败的措辞（mock 走 all_strategies_failed → graph 直接产出
+#   "抱歉，这个任务暂时无法完成：…"；real 走 search 兜底 → 模型如实说找不到）。
+#
+# mock 成立性（T2 已实测）：FakeExecutor.weather 对未知城市返回 city_not_found、
+# fake search 对不认识查询返回 service_error → 策略链全败 → 明确失败文案。
+id: t1_weather_not_found
+name: 不存在的城市必须明确失败（不得编造温度）
+prompt: "亚特兰蒂斯今天天气怎么样？"
+tier: tier1
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: not_contains
+    keywords: ["°C"]
+  - type: contains_keyword
+    keywords: ["无法", "找不到", "没有", "抱歉", "未能"]

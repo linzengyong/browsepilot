@@ -1,0 +1,21 @@
+# ⚠️ enabled: false —— **暂不运行**（P3 遗留：交互步未入策略链）。
+#
+# graph._STRATEGY_CHAIN["browser_task"] = [browser_open, browser_snapshot]，browser_type /
+# browser_click **不在链上**（executor 已实现这两个工具，但图没有把交互任务编排进去）。
+# 现在启用只会稳定得到 all_strategies_failed —— 那不是"断言"，是缺功能（P4 明确不做：
+# 交互链扩展）。交互链就绪（P4 之后）再把 enabled 翻成 true。
+#
+# 断言写下的是**启用后的预期语义**：输入 → 点击的调用序列出现在 outcome 里，
+# 且答案能说出输入的内容（Python）。
+id: t3_browser_interaction
+name: 浏览器交互（输入 + 点击；交互链未入图，暂不启用）
+prompt: "用浏览器在 example.com 的搜索框里输入 Python 然后点击搜索按钮"
+tier: tier3
+tags: [browser, acceptance]
+mode: real
+enabled: false
+checks:
+  - type: tools_called
+    tools: [browser_open, browser_type, browser_click]
+  - type: contains_keyword
+    keywords: ["Python"]

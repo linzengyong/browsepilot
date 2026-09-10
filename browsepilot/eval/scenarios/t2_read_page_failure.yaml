@@ -1,0 +1,18 @@
+# 失败路径的诚实性断言：无效 URL 必须明确失败——不得把异常栈丢给用户，
+# 也不得编造页面内容（编造内容会在答案里出现具体正文，这里只守住两条硬底线）。
+#
+# mock 成立性：FakeExecutor.fetch_page 对不认识的主机返回 service_error、
+# browser_open 返回 browser_unavailable → 策略链全败 → graph 产出
+# "抱歉，这个任务暂时无法完成：…"（real 模式同一路径：DNS 失败 → FetchError/navigation_failed）。
+# .invalid 是 RFC 2606 保留 TLD，永远不可解析。
+id: t2_read_page_failure
+name: 无效 URL 必须明确失败（不抛栈、不编造）
+prompt: "打开 https://this-domain-does-not-exist.invalid/404 告诉我页面内容"
+tier: tier2
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: not_contains
+    keywords: ["Traceback"]
+  - type: contains_keyword
+    keywords: ["无法", "失败", "抱歉", "未能"]

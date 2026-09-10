@@ -1,0 +1,24 @@
+# mode: mock —— 这条断言只能在**没有浏览器**的环境下为真。
+#
+# mock 的 FakeExecutor 与 AppToolExecutor(browser=None) 同形状（6 个浏览器工具 →
+# browser_unavailable），tier3 任务必须明确降级（"暂时无法完成"），既不能崩（无 Traceback）
+# 也不能编造页面内容。真实模式下同一行为的观测点是 _run_real 的池启动失败分支
+# （WARNING + browser_unavailable），而不是场景断言（真实模式没有"没有浏览器"的稳定构造）。
+#
+# 提示词：绕过 read_page 规则（不能出现 URL/打开/访问/读/阅读/摘要），
+# "浏览器" 是 browser_task 的强触发词 → tier3。
+id: degrade_browser_unavailable
+name: 无浏览器环境 tier3 任务明确降级（mock：FakeExecutor 无浏览器）
+prompt: "用浏览器看看 example.com 页面上有什么内容"
+tier: tier3
+tags: [degrade]
+mode: mock
+checks:
+  - type: tier_is
+    expected: tier3
+  - type: tools_called
+    tools: [browser_open, browser_snapshot]
+  - type: contains_keyword
+    keywords: ["无法", "暂时", "不可用"]
+  - type: not_contains
+    keywords: ["Traceback"]

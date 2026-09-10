@@ -1,7 +1,13 @@
+# P0 内容断言的原始形态（"答案含 2024"）：依赖 ddgs 返回的**具体内容** → P4-D6 标 fragile
+# （失败照实打印，但不计入门禁 exit code）。结构化解耦版见 t2_search_structural；
+# T5 会正式把 p0-search 拆成"结构版 + 内容版"（本文件先承接内容版语义）。
 id: p0-search
 name: 搜索结果提取（Tier1）
 prompt: "搜索一下 Python 3.13 正式发布时间"
 tier: tier1
+tags: [acceptance]
+mode: both
+fragile: true
 checks:
   - type: contains_keyword
     keywords: ["2024"]

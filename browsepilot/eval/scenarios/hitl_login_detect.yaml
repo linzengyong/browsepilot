@@ -1,0 +1,24 @@
+# HITL（登录墙 → 人工介入）：需真浏览器，且 headless 下检测行为需实测 → 不进 CI/acceptance
+# 门禁，留给 T7 真实运行（docs/v2-p3-report.md §十二 的运维前置）。
+#
+# 断言为什么只有这两条（读 graph.py 的结论，T2 已用探针实测）：
+# - HITL 的 interrupt 发生在 **answer 之前** → final_answer / stop_reason 都还是空
+#   （stop_reason 默认 ""，**不是** partial）。所以不断言 stop_reason/final_answer ——
+#   那会是一条永远失败的断言。
+# - needs_human（= outcome["pending_human_action"]）才是 HITL 的稳定信号。
+# - tools_called [browser_open]：证明这确实是**浏览器链**上触发的暂停（browser_open 成功后
+#   executor 采样可见文本/密码框，高置信命中才置 needs_human）。
+#
+# 提示词：必须绕过 read_page 规则（不能出现 http(s)://、打开/访问/读/阅读/摘要），
+# "浏览器" 是强触发词；github.com/login 有可见密码框（高置信）且国内可达。
+# 运维前置：BP_BROWSER_HEADLESS=false；URL 由模型按 BrowserParams.url 描述补齐 scheme。
+id: hitl_login_detect
+name: 登录墙触发 HITL（需真浏览器 + headful；T7 验证）
+prompt: "用浏览器去 github.com/login 这个登录页看看能不能直接进去"
+tier: tier3
+tags: [hitl, browser]
+mode: real
+checks:
+  - type: needs_human
+  - type: tools_called
+    tools: [browser_open]

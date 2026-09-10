@@ -1,0 +1,16 @@
+# P4-D6 的**结构断言**：断言"搜索工具被真的调用了"+"答案里出现了结果链接"，
+# 不依赖 ddgs 返回的**具体内容**（那会随引擎/时间漂移 → 见 t2_search_content 的 fragile 标记）。
+#
+# tier 字段是**路由实际层级**：search 规则命中 tier1（与 p0-search 一致）；
+# t2_ 前缀是场景库分组（P2 语义），不是路由层级。
+id: t2_search_structural
+name: 搜索结果结构（工具调用 + 链接；不依赖具体内容）
+prompt: "搜索一下 Python 3.13 正式发布时间"
+tier: tier1
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: tools_called
+    tools: [search]
+  - type: contains_keyword
+    keywords: ["http"]

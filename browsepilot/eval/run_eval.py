@@ -4,6 +4,21 @@ Modes:
   --mock   : fake provider/executor (no network, no tokens) — CI mode
   default  : real model + services + browser pool (needs BP_MODEL_API_KEY) — acceptance mode
 
+场景选择（P4-T2 的 skip 语义，schema 见 :mod:`eval.scenarios`）：
+
+- ``mode`` 不匹配 → ``[SKIP]``，**不计入** pass/fail 计数、不影响 exit code。理由：mock 的
+  FakeProvider/FakeExecutor 只伪造天气/搜索/抓页（**没有浏览器**），tier3/HITL/多轮场景在 mock 下
+  是"跑不了"而不是"跑失败了"——把环境不匹配读成失败会污染成功率，而成功率是报告的核心数据。
+- ``enabled=False`` → ``[DISABLED]``（列出但不跑）：P3 遗留的交互链、未接线的多轮 harness。
+- ``fragile=True`` 的场景失败照实打 FAIL，但**不计入** exit code（P4-D6：ddgs 内容漂移不是回归），
+  汇总里单独计数，供报告引用。
+- ``--tag`` 按 tag 过滤（T7 的 ``--tag acceptance``）；未知 tag 由 argparse 直接拒绝。
+
+工具名注入（P4-T1 ``checks.py`` 的约定）：v2 的 ``AgentState`` 不写 ``execution_log``，所以这里在
+executor 外面套一层 :class:`_ToolCallRecorder`，把"图确实调过哪些工具"（含失败调用）注入
+``outcome["tool_calls"]``——否则 mock 下所有 ``tools_called`` 断言都是假失败。T3 的 harness 在这条
+注入链上继续加用量/耗时采集（``token_usage`` / ``duration_ms``）。
+
 真实模式（P4 评测体系的前置接线，运维前置见 docs/v2-p3-report.md §十二「P4 评测前置（运维）」）：
 
 - **注入浏览器池**：``AppToolExecutor`` 拿不到池时 6 个 Tier3 工具统一返回
@@ -25,13 +40,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from browsepilot.agent.api import run_task
+from browsepilot.agent.tools import ToolExecutor, ToolResult, ToolSpec
 from browsepilot.agent.tracer import JsonlTracer, Tracer
 from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
-from eval.scenarios import Check, Scenario, load_scenarios
+from eval.scenarios import KNOWN_TAGS, Check, Scenario, load_scenarios
 
 SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
 
@@ -47,14 +65,42 @@ def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
     return result.passed, result.detail
 
 
+class _ToolCallRecorder:
+    """包装 executor，记录 ``call()`` 的**全部**工具名（含失败调用）。
+
+    ``outcome["tool_calls"]`` 的唯一数据源：v2 的 ``AgentState`` 不写 ``execution_log``
+    （见 ``eval/checks.py`` 的 ``_tool_names`` 说明），所以"图确实把任务交给了哪个工具"由 harness
+    注入。失败调用同样记录——降级链走到哪一步、哪一步失败了，靠的就是这串工具名；无调用 →
+    空列表，``tools_called`` 断言据此 FAIL（没数据不算通过）。
+    """
+
+    def __init__(self, executor: ToolExecutor) -> None:
+        self._executor = executor
+        self.calls: list[str] = []
+
+    async def list_tools(self) -> list[ToolSpec]:
+        return await self._executor.list_tools()
+
+    async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
+        self.calls.append(name)
+        return await self._executor.call(name, arguments)
+
+
 async def _run_scenario(
     scenario: Scenario, *, provider, executor, tracer, teardown=None
 ) -> tuple[dict, list[tuple[bool, str]]]:
-    """跑一个场景并评估 checks；``teardown``（real 模式 = ``executor.aclose``）在 finally 里跑。"""
+    """跑一个场景并评估 checks；``teardown``（real 模式 = ``executor.aclose``）在 finally 里跑。
+
+    executor 外面套 :class:`_ToolCallRecorder`：工具名必须以 ``outcome["tool_calls"]`` 的形式
+    进 outcome（``tools_called`` 断言的数据源）。teardown 拿到的仍是**原** executor —— 归还页面
+    是它的职责，跟记录无关。
+    """
+    recorder = _ToolCallRecorder(executor)
     try:
         outcome = await run_task(
-            scenario.prompt, provider=provider, executor=executor, tracer=tracer
+            scenario.prompt, provider=provider, executor=recorder, tracer=tracer
         )
+        outcome["tool_calls"] = list(recorder.calls)
         checks = [check_outcome(outcome, c) for c in scenario.checks]
     finally:
         if teardown is not None:
@@ -62,20 +108,89 @@ async def _run_scenario(
     return outcome, checks
 
 
-async def run_all(*, provider, executor, tracer: Tracer, teardown=None) -> int:
-    """顺序跑全部场景并打印逐场景结果；``teardown`` 在每个场景之后跑（逐场景隔离）。"""
+@dataclass(frozen=True)
+class ScenarioSelection:
+    """一次运行对场景集的决策：要跑的 / 跳过的（带原因）/ 停用的。"""
+
+    runnable: list[Scenario]
+    skipped: list[tuple[Scenario, str]]
+    disabled: list[Scenario]
+
+
+def select_scenarios(
+    scenarios: list[Scenario], *, mode: str, tags: list[str] | None = None
+) -> ScenarioSelection:
+    """按运行 ``mode`` 与 ``tags`` 过滤场景；停用（``enabled=False``）单独列出。
+
+    判定次序：停用 → mode 不匹配 → tag 不匹配。取**最根本**的那条原因：停用是"声明了也暂不跑"，
+    比"这次模式不匹配"更值得报出来 —— 否则 mock 的日志里看不出 tier3 交互场景为什么没跑。
+    """
+    if mode not in ("mock", "real"):
+        raise ValueError(f"mode must be 'mock' or 'real', got {mode!r}")
+    wanted = set(tags or ())
+    runnable: list[Scenario] = []
+    skipped: list[tuple[Scenario, str]] = []
+    disabled: list[Scenario] = []
+    for scenario in scenarios:
+        if not scenario.enabled:
+            disabled.append(scenario)
+        elif scenario.mode not in ("both", mode):
+            skipped.append((scenario, f"mode={scenario.mode}（本次运行 = {mode}）"))
+        elif wanted and not wanted & set(scenario.tags):
+            skipped.append((scenario, f"tags={scenario.tags} 不含 --tag {sorted(wanted)}"))
+        else:
+            runnable.append(scenario)
+    return ScenarioSelection(runnable=runnable, skipped=skipped, disabled=disabled)
+
+
+async def run_all(
+    *,
+    provider,
+    executor,
+    tracer: Tracer,
+    teardown=None,
+    mode: str = "mock",
+    tags: list[str] | None = None,
+) -> int:
+    """顺序跑选中的场景并打印逐场景结果；``teardown`` 在每个**跑过的**场景之后跑。
+
+    跳过/停用的场景不跑也不 teardown（没取过页面就没有页面要还）。exit code 只由
+    **非 fragile 的失败**决定（D6/D8：环境不匹配与内容漂移不该让门禁变红）。
+    """
     scenarios = load_scenarios(SCENARIOS_DIR)
-    print(f"[browsepilot eval v0.3] {len(scenarios)} scenarios loaded")
-    failed = 0
-    for s in scenarios:
-        outcome, checks = await _run_scenario(
-            s, provider=provider, executor=executor, tracer=tracer, teardown=teardown
+    selection = select_scenarios(scenarios, mode=mode, tags=tags)
+    scope = f", tags={sorted(tags)}" if tags else ""
+    print(f"[browsepilot eval v0.3] {len(scenarios)} scenarios loaded (mode={mode}{scope})")
+    skip_reasons = {scenario.id: reason for scenario, reason in selection.skipped}
+    disabled_ids = {scenario.id for scenario in selection.disabled}
+    passed = failed = fragile_failed = 0
+    for scenario in scenarios:
+        if scenario.id in disabled_ids:
+            print(f"  [DISABLED] {scenario.id} ({scenario.name})")
+            continue
+        reason = skip_reasons.get(scenario.id)
+        if reason is not None:
+            print(f"  [SKIP] {scenario.id}: {reason}")
+            continue
+        _, checks = await _run_scenario(
+            scenario, provider=provider, executor=executor, tracer=tracer, teardown=teardown
         )
-        ok = all(passed for passed, _ in checks)
-        failed += 0 if ok else 1
-        detail = "; ".join(d for _, d in checks)
-        print(f"  [{'PASS' if ok else 'FAIL'}] {s.id}: {detail}")
-    print(f"[eval] {len(scenarios) - failed}/{len(scenarios)} passed")
+        ok = all(result for result, _ in checks)
+        detail = "; ".join(text for _, text in checks)
+        if ok:
+            passed += 1
+            print(f"  [PASS] {scenario.id}: {detail}")
+        elif scenario.fragile:
+            fragile_failed += 1
+            print(f"  [FAIL] {scenario.id}: {detail} (fragile=true — 不计入门禁 exit code)")
+        else:
+            failed += 1
+            print(f"  [FAIL] {scenario.id}: {detail}")
+    print(
+        f"[eval] passed={passed} failed={failed} fragile_failed={fragile_failed} "
+        f"skipped={len(selection.skipped)} disabled={len(selection.disabled)} "
+        f"total={len(scenarios)}"
+    )
     return 1 if failed else 0
 
 
@@ -117,7 +232,7 @@ def _real_stack():
     return provider, executor, pool
 
 
-async def _run_real(tracer: Tracer) -> int:
+async def _run_real(tracer: Tracer, tags: list[str] | None = None) -> int:
     """真实模式：起池 → 逐场景隔离评测 → 关池；池起不来就诚实降级（打警告，不静默）。"""
     provider, executor, pool = _real_stack()
     started = False
@@ -132,7 +247,12 @@ async def _run_real(tracer: Tracer) -> int:
         executor.attach_browser(None)  # 不变式：executor 手里的要么是已启动的池，要么是 None
     try:
         return await run_all(
-            provider=provider, executor=executor, tracer=tracer, teardown=executor.aclose
+            provider=provider,
+            executor=executor,
+            tracer=tracer,
+            teardown=executor.aclose,
+            mode="real",
+            tags=tags,
         )
     finally:
         if started:
@@ -144,14 +264,26 @@ def main() -> int:
     parser.add_argument(
         "--mock", action="store_true", help="run with fake deps (no network/tokens)"
     )
+    parser.add_argument(
+        "--tag",
+        action="append",
+        choices=list(KNOWN_TAGS),
+        help=f"只跑带该 tag 的场景（可重复；缺省 = 全部；可选：{', '.join(KNOWN_TAGS)}）",
+    )
     args = parser.parse_args()
 
     tracer = JsonlTracer(out_dir=Path("data/traces"))
     if args.mock:
         return asyncio.run(
-            run_all(provider=FakeProvider(), executor=FakeExecutor(), tracer=tracer)
+            run_all(
+                provider=FakeProvider(),
+                executor=FakeExecutor(),
+                tracer=tracer,
+                mode="mock",
+                tags=args.tag,
+            )
         )
-    return asyncio.run(_run_real(tracer))
+    return asyncio.run(_run_real(tracer, tags=args.tag))
 
 
 if __name__ == "__main__":

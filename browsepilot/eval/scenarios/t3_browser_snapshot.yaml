@@ -1,0 +1,17 @@
+# 观察链断言：tier3 的策略链是 [browser_open, browser_snapshot]（graph._CONTINUE_AFTER：
+# open 成功后继续走观察步），所以**两个工具都必须出现在调用序列里**——只断言 browser_open
+# 的话，"打开了但没看内容"（partial）也会通过。
+#
+# 内容断言故意宽松（页面/快照/标题/链接任一）：页面内容随站点变化，结构才是稳定的。
+# 提示词同样要绕过 read_page 规则（见 t3_browser_open 的注释）。
+id: t3_browser_snapshot
+name: 浏览器观察当前页面（Tier3 观察链 open→snapshot）
+prompt: "用浏览器看看 example.com 这个页面有哪些内容和链接"
+tier: tier3
+tags: [browser, acceptance]
+mode: real
+checks:
+  - type: tools_called
+    tools: [browser_open, browser_snapshot]
+  - type: contains_keyword
+    keywords: ["页面", "快照", "标题", "链接"]

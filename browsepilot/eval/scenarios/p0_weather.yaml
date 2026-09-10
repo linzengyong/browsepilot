@@ -1,7 +1,11 @@
+# P0 场景（保留）：P1 "天气 100% 可靠"的证据场景 —— 断言直接落在 result_data 上
+# （city/temperature_c），不依赖答案文本措辞。
 id: p0-weather
 name: 天气查询（Tier1，必须 100% 可靠）
 prompt: "北京今天天气怎么样？"
 tier: tier1
+tags: [smoke, acceptance]
+mode: both
 checks:
   - type: field
     field: city

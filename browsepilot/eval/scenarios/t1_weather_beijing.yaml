@@ -1,0 +1,13 @@
+id: t1_weather_beijing
+name: 北京天气（Tier1 正例：路由 + 工具 + 城市名）
+prompt: "北京今天天气怎么样？"
+tier: tier1
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: tier_is
+    expected: tier1
+  - type: tools_called
+    tools: [weather]
+  - type: contains_keyword
+    keywords: ["北京"]
