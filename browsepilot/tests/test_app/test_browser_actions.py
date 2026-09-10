@@ -1,8 +1,10 @@
 """Tier3 动作层单测：多重回退定位（ref → CSS → 文本）+ click/type/scroll/navigate 原语。
 
 不启浏览器：fake page/locator 双人舞（延续 T1 的测试缝风格）——
-page 记录 ``locator()`` / ``get_by_text()`` 的解析顺序与每个动作的尝试次数，
-locator 用"剩余失败次数"模拟 Playwright 的自动等待超时（含 TimeoutError 形态）。
+page 记录 ``locator()`` / ``get_by_text()`` 的解析顺序与每个动作的尝试次数（``events`` 保留
+跨方法的时间顺序，用来 pin "JS 兜底严格排在所有候选尝试之后"），
+locator 用"剩余失败次数"模拟 Playwright 的自动等待超时（含 TimeoutError 形态），
+失败可按 selector 注入（模拟"CSS 选择器非法/匹配不到，但同名文本存在"的行为回退场景）。
 真浏览器冒烟是独立脚本，不进 pytest（教训 §1）。
 """
 
@@ -24,6 +26,7 @@ from browsepilot.app.browser.actions import (
     MAX_RETRIES,
     NAVIGATE_TIMEOUT_MS,
     Resolution,
+    build_candidates,
     classify_target,
     click,
     navigate,
@@ -43,6 +46,7 @@ class _FakeMouse:
     async def wheel(self, delta_x: float, delta_y: float) -> None:
         self._page._fail_if("wheel")
         self._page.wheel_calls.append((delta_x, delta_y))
+        self._page.events.append(f"wheel:{delta_x},{delta_y}")
 
 
 class _FakeLocator:
@@ -54,11 +58,13 @@ class _FakeLocator:
 
     async def click(self, *, timeout: float | None = None) -> None:
         self._page.click_attempts.append((self.selector, timeout))
-        self._page._fail_if("click")
+        self._page.events.append(f"click:{self.selector}")
+        self._page._fail_if("click", self.selector)
 
     async def fill(self, value: str, *, timeout: float | None = None) -> None:
         self._page.fill_attempts.append((self.selector, value))
-        self._page._fail_if("fill")
+        self._page.events.append(f"fill:{self.selector}={value!r}")
+        self._page._fail_if("fill", self.selector)
         self._page.value = value  # fill 是替换语义（与 Playwright 一致）
 
     async def evaluate(
@@ -67,12 +73,14 @@ class _FakeLocator:
         self._page.evaluate_calls.append(
             {"selector": self.selector, "expression": expression, "arg": arg, "timeout": timeout}
         )
-        self._page._fail_if("evaluate")
+        self._page.events.append(f"evaluate:{self.selector}")
+        self._page._fail_if("evaluate", self.selector)
         return True
 
     async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
         self._page.scroll_into_view_attempts.append((self.selector, timeout))
-        self._page._fail_if("scroll_into_view")
+        self._page.events.append(f"scroll_into_view:{self.selector}")
+        self._page._fail_if("scroll_into_view", self.selector)
 
 
 class _FakeResponse:
@@ -95,18 +103,41 @@ class _FakePage:
         self.wheel_calls: list[tuple[float, float]] = []
         self.goto_calls: list[tuple[str, str | None, float | None]] = []
         self.wait_calls: list[tuple[str | None, float | None]] = []
+        self.events: list[str] = []
         self.value = ""
         self.mouse = _FakeMouse(self)
         self._failures: dict[str, int] = defaultdict(int)
         self._fail_exc: dict[str, BaseException] = {}
+        self._selector_failures: dict[tuple[str, str], int] = {}
+        self._selector_fail_exc: dict[tuple[str, str], BaseException] = {}
 
-    def fail(self, kind: str, times: int = 1, exc: BaseException | None = None) -> _FakePage:
-        self._failures[kind] = times
-        if exc is not None:
-            self._fail_exc[kind] = exc
+    def fail(
+        self,
+        kind: str,
+        times: int = 1,
+        exc: BaseException | None = None,
+        selector: str | None = None,
+    ) -> _FakePage:
+        """注入失败：``selector=None`` 对整个 kind 生效；给了 selector 则只对命中它的 locator 生效。"""
+        if selector is None:
+            self._failures[kind] = times
+            if exc is not None:
+                self._fail_exc[kind] = exc
+        else:
+            key = (kind, selector)
+            self._selector_failures[key] = times
+            if exc is not None:
+                self._selector_fail_exc[key] = exc
         return self
 
-    def _fail_if(self, kind: str) -> None:
+    def _fail_if(self, kind: str, selector: str | None = None) -> None:
+        if selector is not None:
+            key = (kind, selector)
+            if self._selector_failures.get(key, 0) > 0:
+                self._selector_failures[key] -= 1
+                raise self._selector_fail_exc.get(key) or RuntimeError(
+                    f"fake {kind} failure for {selector!r}"
+                )
         if self._failures[kind] > 0:
             self._failures[kind] -= 1
             raise self._fail_exc.get(kind) or RuntimeError(f"fake {kind} failure")
@@ -217,6 +248,35 @@ async def test_resolve_locator_records_resolution_path():
     ]
 
 
+# ── build_candidates：候选序列（F2 行为回退的根据） ────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        ("e2", [("ref", "aria-ref=e2")]),  # ref 无本地等价物：单候选（恢复靠重新快照）
+        ("3", [("ref", "aria-ref=3")]),
+        ("#search", [("css", "#search"), ("text", "#search")]),
+        ("search", [("css", "search"), ("text", "search")]),  # HTML tag 同名 → 文本兜底
+        ("Save:", [("css", "Save:"), ("text", "Save:")]),  # 冒号被当伪类 → 文本兜底
+        ("Sign in", [("text", "Sign in")]),  # 文本已是最后一级：没有更弱的候选
+    ],
+)
+def test_build_candidates_ordered_and_capped(
+    target: str, expected: list[tuple[str, str]]
+) -> None:
+    candidates = build_candidates(target)
+
+    assert [(r.kind, r.selector) for r in candidates] == expected
+    assert len(candidates) <= 2  # 候选数有界：分类级最多 2 个候选
+
+
+@pytest.mark.parametrize("target", ["", "   ", None])
+def test_build_candidates_blank_raises(target: Any) -> None:
+    with pytest.raises(ValueError):
+        build_candidates(target)  # type: ignore[arg-type]
+
+
 # ── click：重试（每次重新 resolve）→ JS 触发兜底 ──────────────────────────────
 
 
@@ -237,15 +297,18 @@ async def test_click_ref_success_reports_resolution_and_attempts():
     assert result["data"]["action"] == "click"
 
 
-async def test_click_retries_with_fresh_resolve_then_succeeds():
-    page = _FakePage().fail("click", 1)
+async def test_click_retries_round_with_fresh_resolve_then_succeeds():
+    page = _FakePage().fail("click", 2)
 
     result = await click(page, "#go", retries=2)
 
     assert result["status"] == "success"
-    assert page.locator_calls == ["#go", "#go"]  # 每次尝试都重新 resolve
-    assert len(page.click_attempts) == 2
-    assert result["data"]["attempts"] == 2
+    # 第 1 轮：CSS 候选（#go）失败 → 文本候选失败；第 2 轮重新 resolve → CSS 候选命中
+    assert page.locator_calls == ["#go", "#go"]
+    assert page.text_calls == [("#go", False)]
+    assert len(page.click_attempts) == 3
+    assert result["data"]["attempts"] == 3
+    assert result["data"]["resolution"] == {"kind": "css", "selector": "#go"}
     assert result["data"]["js_fallback"] is False
     assert page.evaluate_calls == []  # 没用 JS 兜底
 
@@ -270,15 +333,17 @@ async def test_click_falls_back_to_js_trigger_after_retries():
     assert result["data"]["attempts"] == 3
 
 
-async def test_click_retries_zero_means_single_attempt():
+async def test_click_retries_zero_walks_candidates_within_one_round():
     page = _FakePage().fail("click", 1)
 
     result = await click(page, "#go", retries=0)
 
-    assert len(page.click_attempts) == 1
-    assert len(page.evaluate_calls) == 1
+    # retries=0 → 只有一轮；轮内候选仍走完（CSS 失败 → 文本命中），不是"只试一次"
+    assert [selector for selector, _ in page.click_attempts] == ["#go", "text=#go"]
+    assert len(page.evaluate_calls) == 0
     assert result["status"] == "success"
-    assert result["data"]["attempts"] == 1
+    assert result["data"]["attempts"] == 2
+    assert result["data"]["resolution"] == {"kind": "text", "selector": "#go"}
 
 
 async def test_click_returns_error_dict_when_js_fallback_also_fails():
@@ -321,8 +386,55 @@ async def test_click_clamps_out_of_range_retries():
 
     result = await click(page, "#go", retries=10_000)
 
-    assert len(page.click_attempts) == 1 + MAX_RETRIES  # 上限收敛，不无限重试
+    # 轮数收敛到 1 + MAX_RETRIES；每轮走完 2 个候选 → 上限 (1 + MAX_RETRIES) * 2
+    assert len(page.click_attempts) == (1 + MAX_RETRIES) * 2
     assert result["status"] == "success"
+
+
+async def test_click_falls_through_to_text_candidate_when_css_is_not_a_selector():
+    # "Save:" 被 _looks_like_css 当成伪类选择器（非法 CSS）；文本候选必须兜住（F2）
+    page = _FakePage().fail(
+        "click",
+        99,
+        exc=RuntimeError("Unexpected token ':' while parsing selector"),
+        selector="Save:",
+    )
+
+    result = await click(page, "Save:", retries=2)
+
+    assert result["status"] == "success"
+    assert result["data"]["resolution"] == {"kind": "text", "selector": "Save:"}  # 命中文本候选
+    assert result["data"]["js_fallback"] is False
+    assert result["data"]["attempts"] == 2  # CSS 候选失败 1 次 → 立即试文本候选
+    assert [selector for selector, _ in page.click_attempts] == ["Save:", "text=Save:"]
+    assert page.text_calls == [("Save:", False)]
+    assert len(result["data"]["errors"]) == 1  # 只记录了 CSS 候选那次失败
+    assert "Save:" in result["data"]["errors"][0]
+
+
+async def test_ref_target_never_probes_other_candidates():
+    """ref 没有本地等价物：失败只能交给 agent 层重新快照，绝不盲试 CSS/文本。"""
+    page = _FakePage().fail("click", 99).fail("evaluate", 99)
+
+    result = await click(page, "e2", retries=1)
+
+    assert result["status"] == "error"
+    # 2 次动作尝试 + 1 次 JS 兜底：全部只 resolve ref，没换过候选
+    assert page.locator_calls == ["aria-ref=e2"] * 3
+    assert page.text_calls == []  # 没有文本候选
+    assert [call["selector"] for call in page.evaluate_calls] == ["aria-ref=e2"]  # JS 也不换候选
+
+
+async def test_js_fallback_runs_strictly_after_every_candidate_attempt():
+    page = _FakePage().fail("click", 99).fail("evaluate", 99, selector="#go")
+
+    result = await click(page, "#go", retries=0)
+
+    # 事件顺序：先走完候选尝试，再按同一候选序走 JS 兜底（严格排最后）
+    assert page.events == ["click:#go", "click:text=#go", "evaluate:#go", "evaluate:text=#go"]
+    assert result["status"] == "success"
+    assert result["data"]["js_fallback"] is True
+    assert result["data"]["resolution"] == {"kind": "text", "selector": "#go"}  # JS 命中文本候选
 
 
 # ── type_text：先清空再填（P3-D7 幂等），重试 → JS 赋值兜底 ────────────────────
@@ -371,13 +483,23 @@ async def test_type_falls_back_to_js_value_set():
     result = await type_text(page, "#q", "hello", retries=1)
 
     assert result["status"] == "success"
-    assert len(page.fill_attempts) == 2  # 1 次 + 1 次重试，全部失败
+    assert len(page.fill_attempts) == 4  # 2 候选 × (1 + retries) 次尝试，全部在"清空"这步失败
     assert len(page.evaluate_calls) == 1
     call = page.evaluate_calls[0]
     assert call["selector"] == "#q"
     assert call["arg"] == "hello"  # 赋值语义（幂等），不是追加
     assert "value" in call["expression"] and "input" in call["expression"]
     assert result["data"]["js_fallback"] is True
+
+
+async def test_type_falls_through_to_text_candidate():
+    page = _FakePage().fail("fill", 99, selector="Save:")
+
+    result = await type_text(page, "Save:", "hi", retries=1)
+
+    assert result["status"] == "success"
+    assert result["data"]["resolution"] == {"kind": "text", "selector": "Save:"}
+    assert page.fill_attempts == [("Save:", ""), ("text=Save:", ""), ("text=Save:", "hi")]
 
 
 async def test_type_returns_error_dict_when_everything_fails():
@@ -447,10 +569,11 @@ async def test_scroll_rejects_unknown_direction():
     assert page.wheel_calls == []
 
 
-async def test_scroll_rejects_non_numeric_amount():
+@pytest.mark.parametrize("amount", ["lots", {}, [1], {"px": 300}])
+async def test_scroll_rejects_non_numeric_amount(amount: Any) -> None:
     page = _FakePage()
 
-    result = await scroll(page, "down", "lots")  # type: ignore[arg-type]
+    result = await scroll(page, "down", amount)  # type: ignore[arg-type]
 
     assert result["status"] == "error"
     assert result["error_type"] == "invalid_amount"
@@ -484,7 +607,20 @@ async def test_scroll_into_view_error_dict():
 
     assert result["status"] == "error"
     assert result["error_type"] == "timeout"
-    assert len(page.scroll_into_view_attempts) == 2  # 1 + retries
+    assert len(page.scroll_into_view_attempts) == 4  # 2 候选 × (1 + retries)
+
+
+async def test_scroll_into_view_falls_through_to_text_candidate():
+    page = _FakePage().fail("scroll_into_view", 99, selector="#x")
+
+    result = await scroll_into_view(page, "#x", retries=1)
+
+    assert result["status"] == "success"
+    assert result["data"]["resolution"] == {"kind": "text", "selector": "#x"}
+    assert page.scroll_into_view_attempts == [
+        ("#x", ACTION_TIMEOUT_MS),
+        ("text=#x", ACTION_TIMEOUT_MS),
+    ]
 
 
 # ── navigate：domcontentloaded + 有界条件等待（D3） ───────────────────────────
@@ -555,6 +691,101 @@ async def test_navigate_blank_url_is_error_dict():
     assert result["status"] == "error"
     assert result["error_type"] == "invalid_url"
     assert page.goto_calls == []
+
+
+@pytest.mark.parametrize("url", [None, 5, True, {"url": "https://x"}, ["https://x"]])
+async def test_navigate_non_str_url_is_invalid_url(url: Any) -> None:
+    page = _FakePage()
+
+    result = await navigate(page, url)  # type: ignore[arg-type]
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "invalid_url"
+    assert page.goto_calls == []  # 不把垃圾当相对路径真的导航出去（F1）
+
+
+# ── 入参收敛（F1：executor 直传 dict[str, Any]，非 str 入参绝不 AttributeError） ──
+
+
+def test_classify_target_coerces_non_str_target():
+    # 分级本身也得收敛：它是 __all__ 里的公共面（T4 可直接调），不是只给内部用的
+    assert classify_target(3) == Resolution("ref", "aria-ref=3")  # type: ignore[arg-type]
+    assert classify_target(True) == Resolution("text", "True")  # type: ignore[arg-type]
+    # 小数点让它看起来像 CSS（.class 起手）；万一选择器非法还有候选序列里的文本兜底
+    assert classify_target(3.5) == Resolution("css", "3.5")  # type: ignore[arg-type]
+
+
+async def test_resolve_locator_coerces_non_str_target():
+    page = _FakePage()
+
+    locator = resolve_locator(page, 3)  # type: ignore[arg-type]
+
+    assert page.locator_calls == ["aria-ref=3"]
+    assert locator.selector == "aria-ref=3"
+
+
+async def test_click_numeric_target_is_coerced_to_ref_label():
+    page = _FakePage()
+
+    result = await click(page, 3)  # type: ignore[arg-type]
+
+    assert result["status"] == "success"
+    assert page.locator_calls == ["aria-ref=3"]  # JSON 数字 label 是受支持的 ref 写法（3 → "3"）
+    assert page.text_calls == []
+    assert result["data"]["target"] == "3"  # 进状态的是收敛后的 str
+    assert result["data"]["resolution"] == {"kind": "ref", "selector": "aria-ref=3"}
+
+
+async def test_type_numeric_target_is_coerced_to_ref_label():
+    page = _FakePage()
+
+    result = await type_text(page, 3, "hi")  # type: ignore[arg-type]
+
+    assert result["status"] == "success"
+    assert page.fill_attempts == [("aria-ref=3", ""), ("aria-ref=3", "hi")]
+
+
+@pytest.mark.parametrize("text", [None, 5, ["hi"], {"v": "hi"}])
+async def test_type_non_str_text_is_invalid_text_never_js_null(text: Any) -> None:
+    """None 不能落到 JS 兜底被赋成字面量 "null"；非 str 一律结构化拒绝（F1）。"""
+    page = _FakePage()
+
+    result = await type_text(page, "#q", text)  # type: ignore[arg-type]
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "invalid_text"
+    assert page.fill_attempts == [] and page.evaluate_calls == []  # 一个页面调用都没发生
+    assert result["data"]["target"] == "#q"
+
+
+async def test_scroll_numeric_direction_is_invalid_direction():
+    page = _FakePage()
+
+    result = await scroll(page, 5)  # type: ignore[arg-type]
+
+    assert result["status"] == "error"
+    assert result["error_type"] == "invalid_direction"
+    assert page.wheel_calls == []
+
+
+@pytest.mark.parametrize("garbage", [3, 3.5, True, None, {"ref": 3}, ["e2"]])
+async def test_actions_never_raise_on_non_str_arguments(garbage: Any) -> None:
+    """模块契约：任何入参都转成结构化 dict，绝不向图抛异常（F1 回归网）。"""
+    page = _FakePage()
+
+    results = [
+        await click(page, garbage),  # type: ignore[arg-type]
+        await type_text(page, garbage, "hi"),  # type: ignore[arg-type]
+        await scroll(page, garbage),  # type: ignore[arg-type]
+        await scroll_into_view(page, garbage),  # type: ignore[arg-type]
+        await navigate(page, garbage),  # type: ignore[arg-type]
+    ]
+
+    for result in results:
+        assert set(result) == {"status", "content", "data", "error_type", "error_message"}
+        assert result["status"] in {"success", "error"}
+    assert results[2]["error_type"] == "invalid_direction"  # scroll 的 direction 错型 → 结构化拒绝
+    assert results[4]["error_type"] == "invalid_url"  # navigate 的 url 错型 → 结构化拒绝
 
 
 # ── 结果契约（T4 的 executor 直接把它们转成 ToolResult） ─────────────────────
