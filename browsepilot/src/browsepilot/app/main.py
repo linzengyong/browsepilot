@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import aiosqlite
@@ -24,6 +25,9 @@ from browsepilot.app.config import Settings
 from browsepilot.app.rate_limit import SlidingWindowRateLimiter
 from browsepilot.app.sessions import SessionInfo, SessionStore
 from browsepilot.model.provider import ModelProvider
+
+if TYPE_CHECKING:
+    from browsepilot.app.browser.browser_pool import BrowserPool
 
 
 class ChatRequest(BaseModel):
@@ -102,6 +106,19 @@ _EST_TOKENS_PER_TURN = 4000
 _MSGPACK_ALLOWED_TYPES: tuple[type, ...] = (AgentState, ExecutionStep)
 
 
+def _bind_executor_browser(executor: ToolExecutor, browser: BrowserPool | None) -> None:
+    """把池绑定到 executor 的浏览器槽位（未接线 / 启动失败 → ``None``）。
+
+    T4 给 AppToolExecutor 加了可选的 ``browser`` 构造参数，但池的 ``start()`` 是异步的：
+    只有 lifespan 知道池是否真的可用。这里保证一个不变式 —— lifespan 启动完成后，
+    executor 持有的要么是已启动的池，要么是 None（6 个浏览器工具统一返回
+    ``browser_unavailable``），绝不会拿着一个没启动的池。非 AppToolExecutor 的
+    ToolExecutor 替身没有该槽位时静默跳过。
+    """
+    if hasattr(executor, "_browser"):
+        executor._browser = browser  # type: ignore[attr-defined]
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -111,38 +128,59 @@ def create_app(
     session_store: SessionStore | None = None,
     checkpointer=None,
     rate_limiter: SlidingWindowRateLimiter | None = None,
+    browser_pool: BrowserPool | None = None,
 ) -> FastAPI:
     settings = settings or Settings()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # H1：生产接线——未显式传 checkpointer 时按 settings.checkpoint_db_path
-        # 创建共享 AsyncSqliteSaver（跨请求存活），shutdown 时关闭底层连接。
-        # 显式传入（测试）的 checkpointer 由调用方管理生命周期。
-        # 注意：from_conn_string 不接受 serde，故手动构造 conn + saver（serde 见
-        # _MSGPACK_ALLOWED_TYPES 的 msgpack 白名单注册）。
-        if checkpointer is None and settings.checkpoint_db_path:
-            db_path = Path(settings.checkpoint_db_path)
-            db_path.parent.mkdir(parents=True, exist_ok=True)
-            conn = await aiosqlite.connect(str(db_path))
+        # P3 Tier3 接线：BrowserPool 的 start/close 归 lifespan。start() 失败 → 记日志、
+        # executor 的 browser 置 None（6 个浏览器工具统一 browser_unavailable），app 照常
+        # 启动 —— 诚实降级，不为浏览器故障崩服务。传 None（测试 / Tier3 关闭）则完全跳过。
+        if browser_pool is not None:
             try:
-                saver = AsyncSqliteSaver(
-                    conn,
-                    serde=JsonPlusSerializer(allowed_msgpack_modules=_MSGPACK_ALLOWED_TYPES),
+                await browser_pool.start()
+            except Exception:
+                logger.exception(
+                    "BrowserPool.start() failed; Tier3 degraded (browser=None), app continues"
                 )
-                await saver.setup()
-                app.state.checkpointer = saver
-                logger.info(
-                    "browsepilot v2.0 app starting (model={})", settings.default_model
-                )
+                _bind_executor_browser(executor, None)
+            else:
+                _bind_executor_browser(executor, browser_pool)
+        try:
+            # H1：生产接线——未显式传 checkpointer 时按 settings.checkpoint_db_path
+            # 创建共享 AsyncSqliteSaver（跨请求存活），shutdown 时关闭底层连接。
+            # 显式传入（测试）的 checkpointer 由调用方管理生命周期。
+            # 注意：from_conn_string 不接受 serde，故手动构造 conn + saver（serde 见
+            # _MSGPACK_ALLOWED_TYPES 的 msgpack 白名单注册）。
+            if checkpointer is None and settings.checkpoint_db_path:
+                db_path = Path(settings.checkpoint_db_path)
+                db_path.parent.mkdir(parents=True, exist_ok=True)
+                conn = await aiosqlite.connect(str(db_path))
+                try:
+                    saver = AsyncSqliteSaver(
+                        conn,
+                        serde=JsonPlusSerializer(allowed_msgpack_modules=_MSGPACK_ALLOWED_TYPES),
+                    )
+                    await saver.setup()
+                    app.state.checkpointer = saver
+                    logger.info(
+                        "browsepilot v2.0 app starting (model={})", settings.default_model
+                    )
+                    yield
+                finally:
+                    await conn.close()
+                    logger.info("browsepilot app shutting down (checkpointer closed)")
+            else:
+                logger.info("browsepilot v2.0 app starting (model={})", settings.default_model)
                 yield
-            finally:
-                await conn.close()
-                logger.info("browsepilot app shutting down (checkpointer closed)")
-            return
-        logger.info("browsepilot v2.0 app starting (model={})", settings.default_model)
-        yield
-        logger.info("browsepilot app shutting down")
+                logger.info("browsepilot app shutting down")
+        finally:
+            # 启动失败也 close()：池未启动时是幂等空操作；start() 失败路径的清理由
+            # BrowserPool.start 自己负责（_discard_playwright）。
+            if browser_pool is not None:
+                await browser_pool.close()
+                logger.info("browsepilot app shutting down (browser pool closed)")
 
     app = FastAPI(
         title="BrowsePilot API",
@@ -400,8 +438,11 @@ def _default_app() -> FastAPI:
 
     checkpointer 不在此同步构造（aiosqlite 连接是异步的）：create_app 的
     lifespan 会按 settings.checkpoint_db_path 创建共享 AsyncSqliteSaver。
+    BrowserPool 在此同步构造（无 IO），start()/close() 由 lifespan 负责；
+    同一实例既构造注入 executor，又作为 browser_pool 交给生命周期管理。
     """
     from browsepilot.agent.tracer import JsonlTracer
+    from browsepilot.app.browser.browser_pool import BrowserPool
     from browsepilot.app.executor import AppToolExecutor
     from browsepilot.app.services.fetch import PageFetchService
     from browsepilot.app.services.search import SearchService
@@ -414,7 +455,12 @@ def _default_app() -> FastAPI:
         api_key=settings.model_api_key or None,
         base_url=settings.model_base_url or None,
     )
-    executor = AppToolExecutor(WeatherService(), SearchService(), PageFetchService())
+    browser_pool = BrowserPool(
+        headless=settings.browser_headless, max_pages=settings.browser_max_pages
+    )
+    executor = AppToolExecutor(
+        WeatherService(), SearchService(), PageFetchService(), browser=browser_pool
+    )
     tracer = JsonlTracer(out_dir=Path(settings.trace_dir))
     session_store = SessionStore(Path(settings.session_db_path))
     return create_app(
@@ -426,6 +472,7 @@ def _default_app() -> FastAPI:
         rate_limiter=SlidingWindowRateLimiter(
             settings.rate_limit_requests, settings.rate_limit_window_seconds
         ),
+        browser_pool=browser_pool,
     )
 
 

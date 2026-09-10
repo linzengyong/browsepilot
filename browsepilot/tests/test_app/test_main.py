@@ -66,6 +66,44 @@ class HumanNeedingExecutor(FakeExecutor):
         return await super().call(name, arguments)
 
 
+class FakeBrowserPool:
+    """BrowserPool 替身（绝不起真浏览器）：记录 start/close，可注入启动失败。"""
+
+    def __init__(self, *, start_error: Exception | None = None):
+        self.start_error = start_error
+        self.start_calls = 0
+        self.close_calls = 0
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _StubServices:
+    """AppToolExecutor 的 Tier1/2 服务占位：本组测试只碰浏览器槽位。"""
+
+    async def get(self, *args, **kwargs):  # pragma: no cover - 不应被调用
+        raise AssertionError("stub service must not be called")
+
+    async def search(self, *args, **kwargs):  # pragma: no cover
+        raise AssertionError("stub service must not be called")
+
+    async def fetch(self, *args, **kwargs):  # pragma: no cover
+        raise AssertionError("stub service must not be called")
+
+
+def _browser_executor(*, browser=None):
+    """真 AppToolExecutor（只有 Tier3 槽位有意义）：验证 lifespan 真的绑定了池。"""
+    from browsepilot.app.executor import AppToolExecutor
+
+    stub = _StubServices()
+    return AppToolExecutor(stub, stub, stub, browser=browser)
+
+
 def _make_app(tmp_path, settings=None):
     return create_app(
         settings,
@@ -110,6 +148,18 @@ def test_settings_defaults():
     assert s.allowed_domains == []
     assert s.max_steps == 30
     assert s.checkpoint_db_path == "data/checkpoints.sqlite"
+    # P3 Tier3：浏览器设置（默认值即接线默认行为）
+    assert s.browser_headless is True
+    assert s.browser_max_pages == 3
+
+
+def test_settings_browser_fields_follow_bp_env_prefix(monkeypatch):
+    """BP_ 前缀约定：browser 设置与其他字段一样从环境变量读。"""
+    monkeypatch.setenv("BP_BROWSER_HEADLESS", "false")
+    monkeypatch.setenv("BP_BROWSER_MAX_PAGES", "5")
+    s = Settings(_env_file=None)
+    assert s.browser_headless is False
+    assert s.browser_max_pages == 5
 
 
 def test_health_endpoint(tmp_path):
@@ -620,6 +670,88 @@ def test_lifespan_manual_saver_survives_app_restart_for_resume(tmp_path):
             ]
     assert [e["type"] for e in events] == ["answer", "done"]
     assert events[0]["text"] == "合成回答"
+
+
+# ── P3 Tier3：BrowserPool 生命周期接线（lifespan） ──────────────────────────
+
+
+def test_lifespan_starts_browser_pool_and_injects_it_into_executor(tmp_path):
+    """P3 收尾：lifespan 按注入的池 start() 后把（已启动的）池绑到 AppToolExecutor，
+    teardown 时 close() —— 未接线时 6 个浏览器工具只能返回 browser_unavailable。"""
+    pool = FakeBrowserPool()
+    executor = _browser_executor()  # 未带池：绑定必须由 lifespan 完成
+    app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=str(tmp_path / "ckpt.sqlite")),
+        provider=FakeProvider(),
+        executor=executor,
+        tracer=JsonlTracer(trace_id="browser-wire", out_dir=tmp_path),
+        browser_pool=pool,
+    )
+    with TestClient(app) as client:
+        assert pool.start_calls == 1  # 进入 lifespan 即启动
+        assert executor._browser is pool  # 注入的是已经启动的池
+        assert pool.close_calls == 0  # 运行期不回收
+        assert client.get("/health").status_code == 200
+    assert pool.close_calls == 1  # teardown 与 checkpointer 一起回收
+
+
+def test_lifespan_browser_start_failure_degrades_to_browser_none(tmp_path):
+    """启动失败只记日志：executor 的 browser 置 None（6 个工具统一
+    browser_unavailable），app 照常启动 —— 浏览器故障不拖垮服务（诚实降级）。
+
+    close() 仍被调用：池未启动时是幂等空操作，启动失败的清理由 BrowserPool.start
+    自己负责（_discard_playwright）；这里用假池钉死调用次数与降级结果。
+    """
+    boom = FakeBrowserPool(start_error=RuntimeError("chromium executable missing"))
+    # 生产形状：_default_app 先把池构造进 executor；start() 失败必须由 lifespan 摘掉
+    executor = _browser_executor(browser=boom)
+    app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=""),
+        provider=FakeProvider(),
+        executor=executor,
+        tracer=JsonlTracer(trace_id="browser-fail", out_dir=tmp_path),
+        browser_pool=boom,
+    )
+    with TestClient(app) as client:
+        assert boom.start_calls == 1
+        assert executor._browser is None  # 不把未启动的池留在 executor 上
+        assert client.get("/health").status_code == 200  # app 正常启动
+    assert boom.close_calls == 1
+
+
+def test_default_app_wires_browser_pool_into_executor(tmp_path, monkeypatch):
+    """生产接线（gap 本身）：_default_app 按 Settings 构造 BrowserPool，以
+    AppToolExecutor(..., browser=pool) 注入，并把同一实例交给 create_app 管生命周期。
+
+    只把 create_app 换成记录器：不起真浏览器、不跑真 lifespan。
+    """
+    import browsepilot.app.main as main_module
+    from browsepilot.app.browser.browser_pool import BrowserPool
+
+    captured: dict = {}
+
+    def _capture(settings, **kwargs):
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(main_module, "create_app", _capture)
+    monkeypatch.setattr(
+        main_module,
+        "Settings",
+        lambda: Settings(
+            _env_file=None,
+            trace_dir=str(tmp_path / "traces"),
+            session_db_path=str(tmp_path / "sessions.sqlite"),
+            browser_headless=False,
+            browser_max_pages=2,
+        ),
+    )
+    main_module._default_app()
+
+    pool = captured["browser_pool"]
+    assert isinstance(pool, BrowserPool)
+    assert (pool.headless, pool.max_pages) == (False, 2)  # 来自 Settings
+    assert captured["executor"]._browser is pool  # 构造注入，与生命周期同源
 
 
 def test_resume_without_pending_interrupt_errors(tmp_path):

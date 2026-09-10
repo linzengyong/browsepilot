@@ -25,3 +25,7 @@ class Settings(BaseSettings):
     rate_limit_requests: int = 60
     rate_limit_window_seconds: int = 60
     session_budget_tokens: int = 200000
+
+    # ── P3 Tier3 浏览器层（BrowserPool；start/close 由 app lifespan 管） ──
+    browser_headless: bool = True
+    browser_max_pages: int = 3
