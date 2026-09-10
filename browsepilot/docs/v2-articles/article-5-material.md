@@ -329,10 +329,11 @@ uv run uvicorn browsepilot.app.main:app --port 8001
 |------|-----------|------|
 | L2 真模型 E2E trace（11 行） | `%TEMP%\t6-e2e-qn_ad4uc\traces\t6-e2e.jsonl` | 任务「在 www.bing.com 的搜索框里搜索 Python 3.13」的 tier3 全链路 |
 | L1.5 HITL trace（10 行） | `%TEMP%\t6-hitl-sh8bybzr\traces\t6-hitl.jsonl` | zhihu 登录墙 → `human_pending` |
+| **入库副本（T8 落盘）** | `docs/v2-p3-smoke-trace.jsonl`（21 行 = L2 11 + L1.5 10，按 `trace_id` 区分；密钥已核） | 上两行原始 trace 的逐行合并，引用以此为准；出处见 `docs/v2-p3-report.md` §四 |
 | 冒烟脚本与日志（未入库） | `%TEMP%\t6-smoke\layer2_e2e.py`、`layer15_hitl.py`、`layer2.log`、`layer15.log` | SSE 序列 + trace 摘要；smoke 文档 §3-f/§3-g 有可复跑片段 |
 | 运行 state（LangGraph checkpoint） | `%TEMP%\t6-e2e-qn_ad4uc\checkpoints.sqlite` | 本次 L2 运行的 `degradation_log`（唯一盘上证据，见 §5） |
 
-**`data/traces/*.jsonl` 里没有 tier3 事件**：共 98 个文件，`grep -l browser` **0 命中**。原因是 T6 脚本把 `trace_dir` 指到 `tempfile.mkdtemp()`（smoke §3-f 片段：`JsonlTracer(trace_id="t6-e2e", out_dir=tmp / "traces")`），没有写进语料目录。复跑命令见 smoke §0；`%TEMP%` 文件重启即失，已入库的只有 smoke 文档。
+**`data/traces/*.jsonl` 里没有 tier3 事件**：共 98 个文件，`grep -l browser` **0 命中**。原因是 T6 脚本把 `trace_dir` 指到 `tempfile.mkdtemp()`（smoke §3-f 片段：`JsonlTracer(trace_id="t6-e2e", out_dir=tmp / "traces")`），没有写进语料目录。复跑命令见 smoke §0；`%TEMP%` 文件重启即失，T8 已把两份原始 trace 逐行合并落盘为 `docs/v2-p3-smoke-trace.jsonl`（21 行，见上表）。
 
 ## 1. 一条 tier3 trace 的逐行解读（L2 真模型 E2E）
 
@@ -443,7 +444,7 @@ degradation_log = [
 
 ## 6. P3 观测面的新缺口（诚实素材）
 
-1. **tier3 trace 不在语料目录**：`data/traces/` 98 个文件零浏览器事件；唯一副本在 `%TEMP%`（见"数据在哪"）。P2 素材说"语料只能讲顺利的一天"，P3 依然：tier3 的坏天气（探测失败、策略全败、resume）都没有可直接引用的入库语料。
+1. **tier3 trace 不在语料目录**：`data/traces/` 98 个文件零浏览器事件；原始副本在 `%TEMP%`，T8 已合并落盘为 `docs/v2-p3-smoke-trace.jsonl`（21 行，见"数据在哪"）。P2 素材说"语料只能讲顺利的一天"，P3 依然：tier3 的坏天气（探测失败、策略全败、resume）都没有可直接引用的入库语料。
 2. **`model` 字段恒空**（§1 观察 5）——"哪个模型答的"从 trace 里答不出。
 3. **动作细节不进事件**（§3 缺口）——`resolution`/`attempts`/`js_fallback` 只在 state/SSE 里。
 4. **HITL 链缺恢复段**（§2 缺口）——hitl span 只观测进入，`human_response` 不回流 answer 的缺陷在案。
