@@ -16,6 +16,12 @@ r"""Tier3 URL 安全策略单测（D4/D7）：NavigationPolicy 纯函数——�
    ``urlsplit`` 不这么做，按原文解析会放过 SSRF 载荷（见下文反斜杠用例）。
 6. 白名单裸标签条目（无点号，如 ``localhost``）只做**精确**匹配；拒因里回显的主机/scheme
    有长度上限（进状态的数据有界）。
+7. 主机判定前做主机的 WHATWG/UTS46 归一化子集：点变体 ``。``/``．``/``｡`` → ``.``、
+   NFKC 兼容字形 → ASCII（全角/上标数字…）、UTS46 ``ignored`` 码点删除。
+   ``https://169。254.169.254/`` 在 Chromium 里就是 ``169.254.169.254``（云元数据端点）⇒ 必须拒；
+   而 ``https://example。com/`` 归一化后就是 ``example.com`` ⇒ 不能误拒（见下节载荷表）。
+8. 白名单里的 IP 字面值/混淆 IPv4 条目（``127.0.0.1``/``1.1.1``/``0x7f.0.0.1``）只做**精确**匹配：
+   IP 没有"子域"，``allowed_domains=["1.1.1"]`` 若按后缀匹配会放行回环地址 ``127.1.1.1``。
 
 原因串是 T4 面向用户的错误文案来源，故统一为 ``code: detail`` 形态并逐条 pin 住前缀。
 """
@@ -239,6 +245,108 @@ def test_slash_collapsed_private_targets_fail_closed(url):
     assert not ok, f"{url} must be rejected, got {reason!r}"
 
 
+# ── Unicode 主机归一化：点变体 / 兼容字形 / UTS46 ``ignored`` 码点（⇒ SSRF）────────────
+#
+# Chromium（WHATWG ``domain to ASCII`` = UTS46，``UseSTD3ASCIIRules=false``）解析主机前先归一化：
+#   * ``。``(U+3002)/``．``(U+FF0E)/``｡``(U+FF61) → ``.``；
+#   * 兼容字形 → ASCII（全角 ``０ｘ７ｆ`` → ``0x7f``、上标 ``¹²⁷`` → ``127``）；
+#   * ``ignored`` 码点（U+00AD 软连字符、U+200B 零宽空格、变体选择符…）直接删除；
+#   * U+A7F1 → ``s``（UTS46 ``mapped``，NFKC 不动它）。
+# ``urlsplit`` 一个都不做 ⇒ 按原文解析就是"策略放行、浏览器打内网"的解析器差分（SSRF，无需 DNS）。
+# 下面每个载荷的真实 host 都用 node v24 的 WHATWG ``URL`` 复核过（完整对照表见 task-3-fix2-report.md）。
+
+UNICODE_PRIVATE_URLS = [
+    # U+3002 ``。``
+    "https://169\u3002254.169.254/latest/meta-data/",  # 云元数据端点
+    "https://169.254\u3002169.254/",  # 点变体在中间：解析器差分最容易被漏掉的形态
+    "https://0x7f\u30020.0.1/",  # 十六进制字面值 + 点变体 ⇒ 127.0.0.1
+    "https://\uff11\uff16\uff19\u3002\uff12\uff15\uff14.169.254/",  # 全角数字 + 点变体
+    # U+FF0E ``．`` / U+FF61 ``｡``：与 U+3002 同类的另两个点变体
+    "https://169\uff0e254.169.254/",
+    "https://169\uff61254.169.254/",
+    # NFKC 覆盖的"兼容字形 → ASCII"
+    "https://\uff10\uff58\uff17\uff46.0.0.1/",  # 全角 ``0x7f`` ⇒ 127.0.0.1
+    "https://\u00b9\u00b2\u2077.0.0.1/",  # 上标 ``¹²⁷`` ⇒ 127.0.0.1
+    # UTS46 ``ignored`` 码点：Chromium 先删除再解析
+    "https://169.25\u00ad4.169.254/",  # U+00AD（软连字符）
+    "https://\u00ad169.254.169.254/",  # U+00AD 在开头
+    "https://169.254.169.254\u200b/",  # U+200B（零宽空格）
+    "https://0\u200bx7f.0.0.1/",  # ignored 码点藏在 ``0x`` 前缀里
+    # U+A7F1：UTS46 ``mapped`` → ``s`` ⇒ Chromium host 是 ``foo.localhost``（回环）
+    "https://foo.localho\ua7f1t/",
+]
+
+
+@pytest.mark.parametrize("url", UNICODE_PRIVATE_URLS)
+def test_unicode_host_forms_cannot_hide_private_targets(url):
+    policy = NavigationPolicy()
+    ok, reason = policy.validate(url)
+    assert not ok, f"{url} must be blocked: Chromium 的 host 归一化会把它变成私有字面值"
+    assert reason.startswith(REASON_PRIVATE_ADDRESS_BLOCKED), reason
+    # 独立谓词必须同一套判定（上层复用/展示都读它）
+    assert policy.should_block_private(url) is True, url
+
+
+UNICODE_PUBLIC_URLS = [
+    "https://example\u3002com/",
+    "https://example\uff0ecom/",
+    "https://example\uff61com/",
+    "https://www.example\u3002com/",
+]
+
+
+@pytest.mark.parametrize("url", UNICODE_PUBLIC_URLS)
+def test_unicode_dot_variants_normalize_to_ascii_dot_without_over_rejecting(url):
+    """``example。com`` 的真实主机就是 ``example.com`` ⇒ 既要挡住私有目标，也不能误拒公网主机
+    （旧实现把它当单标签主机拒掉，还把这一点写成了"只会多拒（fail-closed）"的承诺——承诺是错的）。"""
+    policy = NavigationPolicy()
+    assert policy.validate(url) == (True, ""), policy.validate(url)
+    assert policy.should_block_private(url) is False, url
+    # 归一化后的主机就是 ``example.com``：白名单按 ASCII 主机名条目匹配得上
+    allowlist = NavigationPolicy(mode="allowlist", allowed_domains=["example.com"])
+    assert allowlist.validate(url) == (True, ""), allowlist.validate(url)
+
+
+def test_uts46_ignored_code_points_are_removed_from_hosts():
+    """``ignored`` 集合的每个区间抽一个代表：Chromium 先删再解析 ⇒ ``169.254.169.2<c>54``
+    就是云元数据端点（U+3164/U+FFA0 先 NFKC 成 U+1160，也在 ignored 集合里）。"""
+    policy = NavigationPolicy()
+    for cp in (
+        "\u00ad",  # 软连字符
+        "\u034f",
+        "\u115f",
+        "\u17b4",
+        "\u180b",
+        "\u200b",  # 零宽空格
+        "\u2060",
+        "\u206a",
+        "\u3164",
+        "\ufe00",  # 变体选择符 VS1
+        "\ufeff",
+        "\uffa0",
+        "\U0001bca0",
+        "\U0001d173",
+        "\U000e0100",  # 变体选择符 VS17
+    ):
+        url = f"http://169.254.169.2{cp}54/"
+        ok, reason = policy.validate(url)
+        assert not ok, f"U+{ord(cp):04X} 未从主机中删除：{url!r}"
+        assert reason.startswith(REASON_PRIVATE_ADDRESS_BLOCKED), reason
+
+
+def test_non_ascii_dns_host_is_judged_literally_no_punycode_decoding():
+    """文档化限制：不做 punycode（``xn--``）编解码 ⇒ 归一化后仍含非 ASCII 的主机按字面判定。
+
+    ``münchen.de``/``例え.jp`` 在 Chromium 里是 ``xn--`` 开头的 DNS 名（**不是字面 IP**），
+    其解析结果是否指向内网属于既有的"不做 DNS 解析"限制。反向保证由上面两个载荷表兜住：
+    凡是 Chromium 会解析成字面 IP/本机名的形态，本策略都拒。
+    """
+    policy = NavigationPolicy()
+    for url in ("https://m\u00fcnchen.de/", "https://\u4f8b\u3048.jp/"):
+        assert policy.validate(url) == (True, ""), policy.validate(url)
+        assert policy.should_block_private(url) is False, url
+
+
 # ── allowlist：精确 + 子域后缀 ────────────────────────────────────────────────
 
 
@@ -274,6 +382,44 @@ def test_allowlist_entries_are_normalized():
     for url in ("https://example.com/", "https://www.example.com/", "https://a.foo.com/"):
         assert policy.validate(url)[0], url
     assert not policy.validate("https://bar.com/")[0]
+
+
+def test_allowlist_entries_use_the_same_unicode_host_mapping():
+    """条目与主机共用同一套归一化：``Example。COM.`` ≡ ``example.com``；
+    全角数字条目 ``１２７.0.0.1`` ≡ ``127.0.0.1``（IP 字面值条目 ⇒ 只精确匹配，见下）。"""
+    policy = NavigationPolicy(
+        mode="allowlist", allowed_domains=["Example\u3002COM.", "\uff11\uff12\uff17.0.0.1"]
+    )
+    for url in ("https://example.com/", "https://example\u3002com/", "http://127.0.0.1:8099/x"):
+        assert policy.validate(url) == (True, ""), policy.validate(url)
+    for url in ("https://evil.com/", "http://127.0.0.2/"):
+        ok, reason = policy.validate(url)
+        assert not ok, url
+        assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
+
+
+@pytest.mark.parametrize(
+    ("entry", "suffix_host"),
+    [
+        ("1.1.1", "127.1.1.1"),  # 回环：``host.endswith(".1.1.1")`` 会把 127.1.1.1 放进来
+        ("1.1.1", "1.1.1.1"),  # 同一个条目的"看似子域"形式
+        ("0x7f.0.0.1", "evil.0x7f.0.0.1"),  # ipaddress 解析不了、但形状就是混淆 IPv4
+    ],
+)
+def test_allowlist_ip_literal_entries_require_exact_match(entry, suffix_host):
+    """IP 字面值/混淆 IPv4 条目不做子域后缀匹配——IP 没有"子域"：
+    ``allowed_domains=["1.1.1"]`` 按后缀匹配会放行回环地址 ``127.1.1.1``。"""
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=[entry])
+    ok, reason = policy.validate(f"http://{suffix_host}/")
+    assert not ok, f"{suffix_host} must not be authorized by the IP-literal entry {entry!r}"
+    assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
+
+
+def test_allowlist_exact_ip_literal_entry_still_allows_that_host():
+    """逃逸口不受收紧影响：显式写 ``127.0.0.1``/``::1`` 仍精确放行该主机（本地调试）。"""
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=["127.0.0.1", "::1"])
+    for url in ("http://127.0.0.1:8099/x", "http://[::1]:8099/x"):
+        assert policy.validate(url) == (True, ""), policy.validate(url)
 
 
 def test_allowlist_wildcards_are_not_supported_and_fail_closed():
@@ -398,6 +544,21 @@ def test_rejection_reasons_truncate_long_hosts():
         assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
         assert "…" in reason, f"缺少截断标记：{reason[-20:]}"
         assert long_host not in reason
+
+
+def test_rejection_reasons_stay_bounded_for_non_ascii_hosts():
+    """截断必须发生在**拼好整条 detail 之后**：先 ``_echo(host)`` 再 ``!r`` 的话，
+    repr 会把 200 个不可打印的非 ASCII 字符转义回 6 倍长（``U+200E`` → ``\\u200e``），
+    300 上限形同虚设（5000 字符主机 ⇒ 拒因 1200+ 字符）。"""
+    # U+200E（Cf，非 ASCII 且不可打印）+ ".." ⇒ 走 malformed host 分支
+    host = "\u200e" * 5000 + "..evil"
+    ok, reason = NavigationPolicy().validate(f"http://{host}/")
+    assert not ok, "malformed host must be rejected"
+    assert reason.startswith(REASON_INVALID_URL), reason
+    assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
+    assert "\u2026" in reason, f"缺少截断标记：{reason[-20:]}"
+    # 截断作用于**拼好的整条 detail**：转义后的 200 字符上限内不会再膨胀回 5000 字符的转义序列
+    assert len(reason) - reason.count("\\u200e") * 5 < 300
 
 
 def test_protocol_blocked_reason_truncates_long_schemes():
