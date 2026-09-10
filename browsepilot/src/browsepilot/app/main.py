@@ -7,14 +7,17 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 
+import aiosqlite
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
+from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from loguru import logger
 from pydantic import BaseModel, Field
 
 from browsepilot import __version__
 from browsepilot.agent.api import has_pending_human_action, resume_task, run_task
+from browsepilot.agent.state import AgentState, ExecutionStep
 from browsepilot.agent.tools import ToolExecutor
 from browsepilot.agent.tracer import Tracer
 from browsepilot.app.config import Settings
@@ -90,6 +93,14 @@ _RATE_LIMITED_PATHS = ("/chat/stream", "/chat/resume")
 # 估算性质 —— P4 换精确 token 统计。
 _EST_TOKENS_PER_TURN = 4000
 
+# ── Checkpoint serde msgpack 白名单（P2 MUST-FIX）──────────────────────────
+# lifespan 手动构造 AsyncSqliteSaver 时显式传入 serde：langgraph-checkpoint 4.x
+# 的 JsonPlusSerializer 默认（allowed_msgpack_modules=True）对未注册类型只 warn
+# 放行，严格模式（LANGGRAPH_STRICT_MSGPACK=true）下则直接拒 → resume 读回裸 dict。
+# 允许项取类型对象本身（归一化成 (module, name) 键）；框架自有类型
+# （PregelTask/Send/Interrupt 等）在 SAFE_MSGPACK_TYPES 中，无需重复列举。
+_MSGPACK_ALLOWED_TYPES: tuple[type, ...] = (AgentState, ExecutionStep)
+
 
 def create_app(
     settings: Settings | None = None,
@@ -106,18 +117,27 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         # H1：生产接线——未显式传 checkpointer 时按 settings.checkpoint_db_path
-        # 创建共享 AsyncSqliteSaver（跨请求存活），shutdown 时随 async-with 关闭。
+        # 创建共享 AsyncSqliteSaver（跨请求存活），shutdown 时关闭底层连接。
         # 显式传入（测试）的 checkpointer 由调用方管理生命周期。
+        # 注意：from_conn_string 不接受 serde，故手动构造 conn + saver（serde 见
+        # _MSGPACK_ALLOWED_TYPES 的 msgpack 白名单注册）。
         if checkpointer is None and settings.checkpoint_db_path:
             db_path = Path(settings.checkpoint_db_path)
             db_path.parent.mkdir(parents=True, exist_ok=True)
-            async with AsyncSqliteSaver.from_conn_string(str(db_path)) as saver:
+            conn = await aiosqlite.connect(str(db_path))
+            try:
+                saver = AsyncSqliteSaver(
+                    conn,
+                    serde=JsonPlusSerializer(allowed_msgpack_modules=_MSGPACK_ALLOWED_TYPES),
+                )
                 await saver.setup()
                 app.state.checkpointer = saver
                 logger.info(
                     "browsepilot v2.0 app starting (model={})", settings.default_model
                 )
                 yield
+            finally:
+                await conn.close()
                 logger.info("browsepilot app shutting down (checkpointer closed)")
             return
         logger.info("browsepilot v2.0 app starting (model={})", settings.default_model)

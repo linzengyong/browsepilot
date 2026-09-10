@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from browsepilot.agent.graph import build_graph
+from browsepilot.agent.graph import _merge_degradation, build_graph
 from browsepilot.agent.params import WeatherParams
 from browsepilot.agent.router import IntentResult
 from browsepilot.agent.state import AgentState
@@ -325,3 +325,53 @@ async def test_search_intent_single_strategy_failure_is_final(tmp_path):
     assert [d["strategy"] for d in result["result_data"]["degradation"]] == ["search"]
     assert [d["strategy"] for d in result["degradation_log"]] == ["search"]
     assert "搜索超时" in result["final_answer"]
+
+
+def test_merge_degradation_dedupes_same_strategy_and_error():
+    """同一 (strategy, error) 只保留首次记录 —— resume 重放不翻倍。"""
+    existing = [{"strategy": "weather", "error": "city_not_found", "message": "无此城市"}]
+    new = [
+        {"strategy": "weather", "error": "city_not_found", "message": "无此城市"},
+        {"strategy": "search", "error": "service_error", "message": "boom"},
+    ]
+    merged = _merge_degradation(existing, new)
+    assert merged == [
+        {"strategy": "weather", "error": "city_not_found", "message": "无此城市"},
+        {"strategy": "search", "error": "service_error", "message": "boom"},
+    ]
+    # 不改动入参：调用方（state / 本轮 degradation）继续独立可用
+    assert existing == [{"strategy": "weather", "error": "city_not_found", "message": "无此城市"}]
+    assert new == [
+        {"strategy": "weather", "error": "city_not_found", "message": "无此城市"},
+        {"strategy": "search", "error": "service_error", "message": "boom"},
+    ]
+
+
+def test_merge_degradation_keeps_distinct_errors_on_same_strategy():
+    """去重键是 (strategy, error)：同策略的不同错误类型都必须保留。"""
+    existing = [{"strategy": "search", "error": "search_timeout", "message": "搜索超时"}]
+    new = [{"strategy": "search", "error": "service_error", "message": "boom"}]
+    assert _merge_degradation(existing, new) == existing + new
+
+
+@pytest.mark.asyncio
+async def test_degradation_log_not_duplicated_when_execute_replays(tmp_path):
+    """resume 重放防护：execute 带着已持久化的 degradation_log 重跑时不再翻倍。
+
+    P2 review 场景：LangGraph resume 重放 interrupt 前的 execute，本轮
+    degradation 追加到 state 里已存在的 degradation_log → 同一条记录翻倍。
+    这里用"第一次运行的终态"作为重放输入（即 execute 重跑时读到的 state），
+    断言合并后 weather/search 仍各只有一条。
+    """
+    tracer = JsonlTracer(trace_id="t9", out_dir=tmp_path / "traces")
+    graph = build_graph(FailingExecutor(), tracer, StubProvider())
+    first = await graph.ainvoke(AgentState(task="北京天气怎么样？"))
+    assert [d["strategy"] for d in first["degradation_log"]] == ["weather", "search"]
+
+    replay_input = AgentState(
+        task="北京天气怎么样？",
+        degradation_log=[dict(d) for d in first["degradation_log"]],
+    )
+    replayed = await graph.ainvoke(replay_input)
+    assert [d["strategy"] for d in replayed["degradation_log"]] == ["weather", "search"]
+    assert replayed["degradation_log"] == first["degradation_log"]

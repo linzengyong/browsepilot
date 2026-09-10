@@ -30,6 +30,23 @@ from browsepilot.model.provider import ModelProvider
 from browsepilot.model.structured import StructuredOutputError
 
 
+def _merge_degradation(existing: list[dict], new: list[dict]) -> list[dict]:
+    """合并降级记录：按 (strategy, error) 去重，保留首次出现的那条。
+
+    resume 会重放 interrupt 之前的 execute 节点：重跑时 state 里已经带着上一轮
+    的 degradation_log，直接相加会让同一条降级记录翻倍。去重键取 (strategy,
+    error) —— 同一策略的不同失败原因仍然各自保留。返回新列表，不改动入参。
+    """
+    seen = {(e.get("strategy"), e.get("error")) for e in existing}
+    merged = list(existing)
+    for entry in new:
+        key = (entry.get("strategy"), entry.get("error"))
+        if key not in seen:
+            merged.append(entry)
+            seen.add(key)
+    return merged
+
+
 def build_graph(
     executor: ToolExecutor,
     tracer: Tracer,
@@ -136,12 +153,16 @@ def build_graph(
                             "result_data": tool_result.data,
                             "pending_human_action": True,
                             "human_prompt": str(tool_result.data.get("human_prompt", "")),
-                            "degradation_log": state.degradation_log + degradation,
+                            "degradation_log": _merge_degradation(
+                                state.degradation_log, degradation
+                            ),
                         }
                     return {
                         "result_data": tool_result.data,
                         "stop_reason": "",
-                        "degradation_log": state.degradation_log + degradation,
+                        "degradation_log": _merge_degradation(
+                            state.degradation_log, degradation
+                        ),
                     }
                 degradation.append(
                     {
@@ -152,7 +173,7 @@ def build_graph(
                 )
             return {
                 "result_data": {"error": "all_strategies_failed", "degradation": degradation},
-                "degradation_log": state.degradation_log + degradation,
+                "degradation_log": _merge_degradation(state.degradation_log, degradation),
             }
 
     async def answer(state: AgentState) -> dict:

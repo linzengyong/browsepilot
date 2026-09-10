@@ -537,6 +537,83 @@ def test_lifespan_wires_checkpointer_from_settings(tmp_path):
     assert ckpt_db.exists()  # checkpoint 已落盘
 
 
+def test_lifespan_checkpointer_registers_msgpack_serde(tmp_path):
+    """P2 MUST-FIX：lifespan 手动构造 AsyncSqliteSaver 时显式注册 msgpack serde。
+
+    langgraph-checkpoint 4.2.0 的 allowed_msgpack_modules 只接受类型本身或
+    (module, name) 符号元组（传模块名字符串是无效条目），默认 serde 为
+    True=全放行+warn；未注册的 browsepilot 自有状态类型在严格模式
+    （LANGGRAPH_STRICT_MSGPACK=true）下反序列化会被拒 → resume 读回裸 dict。
+    断言两件事：注册集合精确，且一次 checkpoint blob 写读 roundtrip 后仍
+    还原为 pydantic 实例（AgentState / 嵌套 ExecutionStep）而不是降级的 dict。
+    """
+    from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
+
+    from browsepilot.agent.state import AgentState, ExecutionStep
+
+    ckpt_db = tmp_path / "ckpt.sqlite"
+    app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=str(ckpt_db)),
+        provider=FakeProvider(),
+        executor=FakeExecutor(),
+        tracer=JsonlTracer(trace_id="serde", out_dir=tmp_path),
+    )
+    with TestClient(app):
+        serde = app.state.checkpointer.serde
+        assert isinstance(serde, JsonPlusSerializer)
+        # 显式白名单（非默认 True）：键与 langgraph 归一化后的 (module, name) 一致
+        assert serde._allowed_msgpack_modules == {
+            ("browsepilot.agent.state", "AgentState"),
+            ("browsepilot.agent.state", "ExecutionStep"),
+        }
+
+        # checkpoint blob 写读 roundtrip：写盘用的就是 dumps_typed 的 msgpack 载荷
+        state = AgentState(
+            task="北京天气",
+            execution_log=[ExecutionStep(index=1, tool="weather")],
+            degradation_log=[
+                {"strategy": "weather", "error": "city_not_found", "message": "无此城市"}
+            ],
+        )
+        type_, blob = serde.dumps_typed(state)
+        assert type_ == "msgpack"
+        revived = serde.loads_typed((type_, blob))
+        assert isinstance(revived, AgentState)  # 未被白名单拒绝降级成 dict
+        assert revived == state
+
+
+def test_lifespan_manual_saver_survives_app_restart_for_resume(tmp_path):
+    """手动构造 saver（conn + 显式 serde）后生命周期语义不变：app shutdown
+    关闭连接，下一次启动从同一 sqlite 文件读回 interrupt 状态并成功 resume。"""
+    ckpt_db = tmp_path / "ckpt.sqlite"
+
+    def _make(trace_id: str):
+        return create_app(
+            Settings(_env_file=None, checkpoint_db_path=str(ckpt_db)),
+            provider=FakeProvider(),
+            executor=HumanNeedingExecutor(),
+            tracer=JsonlTracer(trace_id=trace_id, out_dir=tmp_path),
+        )
+
+    with TestClient(_make("restart-1")) as client:
+        first = _stream_chat_events(client, "s1", "北京天气")
+        assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert ckpt_db.exists()
+
+    # 新进程语义：重新 lifespan（新 conn/saver），从磁盘读回 interrupt 并 resume
+    with TestClient(_make("restart-2")) as client:
+        with client.stream(
+            "POST", "/chat/resume", json={"session_id": "s1", "human_response": "确认"}
+        ) as resp:
+            events = [
+                json.loads(line[len("data: ") :])
+                for line in resp.iter_lines()
+                if line.startswith("data: ")
+            ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[0]["text"] == "合成回答"
+
+
 def test_resume_without_pending_interrupt_errors(tmp_path):
     """无待处理 interrupt 时 resume 必须明确报错，而不是静默开新任务。"""
     from langgraph.checkpoint.memory import MemorySaver
