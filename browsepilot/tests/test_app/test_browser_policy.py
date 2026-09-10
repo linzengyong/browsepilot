@@ -31,6 +31,7 @@ from __future__ import annotations
 import pytest
 
 from browsepilot.app.browser.policy import (
+    _IGNORED_CODE_POINTS,
     REASON_ALLOWLIST_EMPTY,
     REASON_DOMAIN_NOT_ALLOWED,
     REASON_INVALID_URL,
@@ -256,33 +257,37 @@ def test_slash_collapsed_private_targets_fail_closed(url):
 # 下面每个载荷的真实 host 都用 node v24 的 WHATWG ``URL`` 复核过（完整对照表见 task-3-fix2-report.md）。
 
 UNICODE_PRIVATE_URLS = [
+    # (payload, 子拒因关键字)：pin 住归一化后到底由哪条规则拦（私有字面 IP / 混淆 IPv4 / 本机名）
     # U+3002 ``。``
-    "https://169\u3002254.169.254/latest/meta-data/",  # 云元数据端点
-    "https://169.254\u3002169.254/",  # 点变体在中间：解析器差分最容易被漏掉的形态
-    "https://0x7f\u30020.0.1/",  # 十六进制字面值 + 点变体 ⇒ 127.0.0.1
-    "https://\uff11\uff16\uff19\u3002\uff12\uff15\uff14.169.254/",  # 全角数字 + 点变体
+    ("https://169\u3002254.169.254/latest/meta-data/", "private/loopback"),  # 云元数据端点
+    ("https://169.254\u3002169.254/", "private/loopback"),  # 点变体在中间：解析器差分最容易被漏掉的形态
+    ("https://0x7f\u30020.0.1/", "obfuscated IPv4"),  # 十六进制字面值 + 点变体 ⇒ 127.0.0.1
+    ("https://\uff11\uff16\uff19\u3002\uff12\uff15\uff14.169.254/", "private/loopback"),  # 全角数字 + 点变体
     # U+FF0E ``．`` / U+FF61 ``｡``：与 U+3002 同类的另两个点变体
-    "https://169\uff0e254.169.254/",
-    "https://169\uff61254.169.254/",
+    ("https://169\uff0e254.169.254/", "private/loopback"),
+    ("https://169\uff61254.169.254/", "private/loopback"),
     # NFKC 覆盖的"兼容字形 → ASCII"
-    "https://\uff10\uff58\uff17\uff46.0.0.1/",  # 全角 ``0x7f`` ⇒ 127.0.0.1
-    "https://\u00b9\u00b2\u2077.0.0.1/",  # 上标 ``¹²⁷`` ⇒ 127.0.0.1
+    ("https://\uff10\uff58\uff17\uff46.0.0.1/", "obfuscated IPv4"),  # 全角 ``0x7f`` ⇒ 混淆字面值
+    ("https://\u00b9\u00b2\u2077.0.0.1/", "private/loopback"),  # 上标 ``¹²⁷`` ⇒ 合法字面 IP 127.0.0.1
     # UTS46 ``ignored`` 码点：Chromium 先删除再解析
-    "https://169.25\u00ad4.169.254/",  # U+00AD（软连字符）
-    "https://\u00ad169.254.169.254/",  # U+00AD 在开头
-    "https://169.254.169.254\u200b/",  # U+200B（零宽空格）
-    "https://0\u200bx7f.0.0.1/",  # ignored 码点藏在 ``0x`` 前缀里
+    ("https://169.25\u00ad4.169.254/", "private/loopback"),  # U+00AD（软连字符）
+    ("https://\u00ad169.254.169.254/", "private/loopback"),  # U+00AD 在开头
+    ("https://169.254.169.254\u200b/", "private/loopback"),  # U+200B（零宽空格）
+    ("https://0\u200bx7f.0.0.1/", "obfuscated IPv4"),  # ignored 码点藏在 ``0x`` 前缀里
     # U+A7F1：UTS46 ``mapped`` → ``s`` ⇒ Chromium host 是 ``foo.localhost``（回环）
-    "https://foo.localho\ua7f1t/",
+    ("https://foo.localho\ua7f1t/", "local-only hostname"),
 ]
 
 
-@pytest.mark.parametrize("url", UNICODE_PRIVATE_URLS)
-def test_unicode_host_forms_cannot_hide_private_targets(url):
+@pytest.mark.parametrize(("url", "subreason"), UNICODE_PRIVATE_URLS)
+def test_unicode_host_forms_cannot_hide_private_targets(url, subreason):
     policy = NavigationPolicy()
     ok, reason = policy.validate(url)
     assert not ok, f"{url} must be blocked: Chromium 的 host 归一化会把它变成私有字面值"
     assert reason.startswith(REASON_PRIVATE_ADDRESS_BLOCKED), reason
+    # 不能只看 code 前缀（M4）：pin 住是哪条子规则在拦——私有字面 IP / 混淆 IPv4 / 本机名。
+    # 走错规则（例如混淆字面值突然被 ipaddress 解析成合法 IP、或合法 IP 掉进混淆分支）会在这里炸
+    assert subreason in reason, f"{url} 应由 {subreason!r} 规则拒，实际：{reason}"
     # 独立谓词必须同一套判定（上层复用/展示都读它）
     assert policy.should_block_private(url) is True, url
 
@@ -332,6 +337,47 @@ def test_uts46_ignored_code_points_are_removed_from_hosts():
         ok, reason = policy.validate(url)
         assert not ok, f"U+{ord(cp):04X} 未从主机中删除：{url!r}"
         assert reason.startswith(REASON_PRIVATE_ADDRESS_BLOCKED), reason
+
+
+def test_uts46_ignored_code_point_table_invariants():
+    """``_IGNORED_CODE_POINTS`` 是安全关键的字面量：Chromium 解析主机前会先删掉这些码点，
+    漏收/删错一个区间就是一个误放（``169.254.169.2<c>54`` ⇒ 云元数据端点），而上面的载荷
+    测试只抽查代表点——删掉一个区间照样全绿。这里 pin 住整表的不变量：总数（UTS46 17.0.0
+    ``status=ignored`` 的全部码点）、无重复（区间重叠等价于漏收码点）与各区间端点/相邻空档。"""
+    points = _IGNORED_CODE_POINTS
+    assert len(points) == 294, "ignored 码点数变了：改表前先核对 UTS46 IdnaMappingTable.txt"
+    assert len(set(points)) == len(points), "表里有重复码点 ⇒ 集合语义下等于漏收码点（误放）"
+    for cp in (
+        "\u00ad",  # 散列段起点（软连字符）
+        "\u034f",
+        "\u115f",
+        "\u1160",  # NFKC 的落点（\u3164/\uffa0 归一化后就是它）
+        "\u17b5",  # 17b4–17b5 区间末尾
+        "\u180f",  # 散列段末尾
+        "\u200b",  # 零宽空格
+        "\u2060",
+        "\u206f",  # 206a–206f 区间末尾
+        "\u3164",
+        "\ufeff",
+        "\uffa0",
+        "\ufe0f",  # VS1–VS16 区间末尾
+        "\U0001bca3",  # 速记格式控制符区间末尾
+        "\U0001d17a",  # 音乐符号区间末尾
+        "\U000e0100",  # VS17–VS256 区间起点
+        "\U000e01ef",  # VS17–VS256 区间末尾
+    ):
+        assert cp in points, f"U+{ord(cp):04X} 不在 ignored 表里（Chromium 会删除它）"
+    for cp in (
+        "\u180a",  # 17b4–17b5 之前的 valid 码点
+        "\u200c",  # ZWNJ：deviation，Chromium 不删
+        "\u200d",
+        "\u2065",  # 2060–2064 与 206a–206f 之间的空档
+        "\ufe10",  # VS1–VS16 之后
+        "\U0001bca4",
+        "\U000e00ff",
+        "\U000e01f0",  # VS256 之后
+    ):
+        assert cp not in points, f"U+{ord(cp):04X} 不是 UTS46 ignored 码点，不该被删"
 
 
 def test_non_ascii_dns_host_is_judged_literally_no_punycode_decoding():
@@ -420,6 +466,30 @@ def test_allowlist_exact_ip_literal_entry_still_allows_that_host():
     policy = NavigationPolicy(mode="allowlist", allowed_domains=["127.0.0.1", "::1"])
     for url in ("http://127.0.0.1:8099/x", "http://[::1]:8099/x"):
         assert policy.validate(url) == (True, ""), policy.validate(url)
+
+
+def test_obfuscated_ipv4_literal_detection_is_keyed_on_the_last_label():
+    """WHATWG 只在主机**以数字结尾**时才尝试 IPv4 解析（最后一个 label 是十进制/``0x`` 数字），
+    不是"任意 label 长得像 ``0x…``"：``0x7f.example.com`` 的最后一段是 ``com``，Chromium
+    把它当 DNS 名 ⇒ ``allow_https`` 不能误拒（``0x7f.com``/``0x7f.0.0.1.example.com`` 同理）。"""
+    policy = NavigationPolicy()
+    for url in (
+        "https://0x7f.example.com/",
+        "https://0x7f.com/",
+        "https://0x7f.0.0.1.example.com/",
+    ):
+        assert policy.validate(url) == (True, ""), policy.validate(url)
+
+
+def test_allowlist_entry_whose_first_label_looks_like_0x_is_still_a_dns_suffix():
+    """M3：条目 ``0x7f.com`` 不以数字结尾 ⇒ Chromium 走 DNS 名（不是字面 IP）⇒ 不该被
+    当成"IP 字面值条目"降级为只精确匹配：子域 ``www.0x7f.com`` 仍由后缀匹配放行。"""
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=["0x7f.com"])
+    for url in ("https://0x7f.com/x", "https://www.0x7f.com/x"):
+        assert policy.validate(url) == (True, ""), policy.validate(url)
+    ok, reason = policy.validate("https://evil.com/")
+    assert not ok, "unrelated host must stay blocked"
+    assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
 
 
 def test_allowlist_wildcards_are_not_supported_and_fail_closed():
@@ -557,8 +627,15 @@ def test_rejection_reasons_stay_bounded_for_non_ascii_hosts():
     assert reason.startswith(REASON_INVALID_URL), reason
     assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
     assert "\u2026" in reason, f"缺少截断标记：{reason[-20:]}"
-    # 截断作用于**拼好的整条 detail**：转义后的 200 字符上限内不会再膨胀回 5000 字符的转义序列
-    assert len(reason) - reason.count("\\u200e") * 5 < 300
+    # M4：把有界性写成可证伪的具体断言，而不是恒真的长度不等式。截断作用于**拼好的整条
+    # detail** ⇒ detail = _echo 的 200 字符上限 + 省略号；若先 _echo(host) 再 !r，200 个
+    # U+200E 会各自膨胀成 6 字符（200 个 ``\u200e``），下面两条都会炸——旧的
+    # ``len(reason) - count * 5 < 300`` 在那种情况下仍然恒真，等于没测。
+    detail = reason.removeprefix(f"{REASON_INVALID_URL}: ")
+    assert detail.startswith("malformed host "), detail[:40]
+    assert len(detail) <= 201, f"detail 未截断到 200+省略号：{len(detail)} 字符"
+    escapes = detail.count("\\u200e")
+    assert escapes <= 33, f"转义序列未被截断：{escapes}"
 
 
 def test_protocol_blocked_reason_truncates_long_schemes():

@@ -56,13 +56,19 @@ r"""URL 安全策略（D4/D7）：纯函数 + 纯标准库（``urllib.parse`` + 
   （如 ``db-01.corp.example.com``）在 ``allow_https`` 模式下会放行；要挡住请用 ``allowlist`` 模式。
 * 不做端口范围限制（``https://example.com:8443`` 放行），只校验端口可解析。
 * **不做完整 IDNA/UTS46**：只做上面第 2 条的归一化子集，不做 punycode（``xn--``）编解码，也不对齐
-  IDNA2003↔UTS46 的其余差异（``ß``/词尾 ``ς``/Cherokee 小写…）。归一化后仍含非 ASCII 的主机
-  按字面判定：它们在 Chromium 里是 ``xn--`` 开头的 **DNS 名**（不是字面 IP/本机名），是否指向内网
-  属于上面"不做 DNS 解析"的取舍。反向保证（本层的契约）：**凡 Chromium 会解析成字面 IP/本机名的
-  形态（点变体、全角/兼容数字、``ignored`` 码点、``\ua7f1``）也都会按 IP/本机名拒**——这一条逐条
-  核对过 UTS46 17.0.0 ``IdnaMappingTable.txt``：``mapped``/``disallowed_STD3_mapped`` 共 6377 个码点，
-  映射结果含 ASCII 的 1673 个里 NFKC 复现 1669 个，其余三个与判定有关的（``\u3002``/``\uff61``/
-  ``\ua7f1``）由本层显式映射；``ignored`` 码点已全量列入 ``_IGNORED_CODE_POINTS``。
+  IDNA2003↔UTS46 的其余差异（``ß``/词尾 ``ς``/Cherokee 小写…）。归一化后仍含非 ASCII 的主机按字面
+  判定，分两类：UTS46 ``valid``/``mapped`` 的码点在 Chromium 里是 ``xn--`` 开头的 **DNS 名**（不是
+  字面 IP/本机名），是否指向内网属于上面"不做 DNS 解析"的取舍；UTS46 ``disallowed`` 的码点
+  （U+200E/200F/061C、U+2024/2025、U+FE52、C1 控制符…）会让 Chromium 的 ``domain to ASCII`` 直接
+  失败、**拒绝整个 URL**，本层按字面判定则可能放行——方向安全（放行的是浏览器根本不会导航的
+  URL），不构成"策略放行、浏览器打内网"的误放。归一化用 NFKC + 显式映射：NFKC 的映射面比
+  UTS46 ``mapped`` 更宽——UTS46 标 ``valid``/``disallowed`` 的兼容字形它也会先映射（不少直接
+  落成 ASCII，如 ``U+FE52``→``.``）⇒ 有些在 Chromium 里是 DNS 名（或会被拒）的主机在本层会被
+  当成字面 IP/本机名判——偏离方向是更严，不是漏放。反向保证（本层的契约）：**凡 Chromium 会解析成字面 IP/本机名的形态（点变体、
+  全角/兼容数字、``ignored`` 码点、``\ua7f1``）也都会按 IP/本机名拒**——这一条逐条核对过 UTS46
+  17.0.0 ``IdnaMappingTable.txt``：``mapped``/``disallowed_STD3_mapped`` 共 6377 个码点，映射结果
+  含 ASCII 的 1673 个里 NFKC 复现 1669 个，其余三个与判定有关的（``\u3002``/``\uff61``/``\ua7f1``）
+  由本层显式映射；``ignored`` 码点已全量列入 ``_IGNORED_CODE_POINTS``。
 * 校验当次调用的 URL，不跟踪重定向/子资源请求的后续跳转（T4 每次 navigate 前把关）。
 """
 
@@ -168,9 +174,12 @@ def _whatwg_normalized_host(host: str) -> str:
     * 小写放在最后：NFKC 会把全角大写字母变成大写 ASCII。
 
     **不做** punycode（``xn--``）编解码、也不对齐 IDNA2003↔UTS46 的其余差异：归一化后仍含非 ASCII
-    的主机按字面判定——它们在 Chromium 里是 ``xn--`` DNS 名，不是字面 IP/本机名（详见模块
-    docstring"已知限制"）；反之，凡 Chromium 会解析成字面 IP/本机名的形态，这里都会归一化成同样的
-    ASCII 值。
+    的主机按字面判定——UTS46 ``valid``/``mapped`` 的码点在 Chromium 里是 ``xn--`` DNS 名（不是字面
+    IP/本机名），而 ``disallowed`` 的码点（U+200E/200F/061C、U+2024/2025、U+FE52、C1 控制符…）会让
+    Chromium 直接拒绝整个 URL、这里却可能放行（方向安全，详见模块 docstring"已知限制"）；反之，
+    凡 Chromium 会解析成字面 IP/本机名的形态，这里都会归一化成同样的 ASCII 值。另外，NFKC 的
+    映射面比 UTS46 ``mapped`` 更宽（UTS46 标 ``valid``/``disallowed`` 的兼容字形它也会先映射）
+    ⇒ 有些主机在本层被当成字面 IP/本机名判严——偏离方向是更严，不是漏放。
     """
     return unicodedata.normalize("NFKC", host).translate(_HOST_TRANSLATION).lower()
 
@@ -199,15 +208,15 @@ def _is_local_ip(addr: _IPAddress) -> bool:
 def _looks_like_ipv4_literal(host: str) -> bool:
     """整数/八进制/十六进制形式的 IPv4 字面值（如 2130706433、0177.0.0.1、0x7f.0.0.1）。
 
-    Chromium 会把这些形式解析成 IP 地址，故必须与点分十进制同等对待。
+    Chromium 会把这些形式解析成 IP 地址，故必须与点分十进制同等对待。**触发条件与 WHATWG 对齐**：
+    只在主机**以数字结尾**（最后一个 label 是十进制/``0x`` 十六进制数字）时才尝试 IPv4 解析；
+    最后一个 label 不是数字时 Chromium 走 DNS 名（``0x7f.example.com``/``0x7f.com`` 即使第一个
+    label 长得像十六进制字面值也一样），不能误拒，对应的 allowlist 条目也不能降级成"只精确匹配"。
     """
-    labels = host.split(".")
-    if all(label.isdigit() for label in labels):
+    last = host.rsplit(".", 1)[-1]
+    if last.isdigit():
         return True
-    return any(
-        len(label) > 2 and label.startswith("0x") and all(ch in _HEX_DIGITS for ch in label[2:])
-        for label in labels
-    )
+    return len(last) > 2 and last.startswith("0x") and all(ch in _HEX_DIGITS for ch in last[2:])
 
 
 def _local_reason(host: str) -> str | None:
