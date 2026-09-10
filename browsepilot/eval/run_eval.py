@@ -29,6 +29,7 @@ from pathlib import Path
 
 from browsepilot.agent.api import run_task
 from browsepilot.agent.tracer import JsonlTracer, Tracer
+from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
 from eval.scenarios import Check, Scenario, load_scenarios
 
@@ -36,19 +37,14 @@ SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
 
 
 def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
-    """Evaluate one check against a run_task outcome dict. Returns (passed, detail)."""
-    if check.type == "field":
-        value = outcome.get("result_data", {}).get(check.field)
-        if check.kind == "number":
-            ok = isinstance(value, (int, float)) and not isinstance(value, bool)
-            return ok, f"{check.field}={value!r} (number)"
-        ok = value == check.expected
-        return ok, f"{check.field}={value!r} expected={check.expected!r}"
-    if check.type == "contains_keyword":
-        text = outcome.get("final_answer", "")
-        hits = [k for k in (check.keywords or []) if k in text]
-        return bool(hits), f"keywords hit={hits}"
-    return False, f"unknown check type {check.type}"
+    """Evaluate one check against a run_task outcome dict. Returns (passed, detail).
+
+    v0.3（P4-D1）：断言逻辑整体搬到 :mod:`eval.checks`（纯函数 + 全部检查类型）。
+    这里保留 tuple 形状的薄适配层 —— ``run_all`` 与既有测试的调用方式不变；
+    两个既有类型（field / contains_keyword）的通过语义也不变。
+    """
+    result = run_check(outcome, check)
+    return result.passed, result.detail
 
 
 async def _run_scenario(
