@@ -3,13 +3,16 @@
 覆盖主线：**policy 门**（navigate 之前把关、拒绝路径绝不建页/导航）、**动作后 URL 复查**
 （重定向/点击跳转/JS 跳转回流后的落点也要在策略内，I2）、**当前页跟踪**（open 复用同一个 page；
 snapshot/click/type/scroll 都作用在它身上；池回收后的恢复与 ``aclose()`` 释放，I3）、
-**结构化降级**（未注入池 / 池未启动 / 快照为空 / 动作失败 一律返回 ToolResult，绝不抛）。
+**结构化降级**（未注入池 / 池未启动 / 快照为空 / 动作失败 一律返回 ToolResult，绝不抛）、
+**D5/D6 HITL 桥**（open/click/type 之后采样页面，命中登录/验证码即挂
+``needs_human`` + ``human_prompt`` + ``intervention``；检测失败绝不影响动作结果）。
 
 不启真实浏览器（教训 §1）：FakeBrowser / FakePage 双人舞——page 的 ``calls`` 保留跨方法
 的时间顺序（用来 pin "先 aria-ref 定位再 click"、"type 先清空再填"），失败可编程
-（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate），跳转可编程
-（``redirect_url`` / ``click_url`` / ``evaluate_url``，动作后复查的测试缝），
-``closed`` 可以模拟池回收；FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()``，
+（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate / **content / 密码框探测**），
+跳转可编程（``redirect_url`` / ``click_url`` / ``evaluate_url``，动作后复查的测试缝），
+``html`` / ``password_inputs`` 是登录/验证码检测的测试缝，``closed`` 可以模拟池回收；
+FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()``，
 并记录建页次数与归还（当前页复用、隔离、释放的证据）。
 真浏览器冒烟是 T6 的独立脚本，不入 pytest。
 """
@@ -24,6 +27,7 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from browsepilot.agent.tools import ToolExecutor
+from browsepilot.app.browser.detect import MAX_HTML_SAMPLE_CHARS
 from browsepilot.app.browser.policy import NavigationPolicy
 from browsepilot.app.executor import MAX_JS_RESULT_CHARS, AppToolExecutor
 from browsepilot.app.services.weather import Weather
@@ -42,6 +46,17 @@ ARIA_YAML = """- generic [ref=e1]:
   - heading "Example Domain" [level=1] [ref=e2]
   - link "More information..." [ref=e4]
 """
+
+DEFAULT_HTML = "<html><body><h1>Example Domain</h1><p>This domain is for use in examples.</p></body></html>"
+"""默认采样 HTML：普通页面，不含任何登录/验证码/弹窗标记（D5/D6 的负对照）。"""
+
+LOGIN_HTML = (
+    "<html><body><form>账号 <input name='user'>密码 <input type='password'>"
+    "<button>登录</button></form></body></html>"
+)
+"""登录页采样：中文入口词 + 凭据词 + 密码框（真实登录页的最小形态）。"""
+
+CAPTCHA_HTML = "<html><body><p>请完成人机验证：点击验证后继续</p></body></html>"
 
 
 # ── fake page / browser（executor 的测试缝） ──────────────────────────────────
@@ -79,6 +94,13 @@ class FakeLocator:
             raise PlaywrightTimeoutError(f"js fallback timeout: {self.selector}")
         return True
 
+    async def count(self) -> int:
+        """D5/D6 密码框探测：只有密码选择器才返回计数（别的选择器动作层从不 count）。"""
+        self._page.calls.append(("count", self.selector))
+        if self._page.fail_password_count:
+            raise RuntimeError(f"count unavailable: {self.selector}")
+        return self._page.password_inputs if "password" in self.selector else 0
+
     async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
         self._page.calls.append(("scroll_into_view", self.selector))
 
@@ -100,10 +122,14 @@ class FakePage:
         url: str = "https://example.com/",
         snapshot_tree: str = ARIA_YAML,
         js_result: Any = "Example Domain",
+        html: str = DEFAULT_HTML,
+        password_inputs: int = 0,
     ) -> None:
         self.url = url
         self.snapshot_tree = snapshot_tree
         self.js_result = js_result
+        self.html = html  # D5/D6：page.content() 的采样
+        self.password_inputs = password_inputs  # D5/D6：input[type=password] 的匹配数
         self.calls: list[tuple] = []
         self.goto_calls: list[str] = []
         self.closed = False  # 池回收（dispose → close）后为 True
@@ -116,6 +142,8 @@ class FakePage:
         self.fail_click = False
         self.fail_locator_evaluate = False
         self.fail_evaluate = False
+        self.fail_content = False  # D5/D6：采样失败必须降级成“没发现”
+        self.fail_password_count = False
         self.mouse = FakeMouse(self)
 
     async def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None):
@@ -149,6 +177,13 @@ class FakePage:
         if self.evaluate_url is not None:  # JS 跳转（静态黑名单漏网时的兜底测试缝）
             self.url = self.evaluate_url
         return self.js_result
+
+    async def content(self) -> str:
+        """D5/D6 页面采样（executor 只取前 20KB 并小写）。"""
+        self.calls.append(("content",))
+        if self.fail_content:
+            raise RuntimeError("page content unavailable")
+        return self.html
 
 
 class FakeBrowser:
@@ -831,3 +866,174 @@ async def test_browser_call_with_broken_arguments_never_raises():
     result = await ex.call("browser_click", None)  # type: ignore[arg-type]
     assert result.status == "error"
     assert result.error_type == "browser_error"
+
+
+# ── D5/D6：动作后登录/验证码检测 → HITL 载荷 ─────────────────────────────────
+
+
+def _hitl_payload(result) -> dict:
+    """结果里的 HITL 三兄弟（graph.execute 只读前两个，第三个给 trace/前端）。"""
+    return {key: result.data[key] for key in ("needs_human", "human_prompt", "intervention")}
+
+
+@pytest.mark.asyncio
+async def test_browser_open_on_login_page_carries_hitl_payload():
+    """D5：动作后落在登录墙 → 挂 needs_human（graph.execute 见它即转 hitl 节点 interrupt）。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page.redirect_url = "https://example.com/login"  # 入参合法，站点把页面重定向到登录页
+    browser = FakeBrowser(page)
+    result = await make_executor(browser).call(
+        "browser_open", {"url": "https://example.com/orders"}
+    )
+    assert result.status == "success"
+    assert _hitl_payload(result) == {
+        "needs_human": True,
+        "human_prompt": "需要人工处理：检测到登录页面，请在浏览器中手动登录后继续任务。",
+        "intervention": "login",
+    }
+    # HITL 载荷是**附加**：动作自己的 data 一个不少
+    assert result.data["url"] == "https://example.com/login"
+    assert result.data["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_browser_open_on_normal_page_has_no_needs_human_key():
+    """负对照：普通页面绝不挂 needs_human（每次误报都要用掉唯一的人工暂停机会）。"""
+    result = await make_executor(FakeBrowser(FakePage())).call(
+        "browser_open", {"url": "https://example.com/"}
+    )
+    assert result.status == "success"
+    assert "needs_human" not in result.data
+    assert "human_prompt" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_browser_click_on_captcha_page_carries_hitl_payload():
+    """D5：点击后页面变成人机验证 → needs_human（intervention=captcha）。"""
+    page = FakePage(html=CAPTCHA_HTML)
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_click", {"ref": "e2"})
+    assert result.status == "success"
+    assert result.data["needs_human"] is True
+    assert result.data["intervention"] == "captcha"
+    assert "验证" in result.data["human_prompt"]
+
+
+@pytest.mark.asyncio
+async def test_browser_type_into_login_form_carries_hitl_payload():
+    """D5：输入之后落在登录表单 → needs_human；动作本身照常完成（先清空再填）。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.calls.clear()
+    result = await ex.call("browser_type", {"ref": "e2", "text": "13800000000"})
+    assert result.status == "success"
+    assert result.data["needs_human"] is True
+    assert result.data["intervention"] == "login"
+    assert ("fill", "aria-ref=e2", "13800000000") in page.calls
+    # 只认**可见**密码框：真实页面里 DOM 中藏着 display:none 的登录弹窗很常见，
+    # 把“DOM 里存在”当“页面上要登录”会直接误报（D5 保守优先）
+    assert ("count", "input[type=password]:visible") in page.calls
+
+
+@pytest.mark.asyncio
+async def test_detection_failure_never_breaks_the_action():
+    """检测是 best-effort：content()/密码框探测抛错 → 当作“没发现”，动作结果原样可用。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page.fail_content = True
+    page.fail_password_count = True
+    browser = FakeBrowser(page)
+    result = await make_executor(browser).call("browser_open", {"url": "https://example.com/"})
+    assert result.status == "success"
+    assert "needs_human" not in result.data
+    assert result.data["requested_url"] == "https://example.com/"
+
+
+@pytest.mark.asyncio
+async def test_failed_action_on_login_page_keeps_its_own_status():
+    """失败即数据：error 结果只补 needs_human，不改状态/错误字段。
+
+    图端只在 success 上转 hitl（graph.execute），所以错误路径上的 flag 是诊断信息：
+    降级链照常继续——绝不把一次失败的点击伪装成“需要人工”的成功。
+    """
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page.fail_click = True
+    page.fail_locator_evaluate = True
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_click", {"ref": "e2"})
+    assert result.status == "error"
+    assert result.error_type == "timeout"
+    assert result.data["needs_human"] is True
+    assert result.data["attempts"] == 3  # 动作自己的 data 仍在
+
+
+@pytest.mark.asyncio
+async def test_click_navigation_out_of_policy_wins_over_intervention():
+    """落点在策略外时返回拦截结果（不是 HITL 载荷）：安全门先于人工桥。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page.click_url = "file:///etc/passwd"
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_click", {"ref": "e2"})
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "needs_human" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_browser_open_navigation_failure_is_not_sampled():
+    """导航失败时页面停在浏览器错误页：不采样、不检测（错误页上没有“需要人工”的信号）。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page.fail_goto = True
+    browser = FakeBrowser(page)
+    result = await make_executor(browser).call("browser_open", {"url": "https://example.com/down"})
+    assert result.error_type == "navigation_failed"
+    assert "needs_human" not in result.data
+    assert ("content",) not in page.calls
+
+
+@pytest.mark.asyncio
+async def test_observation_tools_do_not_run_detection():
+    """只有 open/click/type 做检测：snapshot/scroll 不采样（content() 是整页序列化，不白花）。"""
+    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.calls.clear()
+    await ex.call("browser_snapshot", {})
+    await ex.call("browser_scroll", {"direction": "down"})
+    assert not [call for call in page.calls if call[0] in ("content", "count")]
+
+
+@pytest.mark.asyncio
+async def test_html_sample_is_truncated_and_lowercased_before_matching():
+    """采样的**本侧**边界（:func:`_sample_html`）：先截到 20KB 再小写。
+
+    为什么单独测这个私有缝：``detect_intervention`` 自己也会截断，所以端到端测试
+    （:func:`test_html_sample_is_bounded_to_20kb`）分不出 executor 有没有截——
+    而这里确实需要它：把可能上 MB 的整页 HTML ``lower()`` 是纯浪费（复制全串）。
+    """
+    from browsepilot.app.executor import _sample_html
+
+    page = FakePage(html="A" * (MAX_HTML_SAMPLE_CHARS * 2))
+    sample = await _sample_html(page)
+    assert len(sample) == MAX_HTML_SAMPLE_CHARS
+    assert sample == sample.lower()
+    assert ("content",) in page.calls
+
+
+@pytest.mark.asyncio
+async def test_html_sample_is_bounded_to_20kb():
+    """采样有界（教训 §4）：标记落在第 20KB 之后就不算命中，超大页面不会拖慢动作。"""
+    page = FakePage(html="x" * MAX_HTML_SAMPLE_CHARS + "<p>验证码</p>")
+    result = await make_executor(FakeBrowser(page)).call(
+        "browser_open", {"url": "https://example.com/"}
+    )
+    assert result.status == "success"
+    assert "needs_human" not in result.data

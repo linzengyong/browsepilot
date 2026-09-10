@@ -19,6 +19,15 @@ Tier3（T4 接线）要点：
   异常）不是“跳到了违规地址”；导航失败时读到的是浏览器错误页（``chrome-error://``），
   复查会把真实的 ``navigation_failed`` 伪装成策略拒绝。**残余**：重定向后导航失败（最终 URL
   未知）不在复查范围。
+- **D5/D6 HITL 桥**：登录墙/人机验证/确认弹窗必须由人处理——``browser_open``（导航成功后）、
+  ``browser_click``、``browser_type`` 之后采样页面（``page.content()`` 前 20KB + 可见密码框探测，
+  都是 best-effort），交给 ``browser.detect.detect_intervention``；命中就把 ``needs_human=True`` /
+  ``human_prompt`` / ``intervention`` 并进结果 ``data``，P2 的 HITL 机制自动接管
+  （``graph.execute`` 见 ``data["needs_human"]`` 即转 hitl 节点 interrupt）——**图不需要改**。
+  检测绝不改变动作本身的结果：``status``/``content``/``error_type`` 原样保留，检测失败
+  （页面已关、content 读不出）当作“没发现”。成本是每个交互动作一次整页序列化（采样随后被
+  截断到 20KB），这是 D5 的固有代价；也正因为有成本，观察类工具（snapshot/scroll/execute_js）
+  不跑检测。
 - **当前页跟踪**：executor 是 app 级共享对象，browser 工具共用**一个** current page
   （``browser_open`` 首次向池索取，之后复用；snapshot/click/type/scroll 都作用在它身上）。
   使用前查 ``is_closed()``（池到上限会回收最老的 busy page，``close()`` 会关掉全部 page）：
@@ -50,7 +59,7 @@ from loguru import logger
 from playwright.async_api import Page
 
 from browsepilot.agent.tools import ToolResult, ToolSpec
-from browsepilot.app.browser import actions
+from browsepilot.app.browser import actions, detect
 from browsepilot.app.browser.browser_pool import BrowserPool, page_snapshot_refs
 from browsepilot.app.browser.policy import NavigationPolicy
 from browsepilot.app.config import Settings
@@ -278,14 +287,16 @@ class AppToolExecutor:
             return await self._browser_snapshot(page)
         if name == "browser_click":
             result = _to_tool_result(await actions.click(page, _arg(arguments, "ref", "target")))
+            result = await self._with_intervention(page, result)  # D5/D6：登录墙/验证码 → HITL
             # 点击可能跟着链接/弹窗跳走（I2）：无论成败都复查当前 URL
             return await self._revalidate_after_action(page, "browser_click", result)
         if name == "browser_type":
             # text 故意的 Any：非 str 由 actions 结构化拒绝（invalid_text），不在这里强转
             text: Any = arguments.get("text")
-            return _to_tool_result(
+            result = _to_tool_result(
                 await actions.type_text(page, _arg(arguments, "ref", "target"), text)
             )
+            return await self._with_intervention(page, result)  # D5/D6
         if name == "browser_scroll":
             direction = _arg(arguments, "direction")
             return _to_tool_result(
@@ -298,7 +309,13 @@ class AppToolExecutor:
         return _browser_error("unknown_tool", f"unknown browser tool: {name}")
 
     async def _browser_open(self, arguments: dict[str, Any]) -> ToolResult:
-        """策略门 → navigate（D4：把关必须在动作之前，拒绝路径不建页不导航）→ 复查落点（I2）。"""
+        """策略门 → navigate（D4：把关必须在动作之前，拒绝路径不建页不导航）→ 检测登录/验证码
+        （D5/D6）→ 复查落点（I2）。
+
+        检测放在复查之前：动作就是动作，先如实记下“页面上要人工”再判落点合不合规；落点违规时
+        复查会整体覆盖结果（安全门优先，见 :meth:`_revalidate_after_action`）。导航失败路径
+        直接返回：页面停在浏览器错误页（``chrome-error://``），采样没有意义。
+        """
         url = _arg(arguments, "url")
         allowed, reason = self._policy.validate(url)
         if not allowed:
@@ -315,6 +332,7 @@ class AppToolExecutor:
             # 失败即数据：导航失败时页面停在浏览器错误页（chrome-error://…），复查会把
             # 真实的 navigation_failed 伪装成策略拒绝，所以失败路径原样返回
             return result
+        result = await self._with_intervention(page, result)  # D5/D6：登录墙/验证码 → HITL
         return await self._revalidate_after_action(page, "browser_open", result)
 
     async def _browser_snapshot(self, page: Page) -> ToolResult:
@@ -392,6 +410,31 @@ class AppToolExecutor:
                     "truncated": truncated,
                 },
             ),
+        )
+
+    # ── D5/D6：登录/验证码检测（动作后 best-effort，命中即上 HITL 桥） ──────────────
+
+    async def _with_intervention(self, page: Page, result: ToolResult) -> ToolResult:
+        """动作后检测登录/验证码/弹窗（D5/D6）：命中就把 HITL 载荷并进 ``data``。
+
+        只增三个键（``needs_human`` / ``human_prompt`` / ``intervention``），
+        ``status`` / ``content`` / ``error_type`` 原样保留——动作本身的结果才是数据；
+        其中 ``needs_human`` 在**成功**结果上是“转 hitl 节点暂停”的开关（graph.execute），
+        在错误结果上只是诊断信息（错误路径继续走降级链，绝不把失败伪装成“需要人工”的成功）。
+        检测失败（页面已关 / content 读不出）时原样返回：检测是 best-effort，绝不破坏动作。
+        """
+        intervention = await _page_intervention(page)
+        if intervention is None:
+            return result
+        return result.model_copy(
+            update={
+                "data": {
+                    **result.data,
+                    "needs_human": True,
+                    "human_prompt": intervention.human_prompt,
+                    "intervention": intervention.kind,
+                }
+            }
         )
 
     # ── 当前页生命周期（I2 隔离 / I3 恢复与释放） ─────────────────────────
@@ -557,3 +600,47 @@ def _page_closed(page: Page) -> bool:
         return bool(page.is_closed())
     except Exception:
         return False
+
+
+# ── D5/D6：页面采样（best-effort，绝不抛） ────────────────────────────────────
+
+
+async def _sample_html(page: Page) -> str:
+    """页面 HTML 采样：前 ``detect.MAX_HTML_SAMPLE_CHARS`` 字符、小写；读不出当空串。
+
+    ``Page.content()`` 是整页序列化（协议没有“只取前 20KB”），截断发生在取回之后：
+    这是 D5 的固有代价（每个交互动作一次），换来的是确定性字符串判定与零额外往返。
+    """
+    try:
+        html = await page.content()
+    except Exception as exc:  # 页面已关 / 驱动异常：检测降级，不影响动作结果
+        logger.debug("detector: page.content() failed: {}", _describe(exc))
+        return ""
+    if not isinstance(html, str):
+        return ""
+    limit = detect.MAX_HTML_SAMPLE_CHARS
+    return html[:limit].lower()
+
+
+async def _has_password_field(page: Page) -> bool:
+    """页面上是否有**可见**的密码输入框（探测失败当 False）。
+
+    只认 ``:visible``：真实页面里 DOM 中藏着登录弹窗（``display:none`` 的登录表单）很常见，
+    把“DOM 里存在”当成“页面上要登录”会直接误报，而误报要花掉唯一的人工暂停机会。
+    """
+    try:
+        return await page.locator("input[type=password]:visible").count() > 0
+    except Exception as exc:
+        logger.debug("detector: password probe failed: {}", _describe(exc))
+        return False
+
+
+async def _page_intervention(page: Page) -> detect.Intervention | None:
+    """动作后的页面 → 登录/验证码/弹窗判定（D6）；best-effort，异常一律当“未发现”。"""
+    try:
+        return detect.detect_intervention(
+            _page_url(page), await _sample_html(page), await _has_password_field(page)
+        )
+    except Exception as exc:  # 纯函数不该抛；这是“检测绝不破坏动作”的最后一道防线
+        logger.debug("detector: detect_intervention failed: {}", _describe(exc))
+        return None
