@@ -7,6 +7,8 @@
 - 属性排在 ref 之前：``- generic [active] [ref=e1]:``；
 - 可访问名里的引号被转义：``- button "Say \\"hi\\"" [ref=e3]: Go``；
 - ref 编号不保证连续（可能只有 e1/e2/e3/e7），故一律以标记为准，不推算序号；
+- ref 标记只出现在**条目头**（第一个 ``:`` 之前）：``:`` 之后是正文/文本值，
+  正文里出现的 ``[ref=...]`` 是纯文本，不能当条目（否则产出幽灵 ref）；
 - 该 ref 可用 Playwright 原生选择器 ``aria-ref=eN`` 定位（动作层 T2 的兜底链第一跳）。
 
 本模块只做字符串处理：``snapshot_to_refs`` 在条目边界截断（绝不切进某个 ref 的块内），
@@ -62,8 +64,15 @@ def _strip_quoted(text: str) -> str:
 
 
 def _ref_label(line: str) -> str | None:
-    """返回该行的 ref token（"e2" / "3"），没有 ref 时返回 None。"""
-    match = _INLINE_REF_RE.search(_strip_quoted(line))
+    """返回该行的 ref token（"e2" / "3"），没有 ref 时返回 None。
+
+    inline 形态只搜条目头（第一个 ``:`` 之前）：Playwright ai 模式总是把 ``[ref=eN]`` 放在
+    头部，``:`` 之后是正文/文本值。正文里的 ``[ref=...]``（如 ``- text: use [ref=e12] to click``）
+    只是文本：当成条目会占掉一个 ``max_refs`` 名额，且 ``PageSnapshot.selector`` 会传出
+    ``aria-ref=e12`` → 动作层点错元素。
+    """
+    header = _strip_quoted(line).split(":", 1)[0]
+    match = _INLINE_REF_RE.search(header)
     if match:
         return match.group("label")
     match = _BLOCK_REF_RE.match(line)

@@ -8,10 +8,12 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import pytest
 
+from browsepilot.app.browser import browser_pool as browser_pool_module
 from browsepilot.app.browser.browser_pool import BrowserPool, page_snapshot_refs
 from browsepilot.app.browser.snapshot import PageSnapshot, parse_snapshot_refs, snapshot_to_refs
 
@@ -110,6 +112,33 @@ def test_snapshot_to_refs_ignores_ref_text_inside_quoted_name():
     refs = parse_snapshot_refs(tree)
     assert [r.label for r in refs] == ["e2"]
     assert snapshot_to_refs(tree, max_refs=1).count("[ref=e2]") == 1
+
+
+def test_snapshot_ref_like_text_in_unquoted_value_is_not_a_phantom_ref():
+    # reviewer 探针复现：'- text: use [ref=e12] to click' 里的 [ref=...] 是正文，不是条目头。
+    # 幽灵条目会占掉 max_refs 名额，且 PageSnapshot.selector 会传出 aria-ref=e12 → 点错元素。
+    tree = (
+        "- generic [ref=e1]:\n"
+        "  - paragraph [ref=e2]:\n"
+        "    - text: use [ref=e12] to click\n"
+    )
+
+    refs = parse_snapshot_refs(tree)
+
+    assert [r.label for r in refs] == ["e1", "e2"]  # 没有幽灵 e12 条目
+    assert refs[1].selector == "aria-ref=e2"
+    # 幽灵条目还会偷走一个 max_refs 名额：max_refs=2 时 e12 之后的行不该出现，
+    # 而作为 e2 的细节子行必须保留。
+    out = snapshot_to_refs(tree, max_refs=2)
+    assert "use [ref=e12] to click" in out
+    assert out.endswith("use [ref=e12] to click")
+
+
+def test_snapshot_ref_like_text_only_line_yields_no_refs():
+    # 只有正文行（无真实条目的快照）不得凭空造出 ref。
+    tree = "- text: use [ref=e12] to click\n"
+    assert parse_snapshot_refs(tree) == []
+    assert snapshot_to_refs(tree, max_refs=30) == ""
 
 
 # ── PageSnapshot / parse_snapshot_refs（给动作层的 locator 解析基础） ──────────
@@ -233,6 +262,48 @@ async def test_pool_evicts_oldest_page_at_capacity():
     await pool.close()
 
 
+class _ConcurrencyProbeFactory:
+    """记录“新建时池中仍存活（已创建且未 close）的 page 数”高水位。
+
+    没有串行化时，5 个并发 ``new_page()`` 会全部悬在 ``await _create_page()`` 上
+    （检查与 append 之间隔着 await）→ 高水位 = 5（reviewer 探针实测 pages_created=5, busy=5）。
+    """
+
+    def __init__(self) -> None:
+        self.created: list[_FakePage] = []
+        self.live_high_water = 0
+
+    @property
+    def live(self) -> int:
+        return sum(1 for page in self.created if not page.closed)
+
+    async def __call__(self) -> Any:
+        self.live_high_water = max(self.live_high_water, self.live + 1)
+        page = _FakePage(len(self.created) + 1)
+        self.created.append(page)
+        await asyncio.sleep(0)  # 让出控制权：把“检查 → 创建 → append”之间的窗口放大
+        return page
+
+
+async def test_pool_concurrent_new_page_respects_max_pages():
+    factory = _ConcurrencyProbeFactory()
+    pool = BrowserPool(max_pages=2, page_factory=factory)
+    await pool.start()
+
+    pages = await asyncio.gather(*(pool.new_page() for _ in range(5)))
+
+    # 池中同时存活的 page 至多 max_pages 个（无串行化实现：live_high_water == 5）
+    assert factory.live_high_water <= pool.max_pages, f"live pages: {factory.live_high_water}"
+    assert all(page in factory.created for page in pages)  # 每个请求拿到池里真实发出的 page
+    assert factory.live <= pool.max_pages
+    # 5 个请求都被满足，但多出的只能靠“回收最老”腾位：2 个存活 + 3 个已回收关闭
+    assert (pool.pages_created, pool.pages_reused, pool.pages_evicted) == (5, 0, 3)
+
+    await pool.close()
+    assert all(page.closed for page in factory.created)  # 无孤儿：建过的每个 page 最终都关了
+    assert factory.live == 0
+
+
 async def test_pool_release_unknown_page_is_noop():
     pool, factory = _make_pool(max_pages=2)
     await pool.start()
@@ -278,6 +349,97 @@ async def test_pool_start_is_idempotent_and_can_restart_after_close():
     assert p2 is not p1
     assert len(factory.created) == 2
     await pool.close()
+
+
+# ── start() 失败路径：playwright driver 不得泄漏（fake 模块级 async_playwright） ──
+
+
+class _FakeBrowser:
+    def __init__(self) -> None:
+        self.closed = False
+        self.pages: list[Any] = []
+
+    async def new_page(self) -> Any:
+        page = _FakePage(len(self.pages) + 1)
+        self.pages.append(page)
+        return page
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class _FakeChromium:
+    def __init__(self, *, fail_launch: bool) -> None:
+        self._fail_launch = fail_launch
+        self.launch_calls = 0
+
+    async def launch(self, **kwargs: Any) -> _FakeBrowser:
+        self.launch_calls += 1
+        if self._fail_launch:
+            raise RuntimeError("fake chromium launch failed")
+        return _FakeBrowser()
+
+
+class _FakePlaywrightHandle:
+    """替身 playwright driver：``chromium.launch`` 可编程失败，``stop()`` 留痕。"""
+
+    def __init__(self, *, fail_launch: bool) -> None:
+        self.chromium = _FakeChromium(fail_launch=fail_launch)
+        self.stopped = False
+        self.stop_calls = 0
+
+    async def stop(self) -> None:
+        self.stopped = True
+        self.stop_calls += 1
+
+
+class _FakePlaywrightLauncher:
+    """替代模块级 ``async_playwright``：``()`` 返回自身，``start()`` 发一个新 driver。
+
+    前 ``fail_launches`` 个 driver 的 ``chromium.launch`` 抛异常（模拟启动失败）。
+    """
+
+    def __init__(self, *, fail_launches: int = 0) -> None:
+        self.handles: list[_FakePlaywrightHandle] = []
+        self._fail_launches = fail_launches
+
+    def __call__(self) -> _FakePlaywrightLauncher:
+        return self
+
+    async def start(self) -> _FakePlaywrightHandle:
+        handle = _FakePlaywrightHandle(fail_launch=self._fail_launches > 0)
+        self._fail_launches = max(0, self._fail_launches - 1)
+        self.handles.append(handle)
+        return handle
+
+
+async def test_pool_start_failure_stops_driver_and_retry_succeeds(monkeypatch):
+    launcher = _FakePlaywrightLauncher(fail_launches=1)
+    monkeypatch.setattr(browser_pool_module, "async_playwright", launcher)
+    pool = BrowserPool(max_pages=1)
+
+    with pytest.raises(RuntimeError, match="fake chromium launch failed"):
+        await pool.start()
+
+    # 失败路径不得留下 driver 引用（否则重试会再起一个，第一个永久泄漏）
+    assert pool._playwright is None
+    assert pool._browser is None
+    assert pool._started is False
+    assert launcher.handles[0].stopped is True  # 已启动的 driver 必须被 stop
+    assert launcher.handles[0].stop_calls == 1
+
+    await pool.start()  # 重试：新 driver 正常启动，无残留
+    page = await pool.new_page()
+
+    assert pool._started is True
+    assert pool._playwright is launcher.handles[1]
+    assert launcher.handles[1].stopped is False  # 在用 driver 不受影响
+    assert page.closed is False
+
+    await pool.close()
+    assert launcher.handles[1].stopped is True
+    assert page.closed is True  # 无残留 page
+    assert launcher.handles[0].stop_calls == 1  # 失败路径只 stop 一次
 
 
 # ── page_snapshot_refs（页面侧 helper：ai 模式 + 边界截断） ────────────────────

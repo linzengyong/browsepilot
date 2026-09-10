@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -52,6 +53,9 @@ class BrowserPool:
         self._idle: list[Any] = []
         self._busy: list[Any] = []
         self._started = False
+        # 串行化“检查 → 创建”：new_page 在检查与 append 之间要 await 建页，
+        # 无锁时并发调用会全部看到“未到上限”而各建一个 page，突破 max_pages。
+        self._new_page_lock = asyncio.Lock()
         # 观测计数（复用 / 回收行为可直接断言）
         self.pages_created = 0
         self.pages_reused = 0
@@ -60,14 +64,22 @@ class BrowserPool:
     # ── 生命周期 ──────────────────────────────────────────────────────────────
 
     async def start(self) -> None:
-        """启动 playwright + 浏览器；重复调用是空操作。"""
+        """启动 playwright + 浏览器；重复调用是空操作。
+
+        启动失败时不留 driver（已启动的 playwright 会被 stop），故失败后可直接重试。
+        """
         if self._started:
             return
         if self._page_factory is None:
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=self.headless, channel=self.channel
-            )
+            try:
+                self._browser = await self._playwright.chromium.launch(
+                    headless=self.headless, channel=self.channel
+                )
+            except Exception:
+                # launch 失败时 driver 已经起来了：不 stop 就永泄漏（重试还会再起一个）。
+                await self._discard_playwright()
+                raise
             logger.info(
                 "BrowserPool started (headless={}, channel={}, max_pages={})",
                 self.headless,
@@ -110,28 +122,35 @@ class BrowserPool:
     # ── page 复用 / 回收 ──────────────────────────────────────────────────────
 
     async def new_page(self) -> Page:
-        """取一个可用 page：先复用空闲 page，再新建，到上限则回收最老的 page。"""
+        """取一个可用 page：先复用空闲 page，再新建，到上限则回收最老的 page。
+
+        “检查 + 创建”整体在 ``_new_page_lock`` 内串行：并发调用不会同时看到“未到上限”
+        而各自 await 出一个新 page（那会突破 ``max_pages``）。
+        """
         if not self._started:
             raise RuntimeError("BrowserPool.new_page() called before start()")
-        if self._idle:
-            page = self._idle.pop(0)
-            self._busy.append(page)
-            self.pages_reused += 1
-            logger.debug("BrowserPool reused idle page (reused={})", self.pages_reused)
-            return page
-        if len(self._busy) < self.max_pages:
+        async with self._new_page_lock:
+            if not self._started:  # 等锁期间池被 close()
+                raise RuntimeError("BrowserPool.new_page() called before start()")
+            if self._idle:
+                page = self._idle.pop(0)
+                self._busy.append(page)
+                self.pages_reused += 1
+                logger.debug("BrowserPool reused idle page (reused={})", self.pages_reused)
+                return page
+            if len(self._busy) < self.max_pages:
+                page = await self._create_page()
+                self._busy.append(page)
+                return page
+            evicted = self._busy.pop(0)
+            logger.warning(
+                "BrowserPool at capacity ({} pages); recycling the oldest page", self.max_pages
+            )
+            await self._dispose(evicted)
+            self.pages_evicted += 1
             page = await self._create_page()
             self._busy.append(page)
             return page
-        evicted = self._busy.pop(0)
-        logger.warning(
-            "BrowserPool at capacity ({} pages); recycling the oldest page", self.max_pages
-        )
-        await self._dispose(evicted)
-        self.pages_evicted += 1
-        page = await self._create_page()
-        self._busy.append(page)
-        return page
 
     async def release(self, page: Page) -> None:
         """把 page 归还池中复用（未知 page 静默忽略；池已关则直接销毁）。"""
@@ -146,6 +165,17 @@ class BrowserPool:
             return
 
     # ── 内部 ──────────────────────────────────────────────────────────────────
+
+    async def _discard_playwright(self) -> None:
+        """启动失败路径：停止并丢弃 driver（不碰 idle/busy 与 ``_started``）。"""
+        self._browser = None
+        playwright, self._playwright = self._playwright, None
+        if playwright is None:
+            return
+        try:
+            await playwright.stop()
+        except Exception as exc:  # driver 可能已自行退出
+            logger.warning("Error stopping playwright after failed start: {}", exc)
 
     async def _create_page(self) -> Page:
         if self._page_factory is not None:
