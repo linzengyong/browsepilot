@@ -1,4 +1,4 @@
-"""URL 安全策略（D4/D7）：纯函数 + 纯标准库（``urllib.parse`` + ``ipaddress``）。
+r"""URL 安全策略（D4/D7）：纯函数 + 纯标准库（``urllib.parse`` + ``ipaddress``）。
 
 层次红线
 --------
@@ -20,6 +20,11 @@
   子域后缀匹配（``example.com`` 放行 ``www.example.com``，但**不**放行 ``notexample.com``）。
   该模式的信任边界就是"运维显式写下的域名"：显式写 ``localhost``/``127.0.0.1`` 即视为有意
   放行本机（本机调试逃逸口），私有 IP 拦截只在 ``allow_https`` 模式生效。
+* 主机按 **WHATWG/Chromium 特殊 scheme 语义**判定：``\`` 与 ``/`` 等价（两者都是 authority
+  终止符）。``urlsplit`` 不做这个归一化——按原文解析会产生**解析器差分**：
+  ``https://127.0.0.1\@example.com/`` 被 urlsplit 读成 host ``example.com``（allowlist 放行），
+  Chromium 却访问 ``127.0.0.1``（SSRF）。故判定前先把 ``\`` 归一化成 ``/``；
+  **交给导航的原始 URL 不动**（判定与 Chromium 的实际解析因此一致）。
 
 设计决定（含红线边界）
 ----------------------
@@ -27,6 +32,11 @@
   构造时**不抛错**：配置缺失时策略必须更严而不是更松，也不能让服务起不来。
 * 白名单条目只接受裸主机名，构造时归一化（大小写/首尾空白/首尾点号）；**不支持**
   ``*.example.com`` 之类通配符——写错即永不匹配（fail-closed，不会误放行）。
+* **无点号的裸标签条目只做精确匹配**（``localhost`` 不放行 ``api.localhost``）：对裸标签做
+  子域后缀匹配等于授权整个 TLD——``allowed_domains=["com"]`` 会放行 ``evil.com``，白名单形同虚设。
+* 拒因里所有来自 URL 的回显（主机/scheme/异常消息）截断到 ``_MAX_ECHO_CHARS`` 字符 + 省略号：
+  拒因会进入 ``ToolResult``/agent 状态，必须与其他状态数据一样有界（同 actions.py 的
+  ``_MAX_ERROR_CHARS`` 约定）；只截断 detail 的长回显，``code`` 前缀与结构不变。
 * ``mode`` 未知/拼写错误 ⇒ 构造时 ``ValueError``，绝不由"未知模式"静默降级为更宽松的策略。
 * 放行时 reason 为空串；拒绝时 reason 形如 ``code: detail``（``code`` = 下面的 ``REASON_*``），
   可直接用作 T4 面向用户的错误文案。原因串是**稳定契约**，改动需同步 T4。
@@ -36,6 +46,8 @@
 * **不做 DNS 解析**（零网络）：只按字面主机名判定。指向内网的公有域名
   （如 ``db-01.corp.example.com``）在 ``allow_https`` 模式下会放行；要挡住请用 ``allowlist`` 模式。
 * 不做端口范围限制（``https://example.com:8443`` 放行），只校验端口可解析。
+* 不做 IDNA/全角点归一化（如 ``example。com``）：这类主机按字面判定 ⇒ 只会多拒（fail-closed），
+  不会误放；本次只对齐 ``\`` ↔ ``/`` 这条会造成误放（SSRF）的差分。
 * 校验当次调用的 URL，不跟踪重定向/子资源请求的后续跳转（T4 每次 navigate 前把关）。
 """
 
@@ -67,8 +79,27 @@ _ALLOWED_SCHEMES = ("http", "https")
 _LOCAL_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
 _CONTROL_CHARS = "\t\r\n\v\f"
 _HEX_DIGITS = frozenset("0123456789abcdef")
+_MAX_ECHO_CHARS = 200
+"""拒因里回显的 URL 片段（主机/scheme/异常消息）上限（CLAUDE.md 教训 §4：进状态的数据
+一律截断；同 actions.py 的 ``_MAX_ERROR_CHARS``）。"""
 
 _IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
+
+
+def _echo(value: str) -> str:
+    """回显用片段：超长截断 + 省略号（拒因长度必须有界，且保持 ``code: detail`` 形态）。"""
+    return value if len(value) <= _MAX_ECHO_CHARS else value[:_MAX_ECHO_CHARS] + "…"
+
+
+def _whatwg_normalized_url(url: str) -> str:
+    r"""按 WHATWG/Chromium 特殊 scheme 语义把 ``\`` 归一化成 ``/``，只用于**判定**主机。
+
+    ``urlsplit`` 不把 ``\`` 当 authority 终止符，Chromium 会（http/https 下两者等价）：
+    ``https://127.0.0.1\@example.com/`` 被 urlsplit 读成 host ``example.com``（allowlist 放行），
+    Chromium 却访问 ``127.0.0.1`` ⇒ SSRF。先归一化再解析 ⇒ 判定与 Chromium 一致。
+    **不改动**交给导航的原始 URL（T4 仍用原文 navigate）。
+    """
+    return url.replace("\\", "/")
 
 
 def _parse_literal_ip(host: str) -> _IPAddress | None:
@@ -111,14 +142,14 @@ def _local_reason(host: str) -> str | None:
     addr = _parse_literal_ip(host)
     if addr is not None:
         if _is_local_ip(addr):
-            return f"{host} is a private/loopback/link-local address"
+            return f"{_echo(host)} is a private/loopback/link-local address"
         return None  # 公网字面 IP：不适用主机名启发式
     if host == "localhost" or host.endswith(_LOCAL_SUFFIXES):
-        return f"{host} is a local-only hostname"
+        return f"{_echo(host)} is a local-only hostname"
     if "." not in host:
-        return f"{host} is a single-label host (internal naming)"
+        return f"{_echo(host)} is a single-label host (internal naming)"
     if _looks_like_ipv4_literal(host):
-        return f"{host} is an obfuscated IPv4 literal"
+        return f"{_echo(host)} is an obfuscated IPv4 literal"
     return None
 
 
@@ -151,13 +182,20 @@ def _extract_host(parsed) -> tuple[str, str]:
             return "", f"{REASON_INVALID_URL}: percent-encoded host is not allowed"
         host = base
     if not host or host.startswith(".") or ".." in host:
-        return "", f"{REASON_INVALID_URL}: malformed host {host!r}"
+        return "", f"{REASON_INVALID_URL}: malformed host {_echo(host)!r}"
     return host, ""
 
 
 def _host_allowed(host: str, allowed_domains: tuple[str, ...]) -> bool:
-    """精确匹配或子域后缀匹配（不匹配 lookalike：example.com 不含 notexample.com）。"""
-    return any(host == domain or host.endswith("." + domain) for domain in allowed_domains)
+    """精确匹配或子域后缀匹配（不匹配 lookalike：example.com 不含 notexample.com）。
+
+    无点号的裸标签条目（``localhost``/``::1``）只做**精确**匹配：对裸标签做后缀匹配等于授权
+    整个 TLD——``allowed_domains=["com"]`` 会放行 ``evil.com``，白名单形同虚设。
+    """
+    return any(
+        host == domain or ("." in domain and host.endswith("." + domain))
+        for domain in allowed_domains
+    )
 
 
 class NavigationPolicy:
@@ -179,23 +217,24 @@ class NavigationPolicy:
         if any(ch in _CONTROL_CHARS or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
             return False, f"{REASON_INVALID_URL}: URL must not contain control characters"
         try:
-            parsed = urlsplit(url)
+            parsed = urlsplit(_whatwg_normalized_url(url))
             _port = parsed.port  # 惰性校验：非法端口在此抛 ValueError，必须显式触发
             host, error = _extract_host(parsed)
         except ValueError as exc:
-            return False, f"{REASON_INVALID_URL}: {exc}"
+            # 异常消息里可能回显 URL 原文（端口/IPv6 括号）⇒ 同样有界
+            return False, f"{REASON_INVALID_URL}: {_echo(str(exc))}"
         scheme = parsed.scheme.lower()
         if scheme not in _ALLOWED_SCHEMES:
             if not scheme:
                 return False, f"{REASON_INVALID_URL}: URL must start with http:// or https://"
-            return False, f"{REASON_PROTOCOL_BLOCKED}: {scheme}: is not allowed"
+            return False, f"{REASON_PROTOCOL_BLOCKED}: {_echo(scheme)}: is not allowed"
         if error:
             return False, error
         if self.mode == "allowlist":
             if not self.allowed_domains:
                 return False, f"{REASON_ALLOWLIST_EMPTY}: no allowed_domains configured, navigation denied"
             if not _host_allowed(host, self.allowed_domains):
-                return False, f"{REASON_DOMAIN_NOT_ALLOWED}: {host} is not in the allowlist"
+                return False, f"{REASON_DOMAIN_NOT_ALLOWED}: {_echo(host)} is not in the allowlist"
             return True, ""
         reason = _local_reason(host)
         if reason:
@@ -210,7 +249,7 @@ class NavigationPolicy:
         if not isinstance(url, str) or not url:
             return False
         try:
-            parsed = urlsplit(url)
+            parsed = urlsplit(_whatwg_normalized_url(url))
             host, error = _extract_host(parsed)
         except ValueError:
             return False

@@ -1,4 +1,4 @@
-"""Tier3 URL 安全策略单测（D4/D7）：NavigationPolicy 纯函数——无浏览器、无网络、无 DNS。
+r"""Tier3 URL 安全策略单测（D4/D7）：NavigationPolicy 纯函数——无浏览器、无网络、无 DNS。
 
 策略契约（设计决定记录在 ``browsepilot/app/browser/policy.py`` 模块 docstring）：
 
@@ -11,6 +11,11 @@
    非法端口、百分号编码主机）⇒ 拒并给出非空原因。
 4. 不做 DNS 解析：主机名"在 DNS 上是否指向内网"不在本层职责内（限制已文档化，
    见 ``test_no_dns_resolution_only_literal_host_rules_apply``）。
+5. 主机判定按 WHATWG/Chromium 特殊 scheme 语义：``\`` 与 ``/`` 等价（authority 终止符），
+   故 ``https://127.0.0.1\@example.com/`` 的真实主机是 ``127.0.0.1`` 而不是 ``example.com``——
+   ``urlsplit`` 不这么做，按原文解析会放过 SSRF 载荷（见下文反斜杠用例）。
+6. 白名单裸标签条目（无点号，如 ``localhost``）只做**精确**匹配；拒因里回显的主机/scheme
+   有长度上限（进状态的数据有界）。
 
 原因串是 T4 面向用户的错误文案来源，故统一为 ``code: detail`` 形态并逐条 pin 住前缀。
 """
@@ -159,6 +164,81 @@ def test_should_block_private_predicate_is_public_api():
     assert policy.should_block_private("") is False
 
 
+# ── WHATWG 特殊 scheme：``\`` 就是 ``/``（authority 终止符 → 解析器差分 / SSRF）──
+#
+# ``urlsplit`` 不把 '\' 当 authority 终止符，Chromium/WHATWG 会（已用 node 的 WHATWG
+# ``URL`` 对齐复核）。按原文解析会直接放行内网目标：
+#   * ``https://127.0.0.1\@example.com/``：原文 host=example.com（allowlist 放行），
+#     而 Chromium 访问 ``https://127.0.0.1/@example.com/``；云元数据端点同理；
+#   * ``https://169.254.169.254\latest/…``：原文 host 是带反斜杠的怪串 ⇒ 放行。
+# 判定主机前必须按 WHATWG 语义把 '\' 归一化成 '/'——交给导航的**原始 URL 不动**。
+
+BACKSLASH_PRIVATE_URLS = [
+    "https://127.0.0.1\\foo/",
+    "https://169.254.169.254\\latest/meta-data/",  # 云元数据端点
+    "https://192.168.1.1\\admin/",
+    "https://localhost\\admin/",
+    "https://[::1]\\admin/",
+    "https://10.0.0.5\\@example.com/",
+    "https://127.0.0.1:80\\@example.com/",
+    "https://127.0.0.1\\foo\\@example.com/",
+]
+
+
+@pytest.mark.parametrize("url", BACKSLASH_PRIVATE_URLS)
+def test_backslash_authority_terminator_cannot_hide_private_hosts(url):
+    policy = NavigationPolicy()
+    ok, reason = policy.validate(url)
+    assert not ok, f"{url} must be blocked: Chromium 的 authority 在反斜杠处终止"
+    assert reason.startswith(REASON_PRIVATE_ADDRESS_BLOCKED), reason
+    # 独立谓词必须同一套判定（上层复用/展示都读它）
+    assert policy.should_block_private(url) is True, url
+
+
+ALLOWLIST_BACKSLASH_BYPASS_URLS = [
+    "https://127.0.0.1\\@example.com/",
+    "https://169.254.169.254\\@example.com/",
+    "https://localhost\\@example.com/",
+    "https://127.0.0.1:80\\@example.com/",
+    "https://10.0.0.5\\x\\@example.com/",
+    "https://[::1]\\@example.com/",
+]
+
+
+def test_backslash_authority_terminator_cannot_bypass_allowlist():
+    r"""原文解析把 ``127.0.0.1\@example.com`` 的 host 读成 example.com ⇒ 白名单放行，
+    而 Chromium 访问 127.0.0.1（allowlist 模式的红线）。"""
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=["example.com"])
+    for url in ALLOWLIST_BACKSLASH_BYPASS_URLS:
+        ok, reason = policy.validate(url)
+        assert not ok, f"{url} must be blocked: 真实主机在第一个反斜杠之前"
+        assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
+
+
+def test_backslash_after_the_real_authority_keeps_the_real_host():
+    r"""反斜杠只终止 authority、不改变真实主机 ⇒ 不误伤：
+    ``https://example.com\path`` 的主机就是 example.com（Chromium 导航到 /path）；
+    ``https://example.com\@127.0.0.1`` 与 ``https://example.com/@127.0.0.1/`` 等价。"""
+    urls = ("https://example.com\\path", "https://example.com\\@127.0.0.1/")
+    policy = NavigationPolicy()
+    for url in urls:
+        ok, reason = policy.validate(url)
+        assert ok, f"{url} should be allowed, got {reason!r}"
+        assert policy.should_block_private(url) is False, url
+    allowlist = NavigationPolicy(mode="allowlist", allowed_domains=["example.com"])
+    for url in urls:
+        ok, reason = allowlist.validate(url)
+        assert ok, f"{url} should be allowed, got {reason!r}"
+
+
+@pytest.mark.parametrize("url", ["https:\\\\127.0.0.1/", "https:/127.0.0.1/", "https:127.0.0.1/"])
+def test_slash_collapsed_private_targets_fail_closed(url):
+    """Chromium 忽略多余斜杠 / 缺 authority 分隔符后照样访问 127.0.0.1；本策略一律拒
+    （归一化后按私有地址拒，其余按 invalid_url 拒：宁可误拒不可误放）。"""
+    ok, reason = NavigationPolicy().validate(url)
+    assert not ok, f"{url} must be rejected, got {reason!r}"
+
+
 # ── allowlist：精确 + 子域后缀 ────────────────────────────────────────────────
 
 
@@ -203,6 +283,28 @@ def test_allowlist_wildcards_are_not_supported_and_fail_closed():
     for url in ("https://www.example.com/", "https://example.com/"):
         ok, reason = policy.validate(url)
         assert not ok, f"{url} must not match a wildcard entry"
+        assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
+
+
+def test_allowlist_bare_label_entries_match_exactly_not_as_tld_wildcards():
+    """裸标签条目（无点号）只做精确匹配——后缀匹配等于授权整个 TLD：
+    ``allowed_domains=["com"]`` 若按 ``host.endswith(".com")`` 匹配会放行 ``evil.com``，
+    白名单与 fail-closed 承诺一起失效。"""
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=["com"])
+    for url in ("https://evil.com/", "https://example.com/", "https://a.b.com/", "https://com.evil/"):
+        ok, reason = policy.validate(url)
+        assert not ok, f"{url} must not be authorized by the bare-label entry 'com'"
+        assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
+    # 精确命中的单标签主机照旧放行（与 localhost 逃逸口同一规则：写哪台主机就只放哪台）
+    assert policy.validate("https://com/") == (True, "")
+
+
+def test_allowlist_bare_label_entry_covers_only_its_exact_host():
+    policy = NavigationPolicy(mode="allowlist", allowed_domains=["localhost"])
+    assert policy.validate("http://localhost:8099/x")[0]  # 逃逸口本身不受影响
+    for url in ("http://api.localhost/", "http://evil.localhost/"):
+        ok, reason = policy.validate(url)
+        assert not ok, f"{url} must not match the bare-label entry by suffix"
         assert reason.startswith(REASON_DOMAIN_NOT_ALLOWED), reason
 
 
@@ -275,6 +377,46 @@ def test_reasons_are_stable_prefixed_codes():
     ok, reason = NavigationPolicy().validate("file:///etc/passwd")
     assert (ok, type(reason)) == (False, str)
     assert reason.partition(":")[2].strip(), reason
+
+
+# ── 状态卫生：拒因里的回显有界（进 agent 状态/ToolResult 的数据一律截断）──────────
+
+
+def test_rejection_reasons_truncate_long_hosts():
+    """主机长度无界 ⇒ 拒因长度无界，而拒因会进入 ToolResult/agent 状态
+    （仓库约定：进状态的数据截断，见 actions.py 的 ``_MAX_ERROR_CHARS``）。"""
+    long_host = "a" * 5000
+    cases = [
+        (NavigationPolicy(), f"http://{long_host}/"),  # 单标签主机
+        (NavigationPolicy(), f"http://{long_host}.local/"),  # 本地名空间
+        (NavigationPolicy(), f"http://{long_host}..evil/"),  # 主机形态非法
+        (NavigationPolicy(mode="allowlist", allowed_domains=["example.com"]), f"http://{long_host}.evil/"),
+    ]
+    for policy, url in cases:
+        ok, reason = policy.validate(url)
+        assert not ok, url
+        assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
+        assert "…" in reason, f"缺少截断标记：{reason[-20:]}"
+        assert long_host not in reason
+
+
+def test_protocol_blocked_reason_truncates_long_schemes():
+    """同类回显（scheme 也逐字来自 URL 原文）⇒ 同样有界。"""
+    ok, reason = NavigationPolicy().validate("a" * 5000 + "://example.com/")
+    assert not ok, reason
+    assert reason.startswith(REASON_PROTOCOL_BLOCKED), reason[:60]
+    assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
+
+
+def test_invalid_url_reasons_truncate_url_derived_exception_text():
+    """``urlsplit`` 的 ValueError 消息会把 URL 原文（非法端口/非法 IPv6 括号）抄进来
+    ⇒ 异常文本也必须有界（否则同样是无界回显）。"""
+    long = "a" * 5000
+    for url in (f"http://example.com:{long}/", f"http://[{long}]/"):
+        ok, reason = NavigationPolicy().validate(url)
+        assert not ok, url
+        assert len(reason) <= 300, f"reason 无界：{len(reason)} 字符"
+        assert long not in reason
 
 
 # ── 构造 / 契约 ───────────────────────────────────────────────────────────────
