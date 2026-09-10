@@ -1,3 +1,5 @@
+import pytest
+
 from browsepilot.agent.router import classify_by_rules
 
 
@@ -74,3 +76,56 @@ def test_browser_task_does_not_steal_read_page_or_weather():
     assert classify_by_rules("打开百度首页").tier == "tier2"
     d = classify_by_rules("京东那边今天天气怎么样")
     assert d.intent == "weather" and d.tier == "tier1"
+
+
+# ── I1 回归：泛化弱动词不得抢走 search/None 的既有匹配 ──────────────────────────
+# 评审探针：下面这些日常提问曾因“选择/提交/输入”这些单字动词被抢成 browser_task，
+# 而 tier3 链（snapshot → open）对它们没有 search 兜底 → all_strategies_failed。
+# 期望值与加 tier3 规则之前一致（git show 9567a90:browsepilot/src/browsepilot/agent/router.py）。
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "为什么选择 Python 而不是 Java",
+        "查一下怎么提交表单",
+    ],
+)
+def test_weak_interaction_words_do_not_steal_search(task):
+    """有 search 关键词的提问仍走 tier1 search（弱动词不抢既有匹配）。"""
+    d = classify_by_rules(task)
+    assert d is not None
+    assert d.intent == "search" and d.tier == "tier1"
+
+
+@pytest.mark.parametrize(
+    "task",
+    [
+        "选择哪个框架比较好",
+        "Python 输入输出教程",
+        "git 提交规范",
+    ],
+)
+def test_weak_interaction_words_alone_stay_out_of_tier3(task):
+    """弱动词没有页面上下文（按钮/表单/站点…）就不算 tier3：规则层不命中，交给模型兜底。
+
+    “选择哪个框架比较好”还钉住一个细节：裸“框”是页面标记，但“框架”不是。
+    """
+    assert classify_by_rules(task) is None
+
+
+def test_weak_interaction_words_with_page_context_are_still_tier3():
+    """共现标记保住真正的交互任务：弱动词 + 页面元素/站点词 = tier3。"""
+    d = classify_by_rules("帮我填写表单并提交")
+    assert d is not None
+    assert d.intent == "browser_task" and d.tier == "tier3"
+    d = classify_by_rules("在页面上输入关键词")
+    assert d is not None
+    assert d.intent == "browser_task" and d.tier == "tier3"
+
+
+def test_strong_site_words_need_no_context():
+    """强触发词（站点/电商/搜索框/浏览器）单独出现即可判 tier3（弱动词才要共现）。"""
+    d = classify_by_rules("用浏览器帮我看看")
+    assert d is not None
+    assert d.intent == "browser_task" and d.tier == "tier3"

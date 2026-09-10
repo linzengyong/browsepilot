@@ -9,18 +9,34 @@ Tier3（T4 接线）要点：
   ``NavigationPolicy.validate``——T2 已实证 ``navigate()`` 自身不设防（能开
   ``file:///etc/passwd``）。拒绝时 ``error_type="navigation_blocked"``，policy 的 reason
   （稳定契约 ``code: detail``）原样进 message/data，降级链与用户文案直接可用。
+- **动作后复查 URL（I2）**：入参把关挡不住“动作把页面带出去”——点击链接/弹窗、``goto`` 跟随
+  重定向、``execute_js`` 里的跳转都可能落在策略外（probe：``location.assign`` / ``location.replace`` /
+  ``requestSubmit`` / ``textContent=`` / ``new Image().src=`` / ``window['fetch']``）。
+  所以 browser_open 导航**成功**后、browser_click 与 browser_execute_js 返回前，一律用
+  ``NavigationPolicy.validate(_page_url(page))`` 复查当前 URL；命中即 ``navigation_blocked``，
+  **并隔离这一页**（丢引用 + 归还池）：后续调用不会继续在违规源上动作，必须先重新
+  ``browser_open``（重新过策略门）。两条不复查的路径各有理由：读不出 URL（页面已关/驱动
+  异常）不是“跳到了违规地址”；导航失败时读到的是浏览器错误页（``chrome-error://``），
+  复查会把真实的 ``navigation_failed`` 伪装成策略拒绝。**残余**：重定向后导航失败（最终 URL
+  未知）不在复查范围。
 - **当前页跟踪**：executor 是 app 级共享对象，browser 工具共用**一个** current page
   （``browser_open`` 首次向池索取，之后复用；snapshot/click/type/scroll 都作用在它身上）。
+  使用前查 ``is_closed()``（池到上限会回收最老的 busy page，``close()`` 会关掉全部 page）：
+  死页立即丢引用，下次 ``browser_open`` 重新取页——否则 current page 指向死页后，每个浏览器
+  调用都永久失败且无法恢复。``aclose()`` 显式把当前页归还池（executor 退役时调用；不调用则
+  该池槽一直占着）——**尚未接到 app lifespan**（P4 议题，不在本次改动范围）。
   并发限制：多会话并行时看到的是同一个页面（会互相串页）；``self._page_lock`` 只保证
   "取页/换页"不交错（并发 open 不会各建一个 page），**不做会话隔离**——会话级隔离要把
-  page 放进会话上下文（P4+ 议题）。demo 阶段接受该限制并在此显式记录。
+  page 放进会话上下文（P4+ 议题）。demo 阶段接受该限制并在此显式记录；``aclose()``/隔离
+  归还的页面同样在池里共享（多会话下别的消费者可能拿到，见 :meth:`aclose` 残余说明）。
 - **池可选**：``browser=None``（Tier3 未接线）时 6 个工具一律返回
   ``error_type="browser_unavailable"``，图不需要特判 Tier3：策略链按既有降级链走到
   all_strategies_failed + 明确告知（诚实原则）。
 - **execute_js 只读**（P3-D1「仅供提取」）：静态黑名单挡明显的写操作
-  （fetch/localStorage/location 赋值/click/submit…），结果序列化后按
+  （fetch/localStorage/location 赋值与调用/click/submit/requestSubmit/DOM 赋值…），结果序列化后按
   ``MAX_JS_RESULT_CHARS`` 截断再进状态（CLAUDE.md 教训 §4）。黑名单是 best-effort，
-  **不是沙箱**（``window['fetch']`` 之类可绕过）；它挡的是"模型顺手写一个副作用表达式"。
+  **不是沙箱**（动态拼写的成员访问如 ``window['loc'+'ation'].assign`` 仍可绕过）；补口是
+  “动作后复查 URL”（见上）：真把页面带出去的动作会被拦在 ``navigation_blocked``。
 """
 
 from __future__ import annotations
@@ -45,6 +61,13 @@ from browsepilot.app.services.weather import CityNotFoundError, WeatherService
 MAX_JS_RESULT_CHARS = 2000
 """``browser_execute_js`` 结果进状态前的上限（教训 §4：原始外部输出绝不整段塞进状态）。"""
 
+_SNAPSHOT_NOTE = "（仅观察，未执行交互）"
+"""browser_snapshot 的观察标注（M-b）：快照是“看见了什么”，不是“做了什么”。
+
+答案节点只读 ``result_data``（agent/graph.py 的 answer），所以标注要进 ``data``；
+``content`` 同步带上，保持两个面一致——免得答案模型把“看到了按钮”说成“点击了按钮”。
+"""
+
 _MAX_ERROR_CHARS = 300
 """单条错误描述写进结果的上限（与 actions/policy 同一约定）。"""
 
@@ -65,14 +88,22 @@ _JS_WRITE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     (
         "网络请求（fetch/XMLHttpRequest/WebSocket/EventSource/sendBeacon）",
         re.compile(
-            r"\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|sendBeacon",
+            r"\bfetch\s*\(|\bXMLHttpRequest\b|\bWebSocket\b|\bEventSource\b|sendBeacon"
+            r"|\bwindow\s*\[\s*['\"]fetch",  # window['fetch']('/api/...')（I2 探针）
             re.IGNORECASE,
         ),
     ),
     ("动态求值（eval / new Function）", re.compile(r"\beval\s*\(|\bnew\s+Function\s*\(", re.I)),
     (
-        "DOM 写入（document.write / innerHTML / insertAdjacentHTML）",
-        re.compile(r"document\s*\.\s*write\b|\.\s*innerHTML\s*=|insertAdjacentHTML", re.I),
+        "DOM 写入（document.write / innerHTML / textContent / src 赋值）",
+        re.compile(
+            r"document\s*\.\s*write\b"
+            r"|\.\s*innerHTML\s*="
+            r"|insertAdjacentHTML"
+            r"|\.\s*(textContent|innerText)\s*=(?!=)"  # document.body.textContent='x'（I2 探针）
+            r"|\.\s*src\s*=(?!=)",  # new Image().src='...' 外传探针（I2 探针）
+            re.I,
+        ),
     ),
     (
         "持久化写入（cookie / storage / indexedDB）",
@@ -84,17 +115,24 @@ _JS_WRITE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         ),
     ),
     (
-        "导航（location 赋值 / history 变更 / window.open）",
+        "导航（location 赋值/调用 / history 变更 / window.open）",
         re.compile(
             r"\blocation\s*(\.\s*(href|assign|replace|reload)\s*)?=(?!=)"
+            # location.assign('...') / location.replace('/next')：I2 探针命中的调用形式。
+            # 刻意不写 "\.\s*(assign|replace)\s*\("：那会连坐字符串的 str.replace(...)，
+            # 而 innerText.replace(...) 正是只读提取的常用写法（见测试）。
+            r"|\blocation\s*\.\s*(assign|replace)\s*\("
+            r"|\blocation\s*\[\s*['\"](assign|replace)['\"]\s*\]\s*\("
             r"|\bhistory\s*\.\s*(pushState|replaceState|go|back|forward)"
             r"|\bwindow\s*\.\s*open\s*\(",
             re.I,
         ),
     ),
     (
-        "表单/点击（submit / click / dispatchEvent）",
-        re.compile(r"\.\s*submit\s*\(|\.\s*click\s*\(|dispatchEvent", re.I),
+        "表单/点击（submit / requestSubmit / click / dispatchEvent）",
+        re.compile(
+            r"\.\s*submit\s*\(|\brequestSubmit\s*\(|\.\s*click\s*\(|dispatchEvent", re.I
+        ),
     ),
     ("剪贴板写入", re.compile(r"clipboard\s*\.\s*(write|writeText)\s*\(", re.I)),
 )
@@ -121,12 +159,17 @@ _TOOL_SPECS = [
     ),
     ToolSpec(
         name="browser_click",
-        description="点击当前页面上的元素（ref 如 e2，也可以是 CSS 选择器或可见文本）",
+        description=(
+            "点击当前页面上的元素（ref 如 e2，也可以是 CSS 选择器或可见文本；"
+            "参数名 target 是 ref 的别名）"
+        ),
         parameters={"ref": "string"},
     ),
     ToolSpec(
         name="browser_type",
-        description="在当前页面元素里输入文本（先清空再填，重放安全）",
+        description=(
+            "在当前页面元素里输入文本（先清空再填，重放安全；参数名 target 是 ref 的别名）"
+        ),
         parameters={"ref": "string", "text": "string"},
     ),
     ToolSpec(
@@ -226,7 +269,7 @@ class AppToolExecutor:
     async def _dispatch_browser(self, name: str, arguments: dict[str, Any]) -> ToolResult:
         if name == "browser_open":
             return await self._browser_open(arguments)
-        page = self._page
+        page = self._current_page()  # 池回收过的死页不接（I3），先丢引用
         if page is None:
             return _browser_error(
                 "no_open_page", "还没有打开的页面：请先调用 browser_open(url) 再观察或操作"
@@ -234,7 +277,9 @@ class AppToolExecutor:
         if name == "browser_snapshot":
             return await self._browser_snapshot(page)
         if name == "browser_click":
-            return _to_tool_result(await actions.click(page, _arg(arguments, "ref", "target")))
+            result = _to_tool_result(await actions.click(page, _arg(arguments, "ref", "target")))
+            # 点击可能跟着链接/弹窗跳走（I2）：无论成败都复查当前 URL
+            return await self._revalidate_after_action(page, "browser_click", result)
         if name == "browser_type":
             # text 故意的 Any：非 str 由 actions 结构化拒绝（invalid_text），不在这里强转
             text: Any = arguments.get("text")
@@ -253,7 +298,7 @@ class AppToolExecutor:
         return _browser_error("unknown_tool", f"unknown browser tool: {name}")
 
     async def _browser_open(self, arguments: dict[str, Any]) -> ToolResult:
-        """策略门 → navigate（D4：把关必须在动作之前，拒绝路径不建页不导航）。"""
+        """策略门 → navigate（D4：把关必须在动作之前，拒绝路径不建页不导航）→ 复查落点（I2）。"""
         url = _arg(arguments, "url")
         allowed, reason = self._policy.validate(url)
         if not allowed:
@@ -262,8 +307,15 @@ class AppToolExecutor:
                 f"URL 被安全策略拒绝：{reason}",
                 data={"action": "browser_open", "url": _preview(url), "reason": reason},
             )
-        page = self._page if self._page is not None else await self._acquire_page()
-        return _to_tool_result(await actions.navigate(page, url))
+        page = self._current_page()
+        if page is None:
+            page = await self._acquire_page()
+        result = _to_tool_result(await actions.navigate(page, url))
+        if result.status != "success":
+            # 失败即数据：导航失败时页面停在浏览器错误页（chrome-error://…），复查会把
+            # 真实的 navigation_failed 伪装成策略拒绝，所以失败路径原样返回
+            return result
+        return await self._revalidate_after_action(page, "browser_open", result)
 
     async def _browser_snapshot(self, page: Page) -> ToolResult:
         try:
@@ -283,7 +335,9 @@ class AppToolExecutor:
                 data={"action": "snapshot", "url": url, "refs": ""},
             )
         return ToolResult(
-            status="success", content=refs, data={"action": "snapshot", "url": url, "refs": refs}
+            status="success",
+            content=f"{refs}\n{_SNAPSHOT_NOTE}",
+            data={"action": "snapshot", "url": url, "refs": refs, "note": _SNAPSHOT_NOTE},
         )
 
     async def _browser_execute_js(self, page: Page, arguments: dict[str, Any]) -> ToolResult:
@@ -308,28 +362,111 @@ class AppToolExecutor:
         try:
             raw = await page.evaluate(expression)
         except Exception as exc:
-            return _browser_error(
-                "evaluate_failed",
-                f"JS 表达式执行失败：{_describe(exc)}",
+            # 表达式已经跑过了（可能已经跳转）：失败路径也复查 URL（I2）
+            return await self._revalidate_after_action(
+                page,
+                "browser_execute_js",
+                _browser_error(
+                    "evaluate_failed",
+                    f"JS 表达式执行失败：{_describe(exc)}",
+                    data={
+                        "action": "execute_js",
+                        "url": _page_url(page),
+                        "expression": _preview(expression),
+                    },
+                ),
+            )
+        text = _stringify(raw)
+        truncated = len(text) > MAX_JS_RESULT_CHARS
+        return await self._revalidate_after_action(
+            page,
+            "browser_execute_js",
+            ToolResult(
+                status="success",
+                content=text[:MAX_JS_RESULT_CHARS],
                 data={
                     "action": "execute_js",
                     "url": _page_url(page),
                     "expression": _preview(expression),
+                    "result": text[:MAX_JS_RESULT_CHARS],
+                    "truncated": truncated,
                 },
-            )
-        text = _stringify(raw)
-        truncated = len(text) > MAX_JS_RESULT_CHARS
-        return ToolResult(
-            status="success",
-            content=text[:MAX_JS_RESULT_CHARS],
+            ),
+        )
+
+    # ── 当前页生命周期（I2 隔离 / I3 恢复与释放） ─────────────────────────
+
+    def _current_page(self) -> Page | None:
+        """当前页（使用前调用）：被池回收过（``is_closed()``）就丢引用，等重新取页。
+
+        池到上限会回收最老的 busy page（``new_page()``），``close()`` 会关全部 page：
+        不检查的话 ``self._page`` 永远指向死页，之后每个浏览器调用都失败且无法恢复
+        （那个池槽也永远不释放）。
+        """
+        page = self._page
+        if page is None:
+            return None
+        if _page_closed(page):
+            logger.info("current page is closed (evicted/closed by pool); dropping reference")
+            self._page = None
+            return None
+        return page
+
+    async def _revalidate_after_action(
+        self, page: Page, action: str, result: ToolResult
+    ) -> ToolResult:
+        """动作后复查当前 URL（I2）：入参把关挡不住“动作把页面带出去”（链接/弹窗/重定向/JS 跳转）。
+
+        放行 → 原结果原样返回（动作本身的结果才是数据）；拦截 → ``navigation_blocked``
+        + **隔离当前页**（丢引用 + 归还池）：后续调用不会继续在违规源上动作，必须先
+        ``browser_open`` 重新过策略门。URL 读不出来（页面已关/驱动异常）时不拦——
+        那不是“跳到了违规地址”，交给 closed-page 恢复路径（:meth:`_current_page`）。
+        """
+        url = _page_url(page)
+        if not url:
+            return result
+        allowed, reason = self._policy.validate(url)
+        if allowed:
+            return result
+        await self._quarantine_page(page)
+        return _browser_error(
+            "navigation_blocked",
+            f"动作后页面跳转到策略不允许的 URL：{reason}",
             data={
-                "action": "execute_js",
-                "url": _page_url(page),
-                "expression": _preview(expression),
-                "result": text[:MAX_JS_RESULT_CHARS],
-                "truncated": truncated,
+                "action": action,
+                "url": _preview(url),
+                "reason": reason,
+                "page_released": True,
             },
         )
+
+    async def _quarantine_page(self, page: Page) -> None:
+        """把“跳到策略外”的页面从当前页摘掉并归还池（best-effort，绝不覆盖动作结果）。"""
+        self._page = None
+        await self._release_page(page)
+
+    async def _release_page(self, page: Page | None) -> None:
+        """把页面还给池（best-effort）：池不可用/未实现 release/页面已关时静默跳过。
+
+        已关闭的页面**不**归还：``new_page()`` 会把 idle 里的页原样取走，往 idle 放死页
+        等于把故障传染给下一个调用者。
+        """
+        if page is None or self._browser is None or _page_closed(page):
+            return
+        try:
+            await self._browser.release(page)
+        except Exception as exc:  # 池已关 / 替身没实现 release：不因此改变动作结果
+            logger.debug("page release failed: {}", _describe(exc))
+
+    async def aclose(self) -> None:
+        """释放当前页占用的池槽（置空引用 + 归还池；幂等）：不调则该池槽一直占着。
+
+        残余限制（与模块 docstring 的共享页限制同源）：归还的页面仍停在最后打开的 URL 上，
+        多会话并发时别的消费者可能拿到它；本 executor 随后会重新取页（``_current_page``），
+        不会继续在旧页上动作。尚未接到 app lifespan（P4 议题）。
+        """
+        page, self._page = self._page, None
+        await self._release_page(page)
 
     async def _acquire_page(self) -> Page:
         """取当前页（首次向池索取并记住）；池不可用 → :class:`_PoolUnavailableError`。"""
@@ -412,3 +549,11 @@ def _page_url(page: Page) -> str:
         return str(page.url)
     except Exception:
         return ""
+
+
+def _page_closed(page: Page) -> bool:
+    """页面是否已被池回收/关闭；读不出状态（替身、驱动异常）时按“可用”处理。"""
+    try:
+        return bool(page.is_closed())
+    except Exception:
+        return False
