@@ -595,10 +595,18 @@ def test_lifespan_manual_saver_survives_app_restart_for_resume(tmp_path):
             tracer=JsonlTracer(trace_id=trace_id, out_dir=tmp_path),
         )
 
-    with TestClient(_make("restart-1")) as client:
+    app1 = _make("restart-1")
+    with TestClient(app1) as client:
         first = _stream_chat_events(client, "s1", "北京天气")
         assert [e["type"] for e in first] == ["phase", "human_pending"]
     assert ckpt_db.exists()
+
+    # shutdown 必须真正关闭 app-1 的 aiosqlite 连接（aiosqlite 0.22 已无
+    # is_alive()：关闭后 _running→False、底层 sqlite3 句柄置 None）。删掉
+    # main.py lifespan finally 的 await conn.close() 会让此断言失败。
+    app1_conn = app1.state.checkpointer.conn
+    assert app1_conn._running is False
+    assert app1_conn._connection is None
 
     # 新进程语义：重新 lifespan（新 conn/saver），从磁盘读回 interrupt 并 resume
     with TestClient(_make("restart-2")) as client:
