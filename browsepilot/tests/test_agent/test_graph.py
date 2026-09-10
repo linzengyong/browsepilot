@@ -375,3 +375,169 @@ async def test_degradation_log_not_duplicated_when_execute_replays(tmp_path):
     replayed = await graph.ainvoke(replay_input)
     assert [d["strategy"] for d in replayed["degradation_log"]] == ["weather", "search"]
     assert replayed["degradation_log"] == first["degradation_log"]
+
+
+# ── Tier3（browser_task / read_page 升级）策略链 ───────────────────────────────
+
+
+class BrowserExecutor(StubExecutor):
+    """browser_task 链的替身：默认“没有打开的页面”（snapshot 失败 → open 兜底）。"""
+
+    def __init__(self, *, page_open: bool = False, browser_error: str = "") -> None:
+        super().__init__()
+        self.calls: list[tuple[str, dict]] = []
+        self.page_open = page_open
+        self.browser_error = browser_error
+
+    async def call(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name.startswith("browser_"):
+            if self.browser_error:  # 模拟真实的"未注入 BrowserPool"：每个浏览器工具都降级
+                return ToolResult(
+                    status="error",
+                    error_type=self.browser_error,
+                    error_message=f"浏览器工具失败：{self.browser_error}",
+                )
+            if name == "browser_snapshot":
+                if not self.page_open:
+                    return ToolResult(
+                        status="error",
+                        error_type="no_open_page",
+                        error_message="还没有打开任何页面",
+                    )
+                refs = '- button "搜索" [ref=e2]'
+                return ToolResult(
+                    status="success",
+                    content=refs,
+                    data={"url": "https://example.com/", "refs": refs},
+                )
+            if name == "browser_open":
+                self.page_open = True
+                url = arguments.get("url", "")
+                return ToolResult(status="success", content=f"已打开 {url}", data={"url": url})
+        return await super().call(name, arguments)
+
+
+class FetchFailingExecutor(StubExecutor):
+    """tier2 → tier3 升级链的替身：fetch_page 失败、browser_open 兜底。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "fetch_page":
+            return ToolResult(status="error", error_type="fetch_failed", error_message="连接超时")
+        if name == "browser_open":
+            url = arguments.get("url", "")
+            return ToolResult(status="success", content=f"已打开 {url}", data={"url": url})
+        return await super().call(name, arguments)
+
+
+@pytest.mark.asyncio
+async def test_browser_task_snapshots_first_then_opens(tmp_path):
+    """tier3 链：先看当前页（点/填都建立在已打开的页面上），没有页面才 open。"""
+    tracer = JsonlTracer(trace_id="t10", out_dir=tmp_path / "traces")
+    ex = BrowserExecutor(page_open=False)
+    provider = StubProvider()
+    graph = build_graph(ex, tracer, provider)
+    result = await graph.ainvoke(AgentState(task="帮我比价 iPhone 15 和 小米 15"))
+    assert result["intent"] == "browser_task"
+    assert result["tier"] == "tier3"
+    assert [name for name, _ in ex.calls] == ["browser_snapshot", "browser_open"]
+    assert ex.calls[0][1] == {}  # snapshot 无参数：不需要模型提取
+    assert ex.calls[1][1]["url"] == "https://example.com"
+    assert result["result_data"]["url"] == "https://example.com"
+    assert [d["strategy"] for d in result["degradation_log"]] == ["browser_snapshot"]
+    assert result["degradation_log"][0]["error"] == "no_open_page"
+    assert result["stop_reason"] == "completed"
+    # 两次尝试都有 tool_call 跟踪（失败一次、成功一次）
+    lines = (tmp_path / "traces" / "t10.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    events = [json.loads(line) for line in lines]
+    tool_calls = [e for e in events if e["event_type"] == "tool_call"]
+    assert [(e["data"]["tool"], e["data"]["status"]) for e in tool_calls] == [
+        ("browser_snapshot", "error"),
+        ("browser_open", "success"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_browser_task_prefers_current_page_snapshot(tmp_path):
+    """已有打开的页面：snapshot 即成功 → 链不继续（不再重复导航）。"""
+    tracer = JsonlTracer(trace_id="t11", out_dir=tmp_path / "traces")
+    ex = BrowserExecutor(page_open=True)
+    provider = StubProvider()
+    graph = build_graph(ex, tracer, provider)
+    result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
+    assert [name for name, _ in ex.calls] == ["browser_snapshot"]
+    assert result["result_data"]["refs"].startswith("- button")
+    assert result["degradation_log"] == []
+    assert provider.structured_calls == 0  # 规则命中 + snapshot 无参数 → 零模型调用
+
+
+@pytest.mark.asyncio
+async def test_browser_task_without_browser_degrades_honestly(tmp_path):
+    """浏览器不可用：两条策略都记 browser_unavailable → all_strategies_failed + 明确告知。"""
+    tracer = JsonlTracer(trace_id="t12", out_dir=tmp_path / "traces")
+    graph = build_graph(BrowserExecutor(browser_error="browser_unavailable"), tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
+    assert result["result_data"]["error"] == "all_strategies_failed"
+    degradation = result["result_data"]["degradation"]
+    assert [d["strategy"] for d in degradation] == ["browser_snapshot", "browser_open"]
+    assert all(d["error"] == "browser_unavailable" for d in degradation)
+    assert result["degradation_log"] == degradation
+    assert "无法完成" in result["final_answer"]
+    assert "browser_unavailable" in result["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_browser_task_surfaces_policy_reason_in_answer(tmp_path):
+    """policy 拒绝原因（稳定契约）必须原样进降级链与最终回答，绝不吞掉。"""
+
+    class BlockedExecutor(StubExecutor):
+        async def call(self, name, arguments):
+            if name.startswith("browser_"):
+                return ToolResult(
+                    status="error",
+                    error_type="navigation_blocked",
+                    error_message="navigation_blocked: protocol_blocked: file: is not allowed",
+                )
+            return await super().call(name, arguments)
+
+    tracer = JsonlTracer(trace_id="t13", out_dir=tmp_path / "traces")
+    graph = build_graph(BlockedExecutor(), tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
+    assert [d["error"] for d in result["degradation_log"]] == [
+        "navigation_blocked",
+        "navigation_blocked",
+    ]
+    assert "protocol_blocked" in result["final_answer"]
+
+
+@pytest.mark.asyncio
+async def test_read_page_escalates_to_browser_when_fetch_fails(tmp_path):
+    """tier2 失败升级到 tier3：HTTP 抓取不行就用真浏览器（同一意图，降级链回退）。"""
+    tracer = JsonlTracer(trace_id="t14", out_dir=tmp_path / "traces")
+    ex = FetchFailingExecutor()
+    graph = build_graph(ex, tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="打开 https://www.python.org 告诉我页面主要内容"))
+    assert result["intent"] == "read_page"
+    assert result["tier"] == "tier2"
+    assert [name for name, _ in ex.calls] == ["fetch_page", "browser_open"]
+    assert result["result_data"]["url"] == "https://example.com"
+    assert [d["strategy"] for d in result["degradation_log"]] == ["fetch_page"]
+    assert result["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_read_page_keeps_fetch_page_when_it_succeeds(tmp_path):
+    """升级只在失败后发生：fetch_page 成功就不碰浏览器（现有 tier2 行为不变）。"""
+    tracer = JsonlTracer(trace_id="t15", out_dir=tmp_path / "traces")
+    ex = RecordingExecutor()
+    graph = build_graph(ex, tracer, StubProvider())
+    result = await graph.ainvoke(AgentState(task="打开 https://www.python.org 告诉我页面主要内容"))
+    assert [name for name, _ in ex.calls] == ["fetch_page"]
+    assert result["degradation_log"] == []
+    assert result["result_data"] == {}  # StubExecutor 的 fetch_page 回显空 data
+    assert result["stop_reason"] == "completed"

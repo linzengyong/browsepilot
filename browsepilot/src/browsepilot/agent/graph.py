@@ -20,7 +20,7 @@ from langgraph.graph import END, StateGraph
 from langgraph.types import interrupt
 from pydantic import BaseModel
 
-from browsepilot.agent.params import ReadPageParams, SearchParams, WeatherParams
+from browsepilot.agent.params import BrowserParams, ReadPageParams, SearchParams, WeatherParams
 from browsepilot.agent.router import IntentResult, RouteDecision, classify_by_rules
 from browsepilot.agent.state import AgentState
 from browsepilot.agent.tools import ToolExecutor
@@ -58,17 +58,29 @@ def build_graph(
     workflow = StateGraph(AgentState)
 
     # 降级策略链：weather 城市未命中 → 用 task 原文搜索兑底；
-    # search/read_page 无有意义回退，失败即明确降级（all_strategies_failed）。
+    # read_page（tier2）HTTP 抓取失败 → 升级到真浏览器 browser_open（同一意图，降级链回退）；
+    # browser_task（tier3）先看当前页（点/填都建立在已打开的页面上），没有页面才 open；
+    # search 无有意义的回退，失败即明确降级（all_strategies_failed）。
     _STRATEGY_CHAIN: dict[str, list[str]] = {
         "weather": ["weather", "search"],
         "search": ["search"],
-        "read_page": ["fetch_page"],
+        "read_page": ["fetch_page", "browser_open"],
+        "browser_task": ["browser_snapshot", "browser_open"],
     }
 
-    _PARAM_MODELS: dict[str, type[BaseModel]] = {
+    # 工具 → 参数模型。``None`` = 工具不需要参数（不用花一次模型调用去提取）。
+    # Tier3 的工具参数形态由 BrowserParams 描述（url/target/text/direction/expression），
+    # 模型按需填；executor 每个工具只取自己要的字段。
+    _PARAM_MODELS: dict[str, type[BaseModel] | None] = {
         "weather": WeatherParams,
         "search": SearchParams,
         "fetch_page": ReadPageParams,
+        "browser_snapshot": None,
+        "browser_open": BrowserParams,
+        "browser_click": BrowserParams,
+        "browser_type": BrowserParams,
+        "browser_scroll": BrowserParams,
+        "browser_execute_js": BrowserParams,
     }
 
     async def classify(state: AgentState) -> dict:
@@ -106,8 +118,8 @@ def build_graph(
         """策略链循环：按 intent 的顺序尝试工具，每次失败记 degradation。
 
         首次尝试按 intent 的 Params 结构化提取；天气回退到 search 时不再
-        结构化提取，直接用 task 原文作 query。全败 → result_data 返回
-        all_strategies_failed + degradation；全程 tool_call trace 可追溯。
+        结构化提取，直接用 task 原文作 query；无参数工具（browser_snapshot）同样跳过提取。
+        全败 → result_data 返回 all_strategies_failed + degradation；全程 tool_call trace 可追溯。
         """
         with tracer.span("execute", intent=state.intent):
             chain = _STRATEGY_CHAIN.get(state.intent, ["search"])
@@ -115,9 +127,12 @@ def build_graph(
             for tool_name in chain:
                 params_model = _PARAM_MODELS[tool_name]
                 try:
-                    if tool_name == "search" and state.intent == "weather" and degradation:
+                    if params_model is None:
+                        # 无参数工具：结构化提取是空转，直接空参调用
+                        params: BaseModel | None = None
+                    elif tool_name == "search" and state.intent == "weather" and degradation:
                         # 天气城市未命中 → 用 task 原文搜索兑底，不再结构化提取
-                        params: BaseModel = SearchParams(query=state.task)
+                        params = SearchParams(query=state.task)
                     else:
                         params = await provider.structured(
                             [
@@ -136,7 +151,8 @@ def build_graph(
                         }
                     )
                     continue
-                tool_result = await executor.call(tool_name, params.model_dump())
+                arguments = {} if params is None else params.model_dump()
+                tool_result = await executor.call(tool_name, arguments)
                 tracer.emit(
                     TraceEvent(
                         trace_id=tracer.trace_id,
