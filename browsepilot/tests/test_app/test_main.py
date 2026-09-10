@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 from fastapi.testclient import TestClient
@@ -398,6 +399,96 @@ def test_chat_resume_after_interrupt(tmp_path):
     assert events[1]["stop_reason"] == "completed"
 
 
+# ── C1：tier3 登录墙 → /chat/resume 闭环 ────────────────────────────────────
+
+
+class LoginWallBrowserExecutor(FakeExecutor):
+    """browser_open 命中登录墙（D5/D6 桥的真实产出形状）；新任务还没有页面（snapshot 失败）。"""
+
+    async def call(self, name, arguments):
+        if name == "browser_snapshot":
+            return ToolResult(
+                status="error", error_type="no_open_page", error_message="还没有打开的页面"
+            )
+        if name == "browser_open":
+            return ToolResult(
+                status="success",
+                content="已打开 https://example.com/login",
+                data={
+                    "action": "browser_open",
+                    "url": "https://example.com/login",
+                    "needs_human": True,
+                    "human_prompt": "页面需要登录：请在浏览器中手动登录后继续任务。",
+                    "intervention": "login",
+                },
+            )
+        return await super().call(name, arguments)
+
+
+class LoginHookedProvider(RecordingProvider):
+    """记录 prompt，并模拟会被过期提示带偏的模型（P3 final review C1 的实证形状）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.system_prompts: list[str] = []
+
+    async def chat(self, messages, *, model=None):
+        first = messages[0] if messages else None
+        self.system_prompts.append(
+            first.content if first is not None and first.role == "system" else ""
+        )
+        await super().chat(messages, model=model)  # 记录 user prompt（prompts[-1]）
+        content = messages[-1].content
+        if "人工反馈" in content:
+            return ChatResult(text="已基于人工反馈继续：登录后的页面已经打开。")
+        if "human_prompt" in content:
+            return ChatResult(text="请在浏览器中手动登录后继续任务。")
+        return ChatResult(text="（没有可用上下文）")
+
+
+def test_chat_resume_after_login_wall_uses_human_response(tmp_path):
+    """C1 端到端（HTTP）：tier3 登录墙 → human_pending → /chat/resume 后答案基于人工反馈，
+    不再要求"请手动登录"（human_response 是写-only 字段时，人工确认等于是白做）。"""
+    from langgraph.checkpoint.memory import MemorySaver
+
+    provider = LoginHookedProvider()
+    app = create_app(
+        Settings(_env_file=None),
+        provider=provider,
+        executor=LoginWallBrowserExecutor(),
+        tracer=JsonlTracer(trace_id="c1-hitl", out_dir=tmp_path),
+        checkpointer=MemorySaver(),
+    )
+    client = TestClient(app)
+
+    # 任务文本不带 URL：带 URL 的任务按既有规则走 read_page（tier2）
+    first = _stream_chat_events(client, "s1", "帮我点击页面上的登录按钮")
+    assert [e["type"] for e in first] == ["phase", "human_pending"]
+    assert "手动登录" in first[1]["human_prompt"]
+
+    with client.stream(
+        "POST",
+        "/chat/resume",
+        json={"session_id": "s1", "human_response": "我已经在浏览器里登录好了"},
+    ) as resp:
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: ") :])
+            for line in resp.iter_lines()
+            if line.startswith("data: ")
+        ]
+    assert [e["type"] for e in events] == ["answer", "done"]
+    assert events[1]["stop_reason"] == "completed"
+    # 答案不再要求人工（旧行为：模型只看到过期的 human_prompt → 复述"请手动登录"）
+    assert "手动登录" not in events[0]["text"]
+    assert "已基于人工反馈继续" in events[0]["text"]
+    # resume 那一轮的 prompt：人工反馈在里面，过期提示不在（system 也讲清了人工已完成）
+    assert "我已经在浏览器里登录好了" in provider.prompts[-1]
+    assert "人工反馈" in provider.prompts[-1]
+    assert "手动登录" not in provider.prompts[-1]
+    assert "不要再让用户手动登录" in provider.system_prompts[-1]
+
+
 def test_anonymous_hitl_surfaces_generated_session_id_for_resume(tmp_path):
     """匿名会话 + HITL interrupt 不再死胡同：phase/start 先公布服务端生成的
     session_id，human_pending 复用它 —— 客户端能凭它对 /chat/resume 寻址。"""
@@ -781,6 +872,69 @@ def test_default_app_wires_browser_pool_into_executor(tmp_path, monkeypatch):
     assert (pool.headless, pool.max_pages) == (False, 2)  # 来自 Settings
     assert pool.channel == "msedge"  # F3：Settings.browser_channel 真的透传到池
     assert captured["executor"]._browser is pool  # 构造注入，与生命周期同源
+
+
+def test_default_app_keeps_browser_pool_and_executor_on_one_settings(tmp_path, monkeypatch):
+    """I3：组合根显式传 ``policy=NavigationPolicy(settings…)`` —— 不许 executor 自己再读一次环境。
+
+    只把 create_app 换成记录器，然后用**行为**断言策略真的来自这一个 Settings：
+    allowlist 模式下白名单外的域名在策略门就被拦（executor 自建默认策略是 allow_https，
+    会放行 evil.com 并走到浏览器那一步变成 browser_unavailable）。
+    """
+    captured = _capture_default_app(
+        tmp_path, monkeypatch, navigation_policy="allowlist", allowed_domains=["example.com"]
+    )
+    executor = captured["executor"]
+
+    blocked = asyncio.run(executor.call("browser_open", {"url": "https://evil.com/"}))
+    assert blocked.error_type == "navigation_blocked"
+    assert "domain_not_allowed" in blocked.error_message
+    # 白名单内：策略放行 → 卡在池（本测试没启动池），证明上面的拦截来自策略而不是“永远拒”
+    allowed = asyncio.run(executor.call("browser_open", {"url": "https://www.example.com/"}))
+    assert allowed.error_type == "browser_unavailable"
+
+
+def test_lifespan_binds_the_pool_through_the_public_attach_browser_api(tmp_path):
+    """Minor：lifespan 走 AppToolExecutor.attach_browser() 公开 API（不再写私有 ``_browser``）。
+
+    替身只覆写公开 API：旧实现（直接赋 ``executor._browser``）下这里根本不会被调用。
+    """
+    pool = FakeBrowserPool()
+    attached: list = []
+
+    class AttachSpyExecutor(FakeExecutor):
+        def attach_browser(self, browser):
+            attached.append(browser)
+
+    app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=""),
+        provider=FakeProvider(),
+        executor=AttachSpyExecutor(),
+        tracer=JsonlTracer(trace_id="attach-api", out_dir=tmp_path),
+        browser_pool=pool,
+    )
+    with TestClient(app) as client:
+        assert attached == [pool]  # 启动后注入的是已启动的池
+        assert client.get("/health").status_code == 200
+
+    # 启动失败 → 同一个 API 传 None（不变的降级契约）
+    boom = FakeBrowserPool(start_error=RuntimeError("chromium executable missing"))
+    failing: list = []
+
+    class FailingSpyExecutor(FakeExecutor):
+        def attach_browser(self, browser):
+            failing.append(browser)
+
+    failing_app = create_app(
+        Settings(_env_file=None, checkpoint_db_path=""),
+        provider=FakeProvider(),
+        executor=FailingSpyExecutor(),
+        tracer=JsonlTracer(trace_id="attach-api-fail", out_dir=tmp_path),
+        browser_pool=boom,
+    )
+    with TestClient(failing_app) as client:
+        assert failing == [None]
+        assert client.get("/health").status_code == 200
 
 
 def test_default_app_maps_settings_channel_to_pool(tmp_path, monkeypatch):

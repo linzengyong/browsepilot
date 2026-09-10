@@ -2,8 +2,9 @@ r"""URL 安全策略（D4/D7）：纯函数 + 纯标准库（``urllib.parse`` + 
 
 层次红线
 --------
-本模块属于 app 层，只依赖标准库，**不** import ``browsepilot.agent.*``（由
-``tests/test_architecture.py`` 守卫）；不需要浏览器、不发起任何网络请求，可离线单测。
+本模块属于 app 层，只依赖标准库，**不** import ``browsepilot.agent.*``（也不 import app 层
+其他模块），由 ``tests/test_architecture.py::test_app_browser_layer_is_self_contained`` 守卫；
+不需要浏览器、不发起任何网络请求，可离线单测。
 
 接口契约
 --------

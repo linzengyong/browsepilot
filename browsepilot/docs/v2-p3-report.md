@@ -170,7 +170,7 @@ $ git diff --stat e455a9f..HEAD -- browsepilot/backend browsepilot/browser_mcp  
 （空输出）
 ```
 
-- `backend/`、`browser_mcp/` **零改动**，冻结延续至 P5（另有 `tests/test_architecture.py` 守卫 agent 层不 import playwright）。
+- `backend/`、`browser_mcp/` **零改动**，冻结延续至 P5（`tests/test_architecture.py` 守卫 agent 层不 import `browsepilot.app`/`browser_mcp`/**playwright**，并守卫 `app.browser` 包不 import `browsepilot.agent`）。
 - P3 全部改动限于 `browsepilot/src/`、`browsepilot/tests/`、`browsepilot/docs/`（26 文件，+7608/−44）；`browsepilot/eval/` 零改动（场景与运行器在 P3 未动）。
 - 本任务（T8）**仅新增 docs**：`docs/v2-p3-report.md`、`docs/v2-p3-smoke-trace.jsonl`，以及 `docs/v2-articles/article-5-material.md` 的 1 处引用行。
 - 工作树另携带会话前既有的无关未提交修改（`CLAUDE.md`、`README.md`、`browsepilot/.env.example`、`browsepilot/backend/app/config.py`）与未跟踪文件——非 P3 产出，未触碰、未提交。
@@ -189,3 +189,34 @@ $ git diff --stat e455a9f..HEAD -- browsepilot/backend browsepilot/browser_mcp  
 - `browsepilot/docs/v2-articles/article-5-material.md`（仅「数据在哪」引用行）
 
 提交信息：`docs: P3 delivery report`
+
+## 十二、P3 收口修复（本报告之后、P4 之前）
+
+提交信息：`fix(agent+app): P3 final-review must-fixes (HITL resume, tier3 completion, error attribution)`
+（P3 whole-branch final review 的 4 个 MUST-FIX-BEFORE-P4 + 便宜的 Important/Minor）。
+
+- **§八 遗留清单的变化**：第 1（click 跨页假失败）、3（`_quarantine_page` release 回 idle）、
+  5（answer 不读 `human_response`）条已关闭；第 2 条**部分关闭**（链改为先导航后观察，只导航到页面时
+  不再假报 `completed`，改报 `partial`；但 `type`/`click` 仍未入链——多步交互留 P4）；
+  第 6 条补了 HTTP 层 `/chat/resume` 测试（真实浏览器里的 resume 仍留 P4）；
+  第 4（`aclose()` 未接 lifespan）与 7-10 仍留 P4。
+- **新增/变更的语义**（P4 读报告时要知道）：tier3 链改为**先导航后观察**（`browser_open` → `browser_snapshot`），
+  未与任务目标匹配的观察结果显式标 `partial`（`stop_reason="partial"`，不再报 `completed`）；
+  `chrome-error://` 按**导航失败**归因（不再当策略违规）；`browser_type`/`browser_snapshot` 也复查 URL；
+  违规页 `discard()`（不回 idle）。
+- **本次提交后已过时的引用**（P3 交付时的事实，原文保留不删）：§五 检查单第 6 行与 §八 第 2 条里的
+  `_STRATEGY_CHAIN["browser_task"] = ["browser_snapshot","browser_open"]` 已是
+  `["browser_open","browser_snapshot"]`；测试 `test_browser_task_snapshots_first_then_opens` 改名为
+  `test_browser_task_navigates_then_observes_without_fake_degradation`。`docs/v2-p3-smoke.md` 与
+  `docs/v2-articles/article-3/5-material.md` 里同样按旧链记录（不在本次改动范围，待统一勘误）。
+
+### P4 评测前置（运维，I5）
+
+1. **真实 HITL 必须有头浏览器**：`BP_BROWSER_HEADLESS=false` —— headless 下没有人能登录/过验证码，
+   HITL 场景只能拿到假结果（页面停在登录墙，人工反馈无从产生）。
+2. **浏览器通道**：`BP_BROWSER_CHANNEL=msedge`（或在镜像内 `playwright install chromium` 补齐 rev 1217）——
+   本机 Playwright 1.59 默认要的 chromium rev 不在缓存里。
+3. **harness 必须注入浏览器池 + 逐场景隔离**：`eval/run_eval.py` real 模式现在自己构造 `BrowserPool`
+   （与 app 同一个组合根来源），并在每个场景后 `executor.aclose()`。不注入 → 每个 tier3 场景都 `browser_unavailable`
+   （接线问题会被读成任务失败）；不隔离 → 下一个场景可能拍到上一个场景留下的页面（报 `completed` 却答非所问）。
+   池起不来时 harness 打 `WARNING` 并降级（tier3 一律 `browser_unavailable`，Tier1/2 照常评测）。

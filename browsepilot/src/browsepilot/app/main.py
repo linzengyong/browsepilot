@@ -112,11 +112,14 @@ def _bind_executor_browser(executor: ToolExecutor, browser: BrowserPool | None) 
     T4 给 AppToolExecutor 加了可选的 ``browser`` 构造参数，但池的 ``start()`` 是异步的：
     只有 lifespan 知道池是否真的可用。这里保证一个不变式 —— lifespan 启动完成后，
     executor 持有的要么是已启动的池，要么是 None（6 个浏览器工具统一返回
-    ``browser_unavailable``），绝不会拿着一个没启动的池。非 AppToolExecutor 的
-    ToolExecutor 替身没有该槽位时静默跳过。
+    ``browser_unavailable``），绝不会拿着一个没启动的池。
+
+    走 AppToolExecutor 的公开 API ``attach_browser()``（不再写私有 ``_browser``）；
+    非 AppToolExecutor 的 ToolExecutor 替身没有该 API 时静默跳过（图只认 ToolExecutor 协议）。
     """
-    if hasattr(executor, "_browser"):
-        executor._browser = browser  # type: ignore[attr-defined]
+    attach = getattr(executor, "attach_browser", None)
+    if callable(attach):
+        attach(browser)
 
 
 def create_app(
@@ -440,11 +443,13 @@ def _default_app() -> FastAPI:
     lifespan 会按 settings.checkpoint_db_path 创建共享 AsyncSqliteSaver。
     BrowserPool 在此同步构造（无 IO），start()/close() 由 lifespan 负责；
     同一实例既构造注入 executor，又作为 browser_pool 交给生命周期管理。
-    池配置全部来自 Settings：headless / max_pages / ``channel``（F3：空串 → None，见
-    ``Settings.browser_channel``——``channel=""`` 不是合法值，会直接启动失败）。
+    池配置与策略全部来自**这一个** Settings 对象：headless / max_pages / ``channel``
+    （F3：空串 → None，见 ``Settings.browser_channel``——``channel=""`` 不是合法值，
+    会直接启动失败）/ navigation_policy + allowed_domains（I3）。
     """
     from browsepilot.agent.tracer import JsonlTracer
     from browsepilot.app.browser.browser_pool import BrowserPool
+    from browsepilot.app.browser.policy import NavigationPolicy
     from browsepilot.app.executor import AppToolExecutor
     from browsepilot.app.services.fetch import PageFetchService
     from browsepilot.app.services.search import SearchService
@@ -463,7 +468,13 @@ def _default_app() -> FastAPI:
         channel=settings.browser_channel or None,  # F3：空 = 自带 Chromium
     )
     executor = AppToolExecutor(
-        WeatherService(), SearchService(), PageFetchService(), browser=browser_pool
+        WeatherService(),
+        SearchService(),
+        PageFetchService(),
+        browser=browser_pool,
+        # I3：策略从这**同一个** Settings 显式构造。不传的话 executor 自己再读一次环境
+        # （Settings()），把显式传入的配置静默覆盖掉——组合根是唯一的配置入口。
+        policy=NavigationPolicy(settings.navigation_policy, settings.allowed_domains),
     )
     tracer = JsonlTracer(out_dir=Path(settings.trace_dir))
     session_store = SessionStore(Path(settings.session_db_path))

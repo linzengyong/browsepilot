@@ -11,10 +11,10 @@ snapshot/click/type/scroll 都作用在它身上；池回收后的恢复与 ``ac
 
 不启真实浏览器（教训 §1）：FakeBrowser / FakePage 双人舞——page 的 ``calls`` 保留跨方法
 的时间顺序（用来 pin "先 aria-ref 定位再 click"、"type 先清空再填"），失败可编程
-（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate / **可见文本 / 密码框探测**），
-跳转可编程（``redirect_url`` / ``click_url`` / ``evaluate_url``，动作后复查的测试缝），
-``visible_text`` / ``password_inputs`` 是登录/验证码检测的测试缝（``html`` 只出现在 F1 负例里，
-``content()`` 是"原始 HTML 被误采样"的探针），``closed`` 可以模拟池回收；
+（goto / networkidle 等待 / snapshot / click / **fill** / JS 回退 / evaluate / **可见文本 / 密码框探测**），
+跳转可编程（``redirect_url`` / ``click_url`` / ``evaluate_url`` / **``js_fallback_url``**，
+动作后复查的测试缝），``visible_text`` / ``password_inputs`` 是登录/验证码检测的测试缝（``html``
+只出现在 F1 负例里，``content()`` 是"原始 HTML 被误采样"的探针），``closed`` 可以模拟池回收；
 FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()`` / ``discard()``（F4），
 并记录建页次数、归还与弃用（当前页复用、隔离、失败页弃用的证据）。
 真浏览器冒烟是 T6 的独立脚本，不入 pytest。
@@ -27,6 +27,7 @@ import json
 from typing import Any
 
 import pytest
+from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from browsepilot.agent.tools import ToolExecutor
@@ -115,9 +116,13 @@ class FakeLocator:
 
     async def fill(self, value: str, *, timeout: float | None = None) -> None:
         self._page.calls.append(("fill", self.selector, value))
+        if self._page.fail_fill:  # Playwright 尝试全失败 → 动作层落到 JS 兜底
+            raise PlaywrightTimeoutError(f"fill timeout: {self.selector}")
 
     async def evaluate(self, expression: Any, arg: Any = None, *, timeout: float | None = None):
         self._page.calls.append(("locator_evaluate", self.selector, expression))
+        if self._page.js_fallback_url is not None:  # JS 兜底把页面带出去（I1：type 复查的测试缝）
+            self._page.url = self._page.js_fallback_url
         if self._page.fail_locator_evaluate:
             raise PlaywrightTimeoutError(f"js fallback timeout: {self.selector}")
         return True
@@ -174,18 +179,23 @@ class FakePage:
         self.click_url: str | None = None  # 点击链接/弹窗后的 URL
         self.evaluate_url: str | None = None  # JS 跳转后的 URL
         self.fail_goto = False
+        self.goto_exc: Exception | None = None  # 驱动级 goto 异常（如 net::ERR_NAME_NOT_RESOLVED）
         self.fail_networkidle_wait = False
         self.fail_snapshot = False
         self.fail_click = False
+        self.fail_fill = False  # type 的 Playwright 尝试失败 → 走 JS 赋值兜底（I1 测试缝）
         self.fail_locator_evaluate = False
         self.fail_evaluate = False
         self.fail_inner_text = False  # D5/D6：采样失败必须降级成“没发现”
         self.fail_password_count = False
+        self.js_fallback_url: str | None = None  # JS 兜底后的 URL（I1：type 复查的测试缝）
         self.mouse = FakeMouse(self)
 
     async def goto(self, url: str, *, wait_until: str | None = None, timeout: float | None = None):
         self.goto_calls.append(url)
         self.calls.append(("goto", url, wait_until))
+        if self.goto_exc is not None:  # 驱动级失败（生产路径：Playwright 网络错误）
+            raise self.goto_exc
         if self.fail_goto:
             raise RuntimeError("net::ERR_NAME_NOT_RESOLVED")
         self.url = self.redirect_url if self.redirect_url is not None else url
@@ -468,6 +478,29 @@ async def test_browser_open_tolerates_networkidle_timeout():
 
 
 @pytest.mark.asyncio
+async def test_browser_open_normalises_driver_navigation_errors():
+    """C3b 归因：真实 DNS 失败/连接被拒由 Playwright 抛成笼统的 ``Error`` → actions 只能归成
+    ``playwright_error``；而 browser_open 这一步**只可能**是导航失败 —— 必须留在
+    ``navigation_failed`` 这一档，P4 才能把"页面打不开"与"浏览器/驱动坏了"分开。
+
+    真浏览器复验（msedge，2026-09）：``https://no-such-host-….invalid/`` 走的正是这条路径。
+    """
+    page = FakePage()
+    page.goto_exc = PlaywrightError(
+        "Page.goto: net::ERR_NAME_NOT_RESOLVED at https://nope.invalid/"
+    )
+    browser = FakeBrowser(page)
+
+    result = await make_executor(browser).call("browser_open", {"url": "https://nope.invalid/"})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_failed"
+    assert result.data["driver_error_type"] == "playwright_error"  # 原档位不丢
+    assert "ERR_NAME_NOT_RESOLVED" in result.error_message
+    assert browser.discarded == [page]  # 错误页弃用（不 release）
+
+
+@pytest.mark.asyncio
 async def test_browser_pool_not_started_degrades_to_browser_unavailable():
     browser = FakeBrowser(start_error=RuntimeError("BrowserPool.new_page() called before start()"))
     result = await make_executor(browser).call("browser_open", {"url": "https://example.com/"})
@@ -719,6 +752,8 @@ async def test_scroll_defaults_to_down_and_honours_direction_amount():
 
 
 # ── I2：动作后导航复查（点击/JS/重定向绕不过策略门） ──────────────────────────
+# 违规页一律 **弃用**（discard，不 release）——release 会把违规源放回 idle，
+# 下一个消费者（另一个会话）会原样取走它（P3 final review I2）。
 
 
 @pytest.mark.asyncio
@@ -735,9 +770,10 @@ async def test_browser_open_revalidates_the_post_redirect_url():
     assert result.data["reason"].startswith("private_address_blocked")
     assert result.data["action"] == "browser_open"
     assert page.goto_calls == ["https://example.com/r"]  # 入参确实过了门（拦的是落点）
-    # 违规页被隔离：后续调用不会继续在它上面动作
+    # 违规页被隔离：后续调用不会继续在它上面动作；且**不**归还给池（I2）
     assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
-    assert browser.released == [page]
+    assert browser.released == []  # 绝不回 idle
+    assert browser.discarded == [page]  # 弃用（真池 = 关掉它）
 
 
 @pytest.mark.asyncio
@@ -754,7 +790,189 @@ async def test_browser_click_navigation_is_revalidated():
     assert "protocol_blocked" in result.error_message
     assert result.data["action"] == "browser_click"
     assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
-    assert browser.released == [page]
+    assert browser.released == []
+    assert browser.discarded == [page]
+
+
+@pytest.mark.asyncio
+async def test_click_that_navigated_despite_timeout_is_success():
+    """C3a：跨页点击的"假失败"——动作已生效（URL 已变）却报 timeout（T6 冒烟实测 1/2）。
+
+    点击触发导航时 Playwright 的 click 等待会被导航打断并报 timeout；两侧 URL 一比就知道
+    点击其实生效了。按失败交出会把 P4 的成功任务算成失败，所以按"已生效"返回成功，
+    同时把原错误留在数据里做诊断（复查看的还是**跳转后的落点**）。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/start"})
+    page.click_url = "https://example.com/next"  # 点击后页面真的跳走了
+    page.fail_click = True  # click 报 timeout（导航打断）
+    page.fail_locator_evaluate = True  # JS 兜底也失败 → actions 交出错误结果
+
+    result = await ex.call("browser_click", {"ref": "e2"})
+
+    assert result.status == "success"
+    assert result.data["navigated"] is True
+    assert result.data["url"] == "https://example.com/next"
+    assert result.data["url_before"] == "https://example.com/start"
+    assert result.data["error_before_navigation"]["error_type"] == "timeout"
+    assert browser.released == [] and browser.discarded == []  # 页面留在原地
+    assert (await ex.call("browser_snapshot", {})).status == "success"
+
+
+@pytest.mark.asyncio
+async def test_click_failure_without_navigation_stays_error():
+    """负对照：URL 没变 → 点击就是真的失败了，不得被"提升"成成功（假成功更难查）。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/start"})
+    page.fail_click = True
+    page.fail_locator_evaluate = True
+
+    result = await ex.call("browser_click", {"ref": "e2"})
+
+    assert result.status == "error"
+    assert result.error_type == "timeout"
+    assert "navigated" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_click_into_a_browser_error_page_is_reported_as_navigation_failure():
+    """C3b：点击把页面带去 DNS 失败的地址 → 页面停在 ``chrome-error://chromewebdata/``。
+
+    这是**导航失败**（DNS 失败/连接被拒，P4 高频），不是策略违规：旧行为把错误页的 scheme
+    拿去 validate → ``protocol_blocked`` + ``navigation_blocked`` + 把真实网络故障记成
+    "安全策略拦截"（错误归因全错）。错误页按既有 F4 约定 **discard**（不 release、不 quarantine）。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/start"})
+    page.click_url = "chrome-error://chromewebdata/"
+    page.fail_click = True
+    page.fail_locator_evaluate = True
+
+    result = await ex.call("browser_click", {"ref": "e2"})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_failed"
+    assert "错误页" in result.error_message
+    assert result.data["action"] == "browser_click"
+    assert result.data["page_discarded"] is True
+    assert browser.released == []  # 错误页不回 idle（会被下一个消费者取走）
+    assert browser.discarded == [page]
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+
+
+@pytest.mark.asyncio
+async def test_execute_js_into_a_browser_error_page_is_navigation_failure():
+    """C3b 同一条修正对 JS 跳转同样成立：错误页 ≠ 策略违规（错的是网络，不是安全门）。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.evaluate_url = "chrome-error://chromewebdata/"
+
+    result = await ex.call("browser_execute_js", {"expression": "document.location.href"})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_failed"
+    assert result.data["action"] == "browser_execute_js"
+    assert browser.released == []
+    assert browser.discarded == [page]
+
+
+@pytest.mark.asyncio
+async def test_blank_page_after_an_action_is_not_a_policy_violation():
+    """空白页（``about:blank``，新建页面的初始状态）既不是跳转也不是违规 —— 放行、不弃用。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.evaluate_url = "about:blank"
+
+    result = await ex.call("browser_execute_js", {"expression": "document.title"})
+
+    assert result.status == "success"  # 动作本身的结果原样返回
+    assert browser.discarded == []
+    assert browser.released == []
+    assert (await ex.call("browser_snapshot", {})).status == "success"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_entry_rechecks_the_current_page_url():
+    """I1：snapshot 入口也复查当前页 URL——不看一眼就可能一直在违规页上取快照。
+
+    违规页（这里的 file:// 是覆盖范围外的路径带出去的）同样按 navigation_blocked + discard 处理。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.url = "file:///etc/passwd"  # 覆盖范围外的路径把页面带出去（测试缝）
+
+    result = await ex.call("browser_snapshot", {})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "protocol_blocked" in result.error_message
+    assert result.data["action"] == "browser_snapshot"
+    assert browser.discarded == [page]
+    assert browser.released == []
+
+
+@pytest.mark.asyncio
+async def test_snapshot_entry_allows_a_blank_page():
+    """负对照：``about:blank``（新建页面的初始状态）在入口复查里放行。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.url = "about:blank"
+
+    result = await ex.call("browser_snapshot", {})
+
+    assert result.status == "success"
+    assert browser.discarded == []
+
+
+@pytest.mark.asyncio
+async def test_browser_type_is_revalidated_before_returning():
+    """I1：type 走 JS 赋值兜底时同样能把页面带出去 → 返回前必须复查 URL。
+
+    （入参把关只挡 URL 参数；type 的参数是文本，页面上会发生什么只有动作后才知道。）
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.fail_fill = True  # Playwright 尝试全失败 → JS 赋值兜底
+    page.js_fallback_url = "file:///etc/passwd"  # 兜底的 JS 把页面带出去
+
+    result = await ex.call("browser_type", {"ref": "e2", "text": "hello"})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_blocked"
+    assert "protocol_blocked" in result.error_message
+    assert result.data["action"] == "browser_type"
+    assert browser.discarded == [page]
+    assert browser.released == []
+
+
+@pytest.mark.asyncio
+async def test_browser_type_into_the_same_page_still_succeeds():
+    """负对照：type 没把页面带出去 → 结果原样成功（复查不改变动作结果）。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+
+    result = await ex.call("browser_type", {"ref": "e2", "text": "hello"})
+
+    assert result.status == "success"
+    assert browser.discarded == []
 
 
 @pytest.mark.asyncio

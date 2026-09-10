@@ -260,6 +260,107 @@ async def test_hitl_interrupt_then_resume(tmp_path):
     assert resumed["stop_reason"] == "completed"
 
 
+# ── C1：HITL resume 闭环（人工反馈必须回到答案的上下文里） ───────────────────
+
+
+class LoginWallExecutor(StubExecutor):
+    """browser_open 命中登录墙：needs_human + 真实文案（D5/D6 桥的产出形状）。"""
+
+    def __init__(self, url: str = "https://example.com/login") -> None:
+        super().__init__()
+        self.calls: list[str] = []
+        self.url = url
+
+    async def call(self, name, arguments):
+        self.calls.append(name)
+        if name == "browser_snapshot":  # 新任务：还没有打开的页面（真实的首次调用）
+            return ToolResult(
+                status="error",
+                error_type="no_open_page",
+                error_message="还没有打开的页面",
+            )
+        if name == "browser_open":
+            return ToolResult(
+                status="success",
+                content=f"已打开 {self.url}",
+                data={
+                    "action": "browser_open",
+                    "url": self.url,
+                    "needs_human": True,
+                    "human_prompt": "页面需要登录：请在浏览器中手动登录后继续任务。",
+                    "intervention": "login",
+                },
+            )
+        return await super().call(name, arguments)
+
+
+class LoginHookedProvider(StubProvider):
+    """会被"过期提示"带偏的模型替身：看到 human_prompt 就复述"请手动登录"。
+
+    真实模型在 P3 final review C1 里就是这个形状：answer 只把 ``result_data``
+    （里面还挂着 ``human_prompt``）喂给它，人工反馈根本没进上下文。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.last_system_content = ""
+
+    async def chat(self, messages, *, model=None):
+        self.last_user_content = messages[-1].content
+        first = messages[0] if messages else None
+        self.last_system_content = first.content if first is not None and first.role == "system" else ""
+        if "人工反馈" in self.last_user_content:
+            return ChatResult(text="已基于人工反馈继续：登录后的页面已经打开。")
+        if "human_prompt" in self.last_user_content:
+            return ChatResult(text="请在浏览器中手动登录后继续任务。")
+        return ChatResult(text="（没有可用上下文）")
+
+
+@pytest.mark.asyncio
+async def test_hitl_resume_feeds_human_response_back_to_the_answer(tmp_path):
+    """C1：resume 后 answer 必须把**人工反馈**喂进上下文，并丢掉已过期的"请人工去做 X"提示。
+
+    P3 final review C1 实证：``human_response`` 是写-only 字段（hitl 节点写、全仓无读取方），
+    而 ``result_data`` 里仍带着 ``human_prompt="…请手动登录…"`` → resume 后的答案大概率
+    复述"请手动登录"，人工确认等于白做（HITL 全链路死胡同）。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+
+    tracer = JsonlTracer(trace_id="t16", out_dir=tmp_path / "traces")
+    ex = LoginWallExecutor()
+    provider = LoginHookedProvider()
+    graph = build_graph(ex, tracer, provider, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "c1-hitl"}}
+
+    # 任务文本里刻意不带 URL：带 URL 的任务按既有规则走 read_page（tier2），
+    # 而登录墙是 tier3 的 browser_open 走出来的（URL 由模型从任务里提取）
+    paused = await graph.ainvoke(AgentState(task="帮我点击页面上的登录按钮"), config=config)
+    assert paused["intent"] == "browser_task"
+    assert paused["pending_human_action"] is True
+    assert "browser_open" in ex.calls
+    assert paused["final_answer"] == ""  # 暂停在 hitl 节点
+
+    resumed = await graph.ainvoke(
+        Command(resume="我已经在浏览器里登录好了，现在停在账户页"), config=config
+    )
+    assert resumed["human_response"] == "我已经在浏览器里登录好了，现在停在账户页"
+    assert [name for name in ex.calls].count("browser_open") == 1  # resume 不重放工具
+
+    # ① 答案模型看到的 user prompt：人工反馈在里面，过期提示不在（数据里也不带）
+    prompt = provider.last_user_content
+    assert "我已经在浏览器里登录好了，现在停在账户页" in prompt
+    assert "人工反馈" in prompt
+    assert "手动登录" not in prompt  # 过期的 human_prompt 已从 data 里剔除
+    # system prompt 里把"人工已经做完"说清楚（否则模型会再请人工操作一遍）
+    assert "不要再让用户手动登录" in provider.last_system_content
+
+    # ② 最终答案：由人工反馈驱动，不再要求人工
+    assert "已基于人工反馈继续" in resumed["final_answer"]
+    assert "手动登录" not in resumed["final_answer"]
+    assert resumed["stop_reason"] == "completed"
+
+
 @pytest.mark.asyncio
 async def test_tool_failure_degrades_with_explicit_reason(tmp_path):
     """全策略失败：result_data 报 all_strategies_failed，degradation 逐次可追溯。"""
@@ -381,13 +482,27 @@ async def test_degradation_log_not_duplicated_when_execute_replays(tmp_path):
 
 
 class BrowserExecutor(StubExecutor):
-    """browser_task 链的替身：默认“没有打开的页面”（snapshot 失败 → open 兜底）。"""
+    """browser_task 链的替身：默认“没有打开的页面”（open 得先建页，snapshot 才能看）。
 
-    def __init__(self, *, page_open: bool = False, browser_error: str = "") -> None:
+    可编程缝：``page_open``（是否已有上一次运行留下的页面）、``open_error`` /
+    ``snapshot_error``（对应工具的失败 error_type，空串 = 成功）、``browser_error``
+    （整个 Tier3 不可用：每个浏览器工具都降级）。
+    """
+
+    def __init__(
+        self,
+        *,
+        page_open: bool = False,
+        browser_error: str = "",
+        open_error: str = "",
+        snapshot_error: str = "",
+    ) -> None:
         super().__init__()
         self.calls: list[tuple[str, dict]] = []
         self.page_open = page_open
         self.browser_error = browser_error
+        self.open_error = open_error
+        self.snapshot_error = snapshot_error
 
     async def call(self, name, arguments):
         self.calls.append((name, arguments))
@@ -398,7 +513,27 @@ class BrowserExecutor(StubExecutor):
                     error_type=self.browser_error,
                     error_message=f"浏览器工具失败：{self.browser_error}",
                 )
+            if name == "browser_open":
+                if self.open_error:
+                    return ToolResult(
+                        status="error",
+                        error_type=self.open_error,
+                        error_message=f"导航失败：{self.open_error}",
+                    )
+                self.page_open = True
+                url = arguments.get("url", "")
+                return ToolResult(
+                    status="success",
+                    content=f"已打开 {url}",
+                    data={"action": "browser_open", "url": url, "requested_url": url},
+                )
             if name == "browser_snapshot":
+                if self.snapshot_error:
+                    return ToolResult(
+                        status="error",
+                        error_type=self.snapshot_error,
+                        error_message=f"快照失败：{self.snapshot_error}",
+                    )
                 if not self.page_open:
                     return ToolResult(
                         status="error",
@@ -409,12 +544,8 @@ class BrowserExecutor(StubExecutor):
                 return ToolResult(
                     status="success",
                     content=refs,
-                    data={"url": "https://example.com/", "refs": refs},
+                    data={"action": "snapshot", "url": "https://example.com/", "refs": refs},
                 )
-            if name == "browser_open":
-                self.page_open = True
-                url = arguments.get("url", "")
-                return ToolResult(status="success", content=f"已打开 {url}", data={"url": url})
         return await super().call(name, arguments)
 
 
@@ -436,8 +567,13 @@ class FetchFailingExecutor(StubExecutor):
 
 
 @pytest.mark.asyncio
-async def test_browser_task_snapshots_first_then_opens(tmp_path):
-    """tier3 链：先看当前页（点/填都建立在已打开的页面上），没有页面才 open。"""
+async def test_browser_task_navigates_then_observes_without_fake_degradation(tmp_path):
+    """C2a：tier3 链改成**先导航后观察** —— 新任务不再先造一次假的 no_open_page 降级。
+
+    P3 final review C2a：旧链 [snapshot, open] 让每个新任务（还没有当前页）都先产出一条
+    ``no_open_page`` 降级记录 —— 任务其实成功了，P4 却会把每个 tier3 任务算一次失败。
+    导航成功也不等于任务完成：任务目标在页面上，所以链继续走观察步（snapshot）。
+    """
     tracer = JsonlTracer(trace_id="t10", out_dir=tmp_path / "traces")
     ex = BrowserExecutor(page_open=False)
     provider = StubProvider()
@@ -445,35 +581,91 @@ async def test_browser_task_snapshots_first_then_opens(tmp_path):
     result = await graph.ainvoke(AgentState(task="帮我比价 iPhone 15 和 小米 15"))
     assert result["intent"] == "browser_task"
     assert result["tier"] == "tier3"
-    assert [name for name, _ in ex.calls] == ["browser_snapshot", "browser_open"]
-    assert ex.calls[0][1] == {}  # snapshot 无参数：不需要模型提取
-    assert ex.calls[1][1]["url"] == "https://example.com"
-    assert result["result_data"]["url"] == "https://example.com"
-    assert [d["strategy"] for d in result["degradation_log"]] == ["browser_snapshot"]
-    assert result["degradation_log"][0]["error"] == "no_open_page"
+    assert [name for name, _ in ex.calls] == ["browser_open", "browser_snapshot"]
+    assert ex.calls[0][1]["url"] == "https://example.com"  # 导航参数来自模型提取
+    assert ex.calls[1][1] == {}  # snapshot 无参数：不需要模型提取
+    # ← C2a 核心：没有假降级（旧行为固定产出一条 no_open_page）
+    assert result["degradation_log"] == []
+    assert result["result_data"]["refs"].startswith("- button")
+    assert result["result_data"]["navigated"] is True
+    assert result["result_data"]["opened_url"] == "https://example.com"
+    assert "partial" not in result["result_data"]
     assert result["stop_reason"] == "completed"
-    # 两次尝试都有 tool_call 跟踪（失败一次、成功一次）
+    # 两步都有 tool_call 跟踪（都成功）
     lines = (tmp_path / "traces" / "t10.jsonl").read_text(encoding="utf-8").strip().splitlines()
     events = [json.loads(line) for line in lines]
     tool_calls = [e for e in events if e["event_type"] == "tool_call"]
     assert [(e["data"]["tool"], e["data"]["status"]) for e in tool_calls] == [
-        ("browser_snapshot", "error"),
         ("browser_open", "success"),
+        ("browser_snapshot", "success"),
     ]
 
 
 @pytest.mark.asyncio
-async def test_browser_task_prefers_current_page_snapshot(tmp_path):
-    """已有打开的页面：snapshot 即成功 → 链不继续（不再重复导航）。"""
+async def test_browser_task_navigates_even_when_a_page_is_already_open(tmp_path):
+    """C2b：当前页可能是上一次运行/别的会话留下的 —— 拿它的快照答本任务 = 假成功 + 答非所问。
+
+    所以链不再"有页面就停在 snapshot"：任务里有 URL 就导航过去，快照拍的是任务目标页面。
+    """
     tracer = JsonlTracer(trace_id="t11", out_dir=tmp_path / "traces")
     ex = BrowserExecutor(page_open=True)
     provider = StubProvider()
     graph = build_graph(ex, tracer, provider)
     result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
-    assert [name for name, _ in ex.calls] == ["browser_snapshot"]
+    assert [name for name, _ in ex.calls] == ["browser_open", "browser_snapshot"]
+    assert ex.calls[0][1]["url"] == "https://example.com"  # 重新导航到任务目标
     assert result["result_data"]["refs"].startswith("- button")
+    assert result["result_data"]["navigated"] is True
     assert result["degradation_log"] == []
-    assert provider.structured_calls == 0  # 规则命中 + snapshot 无参数 → 零模型调用
+    assert result["stop_reason"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_browser_task_without_navigable_url_is_partial(tmp_path):
+    """C2b：任务里没有可导航的 URL（open 失败）→ 只观察了当时开着的页面，必须标 partial。
+
+    "完成了"不能用来描述"只是看了一眼当时正好开着的页面"：那个页面与用户目标的匹配关系
+    从未被验证（它可能是上一次运行/别的会话留下的）——未与目标匹配的快照不得报 completed。
+    """
+    tracer = JsonlTracer(trace_id="t17", out_dir=tmp_path / "traces")
+    ex = BrowserExecutor(page_open=True, open_error="invalid_url")
+    provider = StubProvider()
+    graph = build_graph(ex, tracer, provider)
+    result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
+    assert [name for name, _ in ex.calls] == ["browser_open", "browser_snapshot"]
+    assert result["result_data"]["refs"].startswith("- button")  # 页面内容仍然如实交出
+    assert result["result_data"]["navigated"] is False
+    assert result["result_data"]["partial"] is True
+    assert result["result_data"]["partial_reason"] == "no_navigation_for_task"
+    assert result["stop_reason"] == "partial"  # ← 不得报 completed
+    # 降级记录如实：导航确实失败了（不是假失败，是真没导航）
+    assert [d["strategy"] for d in result["degradation_log"]] == ["browser_open"]
+    assert result["degradation_log"][0]["error"] == "invalid_url"
+    # 答案模型被告知这次是 partial，不许说任务完成
+    assert "partial" in provider.last_user_content
+    assert "没有完成与任务目标匹配" in provider.last_user_content
+
+
+@pytest.mark.asyncio
+async def test_browser_task_opened_but_unobserved_is_partial(tmp_path):
+    """C2：导航成功但观察步失败 → 数据只有"打开了哪个页面"，没有页面内容 —— 仍不得报 completed。
+
+    任务目标在页面上；只报"已打开 URL"对"打开它并告诉我…"类任务就是假成功。
+    """
+    tracer = JsonlTracer(trace_id="t18", out_dir=tmp_path / "traces")
+    ex = BrowserExecutor(page_open=False, snapshot_error="empty_snapshot")
+    provider = StubProvider()
+    graph = build_graph(ex, tracer, provider)
+    result = await graph.ainvoke(AgentState(task="帮我比价 iPhone 15 和 小米 15"))
+    assert [name for name, _ in ex.calls] == ["browser_open", "browser_snapshot"]
+    assert result["result_data"]["url"] == "https://example.com"  # 导航数据保留
+    assert result["result_data"]["navigated"] is True
+    assert result["result_data"]["opened_url"] == "https://example.com"
+    assert result["result_data"]["partial"] is True
+    assert result["result_data"]["partial_reason"] == "no_observation_after_navigation"
+    assert result["stop_reason"] == "partial"
+    assert [d["strategy"] for d in result["degradation_log"]] == ["browser_snapshot"]
+    assert "没有完成与任务目标匹配" in provider.last_user_content
 
 
 @pytest.mark.asyncio
@@ -484,7 +676,7 @@ async def test_browser_task_without_browser_degrades_honestly(tmp_path):
     result = await graph.ainvoke(AgentState(task="帮我点击登录按钮"))
     assert result["result_data"]["error"] == "all_strategies_failed"
     degradation = result["result_data"]["degradation"]
-    assert [d["strategy"] for d in degradation] == ["browser_snapshot", "browser_open"]
+    assert [d["strategy"] for d in degradation] == ["browser_open", "browser_snapshot"]
     assert all(d["error"] == "browser_unavailable" for d in degradation)
     assert result["degradation_log"] == degradation
     assert "无法完成" in result["final_answer"]

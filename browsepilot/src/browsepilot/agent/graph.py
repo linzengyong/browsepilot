@@ -30,6 +30,31 @@ from browsepilot.model.provider import ModelProvider
 from browsepilot.model.structured import StructuredOutputError
 
 
+def _human_feedback_note(human_response: str) -> str:
+    """resume 回来的人工反馈 → 答案 prompt 里的一行（C1）；空串 = 本轮没有人工介入。
+
+    人工反馈不是工具结果，所以不塞进 ``result_data``（那是工具产出的数据面）：
+    它是 ``human_prompt`` 的另一面——一个是"请人工去做 X"，一个是"人工做完了"。
+    """
+    if not human_response:
+        return ""
+    return f"\n人工反馈（人工已完成上一步操作）：{human_response}"
+
+
+def _answer_payload(state: AgentState) -> dict:
+    """进答案模型的数据（C1）：resume 之后 ``human_prompt`` 已经过期。
+
+    ``human_prompt`` 是**打断时对人工的请求**（"请在浏览器中手动登录后继续任务。"），
+    人工反馈到了就再也没人要做这件事了；留在数据里会把模型带回"再请用户手动登录一次"
+    的老路（P3 final review C1：resume 白做）。所以移除它，换上人工反馈本身。
+    """
+    data = dict(state.result_data)
+    if state.human_response:
+        data.pop("human_prompt", None)
+        data["human_response"] = state.human_response
+    return data
+
+
 def _merge_degradation(existing: list[dict], new: list[dict]) -> list[dict]:
     """合并降级记录：按 (strategy, error) 去重，保留首次出现的那条。
 
@@ -47,6 +72,58 @@ def _merge_degradation(existing: list[dict], new: list[dict]) -> list[dict]:
     return merged
 
 
+def _navigation_url(navigation: dict) -> str:
+    """导航结果里的落点（最终 URL 优先，取不到就退到请求的 URL）。"""
+    return str(navigation.get("url") or navigation.get("requested_url") or "")
+
+
+def _observation_result(data: dict, navigation: dict | None) -> dict:
+    """browser_task 的**观察收尾**（C2）：数据里标清本任务到底有没有导航过。
+
+    没有导航就观察 = 看到的是"当时正好开着的页面"（上一次运行/别的会话留下的都可能）：
+    它与用户目标的匹配关系从未被验证，所以标 ``partial`` —— 未与任务目标匹配的快照
+    不得报 completed（否则 P4 拿到的是假成功 + 答非所问的答案）。
+    """
+    if navigation is None:
+        return {
+            **data,
+            "navigated": False,
+            "partial": True,
+            "partial_reason": "no_navigation_for_task",
+        }
+    return {**data, "navigated": True, "opened_url": _navigation_url(navigation)}
+
+
+def _navigation_only_result(navigation: dict) -> dict:
+    """browser_task 的**导航收尾**（C2）：导航成功但没取到页面内容。
+
+    数据只有"打开了哪个页面"——对"打开它并告诉我…"类任务而言，没看到内容就是没完成，
+    所以标 ``partial``（不是失败：页面确实开了；但绝不能算 completed）。
+    """
+    return {
+        **navigation,
+        "navigated": True,
+        "opened_url": _navigation_url(navigation),
+        "partial": True,
+        "partial_reason": "no_observation_after_navigation",
+    }
+
+
+def _partial_note(data: dict) -> str:
+    """partial 结果 → 答案 prompt 里的一行（C2）；非 partial 时为空串。
+
+    数据里的 ``partial_reason`` 是给机器看的稳定码，这行是给模型的指令：
+    "完成了"不能用来说"只是看了一眼当时正好开着的页面"。
+    """
+    if not data.get("partial"):
+        return ""
+    return (
+        "\n注意：数据里 partial=true —— 这次**没有完成与任务目标匹配的核查**"
+        "（要么只观察了当时打开的页面，要么只打开了页面却没取到内容）。"
+        "回答时明确说出已经看到什么、还有什么没完成，不要说任务已完成，也不要编造页面内容。"
+    )
+
+
 def build_graph(
     executor: ToolExecutor,
     tracer: Tracer,
@@ -59,14 +136,24 @@ def build_graph(
 
     # 降级策略链：weather 城市未命中 → 用 task 原文搜索兑底；
     # read_page（tier2）HTTP 抓取失败 → 升级到真浏览器 browser_open（同一意图，降级链回退）；
-    # browser_task（tier3）先看当前页（点/填都建立在已打开的页面上），没有页面才 open；
+    # browser_task（tier3）**先导航后观察**（C2）：任务里有 URL 就先去那个页面，再把页面内容取回来。
+    #   旧链 [snapshot, open] 的两个真实性问题（P3 final review C2）：新任务必产一次假的
+    #   no_open_page 降级（P4 会把每个 tier3 任务算一次失败）；有页面时停在 snapshot，
+    #   而那个页面可能是上一次运行/别的会话留下的 —— 用别的页面的数据答本任务却报
+    #   stop_reason=completed（假成功 + 答非所问）。
     # search 无有意义的回退，失败即明确降级（all_strategies_failed）。
     _STRATEGY_CHAIN: dict[str, list[str]] = {
         "weather": ["weather", "search"],
         "search": ["search"],
         "read_page": ["fetch_page", "browser_open"],
-        "browser_task": ["browser_snapshot", "browser_open"],
+        "browser_task": ["browser_open", "browser_snapshot"],
     }
+
+    # 链上"成功后仍需继续"的步骤（C2）：browser_open 只是**导航**，而浏览器任务的目标在页面上
+    # ——"已打开 https://…"不等于任务完成。所以 open 成功后继续走 browser_snapshot，
+    # 观察结果才是任务的数据（导航信息并进 data）；观察失败时数据只到"打开了哪个页面"，
+    # 结果按 partial 上报（见 _observation_result / _navigation_only_result）。
+    _CONTINUE_AFTER: dict[str, str] = {"browser_open": "browser_snapshot"}
 
     # 工具 → 参数模型。``None`` = 工具不需要参数（不用花一次模型调用去提取）。
     # Tier3 的工具参数形态由 BrowserParams 描述（url/target/text/direction/expression），
@@ -120,11 +207,21 @@ def build_graph(
         首次尝试按 intent 的 Params 结构化提取；天气回退到 search 时不再
         结构化提取，直接用 task 原文作 query；无参数工具（browser_snapshot）同样跳过提取。
         全败 → result_data 返回 all_strategies_failed + degradation；全程 tool_call trace 可追溯。
+
+        tier3（browser_task）的额外语义（C2，见 :func:`_observation_result`）：
+
+        - ``browser_open`` 成功**不是终点**：继续走 chain 里的 ``browser_snapshot``
+          （``_CONTINUE_AFTER``），因为任务目标在页面上，导航信息只是数据的一半。
+        - 观察收尾必须能区分"本任务导航过"与"只是看了一眼当时开着的页面"：
+          没导航过的快照标 ``partial``（不得报 completed）。
+        - 导航成功但观察失败 → 标 ``partial``（打开了页面，但没取到内容）。
         """
         with tracer.span("execute", intent=state.intent):
             chain = _STRATEGY_CHAIN.get(state.intent, ["search"])
             degradation: list[dict] = []
-            for tool_name in chain:
+            #: 本任务里成功导航的 open 结果 data（None = 没导航过）
+            navigation: dict | None = None
+            for index, tool_name in enumerate(chain):
                 params_model = _PARAM_MODELS[tool_name]
                 try:
                     if params_model is None:
@@ -173,8 +270,20 @@ def build_graph(
                                 state.degradation_log, degradation
                             ),
                         }
+                    follow_up = _CONTINUE_AFTER.get(tool_name)
+                    if follow_up is not None and follow_up in chain[index + 1 :]:
+                        # 导航步成功：继续走观察步（导航信息随结果一起进 data）
+                        navigation = dict(tool_result.data)
+                        continue
+                    result_data = tool_result.data
+                    if state.intent == "browser_task":
+                        result_data = (
+                            _observation_result(tool_result.data, navigation)
+                            if tool_name == "browser_snapshot"
+                            else _navigation_only_result(tool_result.data)
+                        )
                     return {
-                        "result_data": tool_result.data,
+                        "result_data": result_data,
                         "stop_reason": "",
                         "degradation_log": _merge_degradation(
                             state.degradation_log, degradation
@@ -187,12 +296,21 @@ def build_graph(
                         "message": tool_result.error_message,
                     }
                 )
+            if navigation is not None:
+                # 导航成功、观察步失败（C2）：结果仍是"已打开页面"，但**没有页面内容** ——
+                # 标 partial 而不是 completed（任务目标在页面上，没看到内容就等于没完成）；
+                # 观察步失败本身已经记在 degradation 里，不掩盖。
+                return {
+                    "result_data": _navigation_only_result(navigation),
+                    "degradation_log": _merge_degradation(state.degradation_log, degradation),
+                }
             return {
                 "result_data": {"error": "all_strategies_failed", "degradation": degradation},
                 "degradation_log": _merge_degradation(state.degradation_log, degradation),
             }
 
     async def answer(state: AgentState) -> dict:
+        """合成最终回答；`stop_reason` 带出这次到底完成了没有（C2：partial 不得报 completed）。"""
         with tracer.span("answer"):
             if state.intent in ("chitchat", "knowledge_qa"):
                 # 直答路径同样把历史摘要放进上下文；无历史时保持原有 prompt
@@ -216,23 +334,36 @@ def build_graph(
                 text = f"抱歉，这个任务暂时无法完成：{message}。可以换个说法试试。"
             else:
                 history_text = "\n".join(state.history[-5:]) if state.history else "（无历史）"
+                # C1：人工反馈进上下文（resume 后不读 human_response 等于把人工确认丢掉），
+                # 并在 system 里把"人工已经做完"说清楚——否则模型会顺着数据里那句
+                # "请手动登录"再要求人工操作一遍。
+                human_note = _human_feedback_note(state.human_response)
+                system_content = "你是信息助手。用中文简洁回答，基于给定数据，不要编造。"
+                if human_note:
+                    system_content += (
+                        "人工已经完成了先前需要人工处理的操作（登录/人机验证等）；"
+                        "请基于人工反馈继续完成任务，不要再让用户手动登录或再次人工确认。"
+                    )
                 answer_result: ChatResult = await provider.chat(
                     [
-                        Message(
-                            role="system",
-                            content="你是信息助手。用中文简洁回答，基于给定数据，不要编造。",
-                        ),
+                        Message(role="system", content=system_content),
                         Message(
                             role="user",
                             content=(
                                 f"历史对话：\n{history_text}\n\n"
-                                f"任务：{state.task}\n数据：{json.dumps(state.result_data, ensure_ascii=False)}"
+                                f"任务：{state.task}\n"
+                                f"数据：{json.dumps(_answer_payload(state), ensure_ascii=False)}"
+                                f"{_partial_note(state.result_data)}"
+                                f"{human_note}"
                             ),
                         ),
                     ]
                 )
                 text = answer_result.text
-            return {"final_answer": text, "stop_reason": "completed"}
+            # C2：partial 是**第三种**结果（不是 completed、也不是 error）——
+            # 只观察了未导航的页面 / 只打开了页面没看到内容，都必须如实标出来。
+            stop_reason = "partial" if state.result_data.get("partial") else "completed"
+            return {"final_answer": text, "stop_reason": stop_reason}
 
     async def hitl(state: AgentState) -> dict:
         """Human-in-the-loop：interrupt 暂停执行，resume 后带上人工确认回 answer。"""
