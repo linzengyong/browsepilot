@@ -183,3 +183,126 @@ except StructuredOutputError:
 2. **评测数据驱动的规则调整**：本次 12/13 是"评测场景 + 人工样本"的小样本；P4 用评测集回归，规则增删以"评测通过率不下降"为准，拒绝拍脑袋加关键词。
 3. **规则与模型的分工边界**：目前规则覆盖 5 类意图；新增意图（如"对比"、"翻译"）先加规则还是先进模型，需要评测数据说话。
 4. **天气链路端到端零 LLM**（见上）：参数提取规则化后，Tier1 天气可完全脱离模型运行，成本与延迟双降。
+
+---
+
+# P3 补充：tier3 路由的「抢匹配」回归 —— 关键词路由的假阳性失败模式
+
+> 采集时间：2026-09-10（P3 收尾提交 `5ae1a9c` 之后，v2.0 分支）
+> 数据说明：规则判定用真实代码 `classify_by_rules` 复跑（下方有原始输出）；修复前后代码见 commit `f907680` / `8dbbb7b`；行为已钉进 `tests/test_agent/test_router.py`。
+
+## 背景：规则表新增第 6 类意图 browser_task（tier3）
+
+P3 给意图系统加了浏览器任务意图，规则表位置（`router.py::_RULES`）：
+
+```
+weather → read_page → knowledge_qa → browser_task → search → chitchat
+```
+
+- `browser_task` 排在 knowledge_qa 之后（"什么是表单登录"这类教科书提问仍归 knowledge_qa）、search 之前（带站点/交互标记的任务比泛化的"搜索一下"更具体）。
+- tier3 策略链是 `["browser_snapshot", "browser_open"]`（`graph.py::_STRATEGY_CHAIN`）——**没有 search 回退**：这些任务被当成"去页面上办事"，而不是"要一份资料"。
+- 规则表位置=优先级的设计来自 P1（用顺序显式裁决关键词打架，"knowledge_qa 必须在 search 之前"）；P3 把它复制到了第 6 类意图。
+
+## Bug：单字弱动词抢走 search 的既有匹配（评审发现）
+
+初始实现（`f907680`）把 browser_task 写成一张纯关键词表（原文一词一行，此处压缩排版）：
+
+```python
+(
+    "browser_task",
+    "tier3",
+    [
+        # 交互动作（在页面上操作元素）
+        "点击", "填写", "输入", "提交", "勾选", "选择", "登录", "注册", "表单", "搜索框",
+        # 电商/站点（含技能的触发词：比价、购物、京东…）
+        "比价", "购物", "下单", "加购", "加入购物车", "购物车", "结算", "商城",
+        "京东", "淘宝", "天猫", "拼多多",
+    ],
+),
+```
+
+判定就是 `any(k in text for k in keywords)`。评审探针 5 例全部被抢成 tier3：
+
+| 探针 | 抢它的词 | 抢走之前的既有匹配 | 修复前的下场 |
+|------|---------|------------------|------------|
+| 为什么选择 Python 而不是 Java | 选择 | search（关键词"为什么"） | tier3 链无 search 回退 → `all_strategies_failed` |
+| 查一下怎么提交表单 | 提交 | search（关键词"查一下"） | 同上 |
+| 选择哪个框架比较好 | 选择 | 无（规则层本不命中，交模型） | 同上 |
+| Python 输入输出教程 | 输入 | 无 | 同上 |
+| git 提交规范 | 提交 | 无 | 同上 |
+
+为什么会被抢（两个原因叠加）：
+
+1. **泛化动词做裸子串匹配**："选择/提交/输入"是日常提问里的高频词——"选择"出现在任何技术选型问题里，"提交"出现在任何 Git 提问里。
+2. **规则顺序放大了假阳性**：browser_task 在 search 之前，"为什么选择…"本可命中 search 的"为什么"，但循环先撞上 browser_task 就 return 了。顺序裁决保证了"具体规则优先"，但"具体性"是靠词表声明的，不是靠匹配质量保证的。
+
+用户可见性：tier3 没有 search 兜底，规则抢走 = 直接进一条没有回退的策略链，报 `all_strategies_failed`。这不是"分类错了但能救"，而是"用户看到一个本不该失败的失败"。**关键词路由的假阳性成本不对称**：假阴性回退到模型（可恢复），假阳性提交给无兜底的链（不可恢复）。
+
+## 修复：强词/弱词两段式 + 页面上下文共现 + 求知守卫（commit `8dbbb7b`）
+
+`browser_task` 的关键词位改成 `None`，由 `_is_browser_task` 显式求值（位置仍表达优先级）；判定拆三层（`router.py` 现文，压缩排版：省略类型标注与 docstring 全文）：
+
+```python
+_SITE_WORDS: tuple[str, ...] = ("比价", "购物", "下单", "加购", "加入购物车", "购物车",
+                                "结算", "商城", "京东", "淘宝", "天猫", "拼多多")
+"""电商/站点词（含技能触发词）：本身就是"去这个网站办事"的信号。"""
+
+_BROWSER_STRONG_KEYWORDS = (*_SITE_WORDS, "搜索框", "浏览器")
+_BROWSER_WEAK_KEYWORDS = ("点击", "填写", "输入", "提交", "勾选", "选择", "登录", "注册", "表单")
+
+_BROWSER_CONTEXT_RE = re.compile(r"页面|按钮|表单|框(?!架)|网站|" + "|".join(map(re.escape, _SITE_WORDS)))
+_BROWSER_INFO_SEEKING_RE = re.compile(r"怎么|如何|为什么|教程|规范|指南|入门")
+
+def _is_browser_task(text: str) -> bool:
+    if any(k in text for k in _BROWSER_STRONG_KEYWORDS):
+        return True
+    if _BROWSER_INFO_SEEKING_RE.search(text):
+        return False
+    return any(k in text for k in _BROWSER_WEAK_KEYWORDS) and bool(_BROWSER_CONTEXT_RE.search(text))
+```
+
+三个设计点：
+
+1. **强词免上下文**：站点/电商词（"去这个网站办事"的明确信号）+ "搜索框"/"浏览器"——单独出现即 tier3。
+2. **弱词要共现**：泛化交互动词必须与页面上下文标记同现（"点击登录按钮"）；`框(?!架)` 负向前瞻是关键细节——裸"框"算页面标记（输入框/搜索框），"框架"不算（"选择哪个框架比较好"是技术选型提问）。
+3. **求知守卫**：`怎么|如何|为什么|教程|规范|指南|入门` 出现即弱词不成命中——问"怎么做"不等于"去做"。守卫只对弱词生效，强词（京东/比价）不受限。
+
+注意没有改规则顺序，也没有增加任何模型调用：修复全部在判定条件里（多一次正则），"更聪明的规则"不等于"更贵的分类"。
+
+## 验证：回到 pre-tier3 行为（真实复跑输出）
+
+修复目标不是"调参到能过"，而是**与加 tier3 规则之前的判定一致**（测试注释给出的基准：`git show 9567a90:browsepilot/src/browsepilot/agent/router.py`）。用当前代码复跑 8 个样本的原始输出：
+
+```
+'为什么选择 Python 而不是 Java' -> ('search', 'tier1', 1.0)
+'查一下怎么提交表单' -> ('search', 'tier1', 1.0)
+'选择哪个框架比较好' -> None
+'Python 输入输出教程' -> None
+'git 提交规范' -> None
+'帮我填写表单并提交' -> ('browser_task', 'tier3', 1.0)
+'在页面上输入关键词' -> ('browser_task', 'tier3', 1.0)
+'用浏览器帮我看看' -> ('browser_task', 'tier3', 1.0)
+```
+
+- 前两条回到 **search**（P1 就有的匹配，tier1/1.0）；后三条回到 **None**（规则层不命中，交模型兜底——与 pre-tier3 一致）。
+- 后三个正样本证明共现/强词还能抓住真交互任务（只加守卫不加同现就只能等死）。
+- 行为已钉进 `tests/test_agent/test_router.py`（`8dbbb7b` 新增）：`test_weak_interaction_words_do_not_steal_search`（参数化 2 例）、`test_weak_interaction_words_alone_stay_out_of_tier3`（参数化 3 例，含"框架"细节）、`test_weak_interaction_words_with_page_context_are_still_tier3`、`test_strong_site_words_need_no_context`。复跑：`uv run pytest tests/test_agent/test_router.py -q` → **19 passed**。
+- 该回归的"不抢"直接约束来自 T4 任务书（"不得抢既有匹配"），4 条不抢测试在实现前就已通过（`task-4-report.md`）——说明它们 pin 的是既有行为，不是新行为；修复后全套 529 passed（`8dbbb7b`，progress 记录）。
+
+## 残留与一般化教训
+
+- **残留**（progress.md T4 记账）：强关键词仍会被问题式短语触发——"为什么京东比淘宝便宜" → tier3（京东是强词，求知守卫对强词不生效）。规则路由的调优没有终点，只有"用评测集说话"（P4 钩子）。
+- **教训一**：给规则表加一条"更具体"的规则时，先问它的 precision 会不会伤到既有匹配；词表位置上的"具体"不等于判定上的"精确"。
+- **教训二**：泛化动词（选择/提交/输入…）裸用就是假阳性机器；把"具体性"从词表升级为判定条件（强词/共现/守卫）是这一类的通用修复模式。
+- **教训三**：规则抢走的代价取决于该规则背后的策略链——有兜底的意图抢错了还能降级，无兜底的意图（tier3）抢错就是硬失败。规则优先级设计应把"链的鲁棒性"也算进去。
+
+## P3 代码位置（补充索引）
+
+| 内容 | 位置 |
+|------|------|
+| tier3 规则引入（含被修复的裸关键词表） | commit `f907680`；`git show f907680 -- src/browsepilot/agent/router.py` |
+| 强/弱词拆分 + 共现 + 求知守卫（修复） | commit `8dbbb7b`；`router.py::_SITE_WORDS`、`_BROWSER_STRONG_KEYWORDS`、`_BROWSER_WEAK_KEYWORDS`、`_BROWSER_CONTEXT_RE`、`_BROWSER_INFO_SEEKING_RE`、`_is_browser_task` |
+| 两段式判定接入规则循环（keyword=None 分支） | `router.py::classify_by_rules` |
+| tier3 策略链（无 search 兜底） | `graph.py::_STRATEGY_CHAIN` |
+| 回归测试（5 探针 + 3 正样本） | `tests/test_agent/test_router.py` |
+| pre-tier3 基准代码（期望值来源） | `git show 9567a90:browsepilot/src/browsepilot/agent/router.py` |

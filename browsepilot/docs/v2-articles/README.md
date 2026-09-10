@@ -6,8 +6,10 @@
 |---|------|------|---------|
 | 1 | 从"最短路径"到"工程化"：一次 Vibe Coding 的重构实录 | 起草中 | article-1-material.md |
 | 2 | LLM 结构化输出之战：如何让 AI 稳定返回 JSON | P1 实战案例已补 | article-2-notes.md |
-| 3 | Agent 的"大脑"：意图识别系统的设计与演进 | 起草中，素材见 article-3-material.md | article-3-material.md |
+| 3 | Agent 的"大脑"：意图识别系统的设计与演进 | 起草中；P3 补 tier3 抢匹配回归故事 | article-3-material.md |
 | 4 | Agent 的"体检"：如何构建评测集与评测体系 | P4 阶段产出 | — |
-| 5 | Agent 的"黑匣子"：可观测性系统的设计与实现 | P2 阶段产出 | article-5-material.md |
+| 5 | Agent 的"黑匣子"：可观测性系统的设计与实现 | P2 素材 + P3 Tier3 trace / HITL 事件链 | article-5-material.md |
+
+> P3 补充（2026-09-10）：文章 3 的 tier3 路由抢匹配回归（commit `8dbbb7b`）、文章 5 的 Tier3 浏览器 trace 与 `human_pending` 事件链已入素材。
 
 > 联动规则：文章 1 的 "before" 数据在 P0 阶段采集（重构刚开始、旧代码状态最新鲜）；其余文章随阶段推进补充素材。

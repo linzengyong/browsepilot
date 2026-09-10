@@ -315,3 +315,145 @@ uv run uvicorn browsepilot.app.main:app --port 8001
 - "llm_call 的缺席，就是这次降级回答零 token 的证据"——demo-b 的一行版。
 - "trace 的边界不是任务，是 tracer 的生命周期"——粒度问题的一行版。
 - "端口比实现先到：Langfuse/LangSmith 一行代码都没写，换 sink 的路径已经画好了。"
+
+---
+
+# P3 补充：Tier3 浏览器层 —— 真实 trace、降级与 HITL 事件链
+
+> 采集时间：2026-09-10（P3 收尾提交 `5ae1a9c` 之后，v2.0 分支）
+> 数据说明：主证据是 P3 T6 冒烟（真 msedge 浏览器 + 真模型 E2E）留下的两份真实 trace；`docs/v2-p3-smoke.md`（commit a12cc22，423 行）是已入库的文字记录。所有片段按原文复制，不可得处显式标注。
+
+## 数据在哪（先看这个，避免找不到）
+
+| 产物 | 采集时位置 | 内容 |
+|------|-----------|------|
+| L2 真模型 E2E trace（11 行） | `%TEMP%\t6-e2e-qn_ad4uc\traces\t6-e2e.jsonl` | 任务「在 www.bing.com 的搜索框里搜索 Python 3.13」的 tier3 全链路 |
+| L1.5 HITL trace（10 行） | `%TEMP%\t6-hitl-sh8bybzr\traces\t6-hitl.jsonl` | zhihu 登录墙 → `human_pending` |
+| 冒烟脚本与日志（未入库） | `%TEMP%\t6-smoke\layer2_e2e.py`、`layer15_hitl.py`、`layer2.log`、`layer15.log` | SSE 序列 + trace 摘要；smoke 文档 §3-f/§3-g 有可复跑片段 |
+| 运行 state（LangGraph checkpoint） | `%TEMP%\t6-e2e-qn_ad4uc\checkpoints.sqlite` | 本次 L2 运行的 `degradation_log`（唯一盘上证据，见 §5） |
+
+**`data/traces/*.jsonl` 里没有 tier3 事件**：共 98 个文件，`grep -l browser` **0 命中**。原因是 T6 脚本把 `trace_dir` 指到 `tempfile.mkdtemp()`（smoke §3-f 片段：`JsonlTracer(trace_id="t6-e2e", out_dir=tmp / "traces")`），没有写进语料目录。复跑命令见 smoke §0；`%TEMP%` 文件重启即失，已入库的只有 smoke 文档。
+
+## 1. 一条 tier3 trace 的逐行解读（L2 真模型 E2E）
+
+环境：deepseek/deepseek-chat、msedge headless、`browser_max_pages=3`；整轮 7.5s（smoke §2 L2 与 `layer2.log`）。t0 = `2026-09-10T14:57:28.667387Z`。
+
+原文两行（`t6-e2e.jsonl` 逐字复制）：
+
+```json
+{"trace_id": "t6-e2e", "span_id": "c0380fba", "parent_span_id": null, "node": "classify", "event_type": "decision", "timestamp": "2026-09-10T14:57:28.667984+00:00", "data": {"intent": "browser_task", "tier": "tier3", "confidence": 1.0}, "duration_ms": null}
+{"trace_id": "t6-e2e", "span_id": "0d6f77af", "parent_span_id": null, "node": "execute", "event_type": "tool_call", "timestamp": "2026-09-10T14:57:28.683346+00:00", "data": {"tool": "browser_snapshot", "status": "error"}, "duration_ms": null}
+```
+
+11 条事件全表（t+ 为相对 t0 的毫秒数，由 timestamp 相减得来；span_id 即原文全值）：
+
+| # | t+ms | node | 事件 | span_id | data | 解读 |
+|---|------|------|------|---------|------|------|
+| 1 | 0.00 | classify | node_start | `88b0598e` | `{"task": "在 www.bing.com 的搜索框里搜索 Python 3.13"}` | 任务进入 |
+| 2 | 0.60 | classify | decision | `c0380fba` | `{"intent": "browser_task", "tier": "tier3", "confidence": 1.0}` | **规则命中**（tier3 新意图） |
+| 3 | 0.94 | classify | node_end | `88b0598e` | `{}` | duration 0.9451ms；#1/#3 同 span，**span 内无 llm_call = 分类零模型调用** |
+| 4 | 15.55 | execute | node_start | `0d0d2c58` | `{"intent": "browser_task"}` | 进策略链 `["browser_snapshot", "browser_open"]` |
+| 5 | 15.96 | execute | tool_call | `0d6f77af` | `{"tool": "browser_snapshot", "status": "error"}` | 还没开页面（`no_open_page`，见 §5）→ 降级链第一跳失败 |
+| 6 | 3949.15 | llm | llm_call | `fc4b943b` | `{"kind": "structured", "model": "", "session_id": "e8a45d51-…"}` | BrowserParams 参数提取；duration **3932.87ms**（真模型大头） |
+| 7 | 5315.16 | execute | tool_call | `b7bb6f20` | `{"tool": "browser_open", "status": "success"}` | 降级链第二跳成功（bing 200，重定向 cn.bing.com） |
+| 8 | 5315.55 | execute | node_end | `0d0d2c58` | `{}` | duration **5300.01ms**，内含两次工具尝试 |
+| 9 | 5316.78 | answer | node_start | `1f6d3754` | `{}` | — |
+| 10 | 6308.15 | llm | llm_call | `9923094b` | `{"kind": "chat", "model": "", "session_id": "e8a45d51-…"}` | 回答合成 991.10ms |
+| 11 | 6308.55 | answer | node_end | `1f6d3754` | `{}` | duration 991.77ms |
+
+关键观察（都能在上表核对）：
+
+1. **规则优先在 tier3 原样成立**：#3 分类 span 0.95ms、无 llm_call、confidence 1.0——新增意图没有破坏 P2 语料里的"规则命中=零分类成本"签名。
+2. **降级链的观测签名是"同一 span 内 error → success"**：#5 `browser_snapshot` error 后 #7 `browser_open` success，与 P2 demo-a（weather error → search success）同构。tier3 的这条链是**固有前缀**：先看当前页（点/填都建立在已打开的页面上），没有页面才 open（`graph.py::_STRATEGY_CHAIN` 注释原文）。
+3. **真正的延迟在模型不在浏览器**：3932.87ms 参数提取 + 991.10ms 回答合成 ≈ 4.9s，占全轮 7.5s 的绝大部分；`browser_open` 本身约 1.4s（#6 结束到 #7）。对照 P2 demo-a 的 stub structured 仅 0.26ms——"参数提取一次 LLM"的定价在真模型下才显形。
+4. **trace 与 SSE 的分工**：trace 记 `browser_open status=success`；SSE `done.result_data` 记细节 `{action:"navigate", requested_url:"https://www.bing.com", url:"https://cn.bing.com/", status:200, waited:false, wait_timeout:true, wait_ms:500}`（smoke §2 L2）。`waited=false / wait_timeout=true` 是已知 quirk（P2 Task 2 交接：networkidle 有 500ms 边界，`waited` 实际总为 False），不是本轮异常。
+5. **`llm_call.data.model` 全是空串**：本 trace 两条、HITL trace 一条、`data/traces/` 语料 **378/378** 条全部 `"model": ""`（`grep -c` 实测）。原因在装饰器：`TracingModelProvider._emit` 记的是调用方传入的 `model` kwarg（`model or ""`）；graph 的 chat 调用不传模型名、structured 传 `model=small_model`，而 `small_model` 在生产装配里**没有任何调用方赋值**（`grep -rn small_model src/browsepilot/` 只有 `graph.py` 的签名与两个使用点）。P2 素材说 `data` 带 `model` 字段——P3 补上后半句：**字段在，值恒空**，黑匣子目前答不了"这次用的哪个模型"。
+6. **`hitl` 不在本轮 trace 里**：L2 任务不需要人工确认；hitl 的真实样本见下一节。
+
+## 2. HITL：`human_pending` 事件链（真实 trace + SSE 断言）
+
+L1.5 运行（API 层 HITL，真 msedge，provider 固定返回登录 URL → 不花模型调用）：任务「在 zhihu.com 的搜索框里搜索 Python 3.13」。
+
+trace 逐行（`t6-hitl.jsonl`，10 条，t0 = `2026-09-10T14:57:54.668960Z`）：classify decision → execute start → `tool_call browser_snapshot error` → `llm_call structured`（0.02ms，keyless stub）→ `tool_call browser_open success` → execute end（2362.76ms）→ **hitl node_start / node_end（同 span `04081b05`，0.38ms）**。
+
+- P2 素材记录"hitl 在既有语料里零样本"；P3 补上了真实 hitl span。0.38ms 的 duration 是 `interrupt()` 抛出的耗时——暂停本身不占 span 时间（`graph.py::hitl`：`response = interrupt({"human_prompt": state.human_prompt})`）。
+
+SSE 序列（smoke §2 L1.5 原文）：
+
+```json
+{"tag":"sse","index":0,"type":"phase","phase":"start","session_id":"c4dbadf7-…"}
+{"tag":"sse","index":1,"type":"human_pending","session_id":"c4dbadf7-…","human_prompt":"需要人工处理：检测到登录页面，请在浏览器中手动登录后继续任务。"}
+{"tag":"hitl_assertion","human_pending":true,"no_answer_event":true,"seconds":3.6}
+```
+
+- **事件名与载荷键**：`human_pending` 带 `session_id`、`human_prompt` 两个键（`app/main.py` 的 `_sse({...})` 原文）；**不发空 answer/done、不落库**（H2 契约，smoke §2 L1.5 断言 `no_answer_event=true`）。
+- 触发条件（`app/main.py` 原文）：`if not result.get("final_answer") and (result.get("__interrupt__") or result.get("pending_human_action"))` → 发 `human_pending` 后 `return`。
+- 上游链路（三跳，代码可查）：
+  1. `executor._with_intervention`：登录页检测 `confidence=high` → 结果 `data` 加 `needs_human=True`、`human_prompt`、`intervention`（kind ∈ login/captcha/dialog）；`medium` 只写 `data["intervention"]` 并打日志，不暂停（F2 门，commit `5ae1a9c`）。
+  2. `graph.execute`：`tool_result.data.get("needs_human")` → 返回 `pending_human_action=True` + `human_prompt` → 路由到 `hitl` 节点 interrupt。
+  3. `app/main.py`：见上。
+- **只观测到暂停，没观测到恢复**：T6 L1.5 SKIP `/chat/resume`（smoke §4 跳过项）；P2 素材开放问题 4 的"resume 重放导致 hitl span 重开两次"未在 P3 实测。另有一个 T5 评审在案的真实缺陷：answer 节点不读 `state.human_response` → resume 后最终答案可能仍说"请手动登录"（deferred P4）。写文章时这是"HITL 观测链缺一段"的最诚实例子。
+- 恢复接口形状（供对照）：`POST /chat/resume`，`ResumeRequest{session_id, human_response}`（均 `min_length=1`）；`api.resume_task` 对无 pending interrupt 的会话显式报错，不静默开新任务（P3 未跑通该链路）。
+
+## 3. 浏览器动作的细节数据：trace 只有 tool/status，细节在 ToolResult.data
+
+`graph.py::execute` 的 tool_call 事件只发 `{"tool": ..., "status": ...}`（与 P2 结论一致）。浏览器动作真正"发生了什么"在 executor 返回的 `ToolResult.data`（`actions.py::_detail`），键固定为：
+
+| 键 | 类型 | 含义 | 真实样例 |
+|----|------|------|---------|
+| `resolution` | dict | `classify_target(target)` 的命中候选 `{kind, selector}` | `{"kind":"ref","selector":"aria-ref=e6"}`（smoke §2 S2 `s2_type`） |
+| `attempts` | int | 总尝试次数（重试 + 候选切换） | `1`（S2）；`3`（§2 S4 运行 B） |
+| `js_fallback` | bool | 是否走了 JS 触发兜底 | `false`：`{"tag":"click_submit","target":"e7","role":"generic","status":"success","attempts":1,"js_fallback":false}`；`true`：§2 S4 运行 B |
+| `errors` | list[str] | 累积错误文本（非空才带） | `_MAX_ERROR_CHARS=300` 截断（actions.py） |
+| `url` | str | 动作后当前 URL | `https://cn.bing.com/search?q=Python+3.13…` |
+
+- `js_fallback=True` 的语义是"已派发、效果未证"（docstring 原话），不是"成功"——smoke §2 S4 运行 B 的真实假阴性就是它：`status=error, error_type=timeout, attempts=3 + js_fallback=true`，但 URL 已经跳到目标页（`https://www.iana.org/help/example-domains`；详见 smoke §5.2）。
+- 错误/回显一律截断：`actions.py::_MAX_ERROR_CHARS=300`、`policy.py::_MAX_ECHO_CHARS=200`（拒因里来自 URL 的回显）。
+- 池也有计数器（`pages_created` / `pages_reused` / `pages_evicted`），但只出现在日志行（`BrowserPool closed (created=1, reused=0, evicted=0)`，layer2.log）与 smoke 的 `pool_counters` 断言里，**不进 trace**。
+- **诚实缺口**：`resolution`/`attempts`/`js_fallback` 目前不在 trace 事件里；要把浏览器动作细节关联到 trace，必须另接 SSE `done.result_data` 或 state。这是 P2"事件层 vs 状态层分工"在 tier3 的新实例。
+
+## 4. 快照截断：≤30 refs 与"进 agent 状态前先裁剪"
+
+- 代码：`executor._browser_snapshot` → `page_snapshot_refs(page)`（默认 `max_refs: int = 30`）→ `snapshot_to_refs(tree, max_refs)`——**在条目边界**用 `itertools.islice` 截断，不切进 YAML 块内；底层 `page.locator(root).aria_snapshot(mode="ai")`（`[ref=eN]` 只在 ai 模式出现）。
+- 真实数字（smoke §2 S1/S2）：example.com **5** refs；bing 首页 **27**；搜索后 **30**——搜索页显然超过 30，看到的就是截断后的 30。
+- **为什么是 30（V1 实测教训）**：项目根 `CLAUDE.md` §4（中文第 234 行 / 英文第 128 行）原文——"Playwright MCP 的 `browser_snapshot` 返回 YAML 无障碍树。一个搜索结果页面产生 **71KB** 的 YAML。当存入 `execution_log`（LangGraph agent 状态）时，agent 调用 5 次 snapshot 就是 **355KB** 的状态……单次搜索任务的 token 使用量达到 **206K**。规则：在 `call_tool` 边界处，将快照数据截断到仅 LLM 所需的内容（ref 行，最多 30 条）。"
+- **出处勘误**：`browsepilot/docs/v2-baseline.md`（P0 基线，17 行）**没有**这组数字——它只记录旧测试基线（66 passed）、环境备注、根因清单索引。71KB/355KB/206K 的出处是项目根 `CLAUDE.md` 的 v1 回顾，写文章引用时别归错。
+- 同一截断原则的其他实例：页面文本采样 `detect.MAX_HTML_SAMPLE_CHARS = 20_000`（`body.inner_text()` 渲染后可见文本，F1 加固后不再采原始 HTML）；policy 回显 200 字符；动作错误 300 字符。
+
+## 5. 降级条目：真实持久化证据 + 代码形状 + 渲染路径
+
+**真实条目（唯一盘上证据）**：L2 运行结束时策略链已经成功，但第一次 `browser_snapshot` 的失败仍留在 state 的 `degradation_log` 里。从该运行的 checkpoint（`%TEMP%\t6-e2e-qn_ad4uc\checkpoints.sqlite`，LangGraph msgpack blob）提取出的字段序列是：
+
+```
+degradation_log = [
+  {strategy: "browser_snapshot", error: "no_open_page",
+   message: "还没有打开的页面：请先调用 browser_open(url) 再观察或操作"}
+]
+```
+
+（`grep -a -c no_open_page checkpoints.sqlite` = 4 个二进制行命中；对应 state 里的一次降级。msgpack 控制字节略去，中文与三个键名逐字来自 blob。）
+
+**代码形状**（`graph.py::execute`，两种失败各 append 一条）：工具失败 `{strategy: 工具名, error: tool_result.error_type, message: tool_result.error_message}`；参数提取失败 `{strategy: 工具名, error: "param_extraction_failed", message: str(exc)}`。`error_type` 由 executor 给出，如 `no_open_page` / `snapshot_failed` / `empty_snapshot` / `browser_unavailable` / `navigation_blocked`。
+
+**去重**（`graph.py::_merge_degradation`）：按 `(strategy, error)` 去重、保留首次出现；注释原文说明动机——"resume 会重放 interrupt 之前的 execute 节点：重跑时 state 里已经带着上一轮的 degradation_log，直接相加会让同一条降级记录翻倍。"
+
+**渲染**：只有 `result_data.error` 存在（即 `all_strategies_failed`）时 answer 才把 degradation 拼给用户——`"；".join(f"{strategy}: {message}")` 后包进"抱歉，这个任务暂时无法完成：…。可以换个说法试试。"（`graph.py::answer`）。链中途成功时 degradation_log 留在 state，**既不进 SSE `done.result_data`，用户也看不到**——L2 那条 no_open_page 就属于这种"沉默的降级"。
+
+**诚实缺口**：P3 没有 tier3 的 `all_strategies_failed` 真实样本（L2 成功、L1.5 转 HITL），渲染路径的证据是代码 + P2 demo-b 的同类代码路径；tier3 失败文案的实样要等 P4。另 T4 评审在案：tier3 成功也带 `no_open_page` 条目，记账为噪声（progress.md T4 review Minor）——观测该记多少没有结论，但现象是真的。
+
+## 6. P3 观测面的新缺口（诚实素材）
+
+1. **tier3 trace 不在语料目录**：`data/traces/` 98 个文件零浏览器事件；唯一副本在 `%TEMP%`（见"数据在哪"）。P2 素材说"语料只能讲顺利的一天"，P3 依然：tier3 的坏天气（探测失败、策略全败、resume）都没有可直接引用的入库语料。
+2. **`model` 字段恒空**（§1 观察 5）——"哪个模型答的"从 trace 里答不出。
+3. **动作细节不进事件**（§3 缺口）——`resolution`/`attempts`/`js_fallback` 只在 state/SSE 里。
+4. **HITL 链缺恢复段**（§2 缺口）——hitl span 只观测进入，`human_response` 不回流 answer 的缺陷在案。
+5. **`error` 事件类型仍然没有生产者**（P2 开放问题 3）：P3 的所有失败（browser_snapshot error、导航失败）都只表现为 `tool_call status=error` + state 里的 degradation，没有 `error` 事件。
+
+## P3 一句话素材（供作者选用）
+
+- "同一条 span 里 error → success，就是降级链的可视化签名"——tier3 的 snapshot→open 版（对照 P2 的 weather→search）。
+- "浏览器不慢，模型慢：7.5s 里约 4.9s 是两次 LLM 调用，真正 open 页面约 1.4s。"
+- "规则命中的分类花 0.95ms 且一条 llm_call 都没有——观测数据本身就是'规则省调用'的证据。"
+- "llm_call 记了 `model` 字段，但真实运行里 378/378 是空串：黑匣子不知道是哪个模型在说话。"
+- "快照最多 30 条 ref 不是产品洁癖，是 v1 的 71KB YAML / 355KB state / 206K token 换来的。"
+- "human_pending 只有两个键（session_id、human_prompt）——HITL 暂停的用户可见契约就这么大。"
