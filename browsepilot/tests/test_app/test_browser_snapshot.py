@@ -185,6 +185,7 @@ class _FakePage:
         self.index = index
         self.closed = False
         self.close_calls = 0
+        self.url = "about:blank"
 
     async def close(self) -> None:
         self.closed = True
@@ -316,6 +317,73 @@ async def test_pool_release_unknown_page_is_noop():
     other = await pool.new_page()  # 真 page 仍算占用 → 走新建而非复用
     assert other is not page
     assert len(factory.created) == 2
+    await pool.close()
+
+
+async def test_pool_never_hands_out_an_error_page():
+    """F4（T6 冒烟 S6）：失败导航留下的 ``chrome-error://`` 页面**绝不复用**。
+
+    错误页自身的导航可能还没落定，复用它的下一次 ``goto`` 会报
+    "interrupted by another navigation to chrome-error://chromewebdata/"（假失败）；
+    所以交付前判一次：碰到错误页就弃用（关闭）并新建。
+    """
+    pool, factory = _make_pool(max_pages=2)
+    await pool.start()
+    page = await pool.new_page()
+    page.url = "chrome-error://chromewebdata/"  # 失败导航之后浏览器自己跳到这里
+    await pool.release(page)
+
+    fresh = await pool.new_page()
+
+    assert fresh is not page  # 拿到的是干净新页
+    assert page.closed is True and page.close_calls == 1
+    assert (pool.pages_created, pool.pages_reused, pool.pages_discarded) == (2, 0, 1)
+    await pool.close()
+
+
+async def test_pool_skips_error_page_that_became_dirty_while_idle():
+    """归还时还没脏（错误页导航晚一步落定）的页面，也不能被发出去。"""
+    pool, factory = _make_pool(max_pages=2)
+    await pool.start()
+    page = await pool.new_page()
+    await pool.release(page)  # 正常归还：此时 URL 还是 https://…
+    page.url = "chrome-error://chromewebdata/"  # 归还之后才被错误页导航带走
+
+    fresh = await pool.new_page()
+
+    assert fresh is not page
+    assert page.closed is True
+    assert pool.pages_discarded == 1
+    await pool.close()
+
+
+async def test_pool_discard_closes_the_page_and_frees_its_slot():
+    """F4：executor 弃用失败导航的页面走 ``discard()``——关掉它，并且不占池槽。"""
+    pool, factory = _make_pool(max_pages=1)
+    await pool.start()
+    page = await pool.new_page()
+
+    await pool.discard(page)
+
+    assert page.closed is True
+    assert pool.pages_discarded == 1
+    other = await pool.new_page()  # max_pages=1：槽位真释放了（走新建，不是回收）
+    assert other is not page
+    assert pool.pages_evicted == 0
+    await pool.close()
+
+
+async def test_pool_discard_unknown_page_is_noop():
+    pool, factory = _make_pool(max_pages=2)
+    await pool.start()
+    page = await pool.new_page()
+    stranger = _FakePage(99)
+
+    await pool.discard(stranger)  # 不属于本池 → 静默忽略（也不关它）
+
+    assert stranger.closed is False
+    assert pool.pages_discarded == 0
+    assert page.closed is False
     await pool.close()
 
 

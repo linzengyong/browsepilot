@@ -7,9 +7,15 @@ Tier3 的输入是「浏览器动作之后的页面」：打开/点击/输入之
 设计约束与取舍：
 
 - **零页面往返**：所有输入都是调用方已经拿到的字符串/布尔（``url`` = 当前页 URL，
-  ``html_sample`` = ``Page.content()`` 的前 ``MAX_HTML_SAMPLE_CHARS`` 个字符，
-  ``has_password`` = 调用方对密码输入框的探测结果）。本模块不 import playwright、
-  不解析 DOM、不发网络请求、不用 LLM。
+  ``html_sample`` = 页面**渲染后可见文本**的前 ``MAX_HTML_SAMPLE_CHARS`` 个字符（executor 用
+  ``body.inner_text()`` 取得），``has_password`` = 调用方对**可见**密码输入框的探测结果）。
+  本模块不 import playwright、不解析 DOM、不发网络请求、不用 LLM。
+- **只吃可见文本**（F1 / T5 审查）：关键词规则判的是**用户看得见什么**，所以采样是渲染后可见文本
+  而不是原始 HTML——``display:none`` 的隐藏登录下拉、``<script>`` 与 i18n bundle 里的「验证码」
+  词条都只是源码，不是页面上的东西（实例：电商产品页的可见「登录」导航链接 + 隐藏登录下拉
+  → 旧接线把原始 HTML 当采样，入口词 + 凭据词同时出现 → 误报 login/medium，把唯一的人工暂停
+  机会花在用户根本看不见的表单上）。代价：输入里没有标签，**标签级**结构标记（``role="dialog"``）
+  不可用——确认弹窗只能靠短语文案判定（见 :data:`_DIALOG_PHRASE_MARKERS`）。
 - **保守优先**：误报的代价是「没必要的人工暂停」——而且每次运行只有一次暂停机会
   （``graph._route_execute_result`` 只在 ``hitl_triggered_count == 0`` 时转 hitl 节点），
   一次误报就会把唯一机会用掉；漏报的代价只是继续走既有降级链（诚实汇报失败）。
@@ -34,10 +40,11 @@ from urllib.parse import urlsplit
 __all__ = ["MAX_HTML_SAMPLE_CHARS", "Intervention", "detect_intervention"]
 
 MAX_HTML_SAMPLE_CHARS = 20_000
-"""只检查 HTML 采样的前 2 万字符（executor 也按这个上限截断）。
+"""只检查采样文本的前 2 万字符（executor 也按这个上限截断）。
 
-登录/验证码是**首屏**特征，前 20KB 足够；上限同时保证本函数对任意长度的输入都是
-有界的 O(20KB)：页面再大也不会把检测成本变成整页扫描。
+登录/验证码是**首屏**特征，前 2 万字符足够；上限同时保证本函数对任意长度的输入都是
+有界的 O(20KB)：页面再大也不会把检测成本变成整页扫描。采样是**渲染后可见文本**
+（F1；executor 用 ``body.inner_text()``）——名字沿用 D5/D6 的接线契约 ``html_sample``。
 """
 
 _LOGIN_PROMPT = "需要人工处理：检测到登录页面，请在浏览器中手动登录后继续任务。"
@@ -92,13 +99,8 @@ _CAPTCHA_BRAND_MARKERS = ("captcha",)
 （页面上根本没有可见验证码），所以单独命中只给 ``medium`` 置信度。"""
 
 _DIALOG_PHRASE_MARKERS = ("确认对话框", "如需继续请点击", "请点击确认", "请确认后继续")
-"""确认弹窗的具体文案。"""
-
-_DIALOG_MODAL_MARKERS = ('aria-modal="true"', 'role="dialog"', "role='dialog'")
-"""「当前有打开的模态框」的结构标记（框架只在弹窗**打开时**才写 ``aria-modal``）。"""
-
-_DIALOG_GENERIC_MARKER = "请确认"
-"""泛化的确认文案：普通下单页/地址页也会写「请确认…」，必须配模态结构才算弹窗。"""
+"""确认弹窗的**具体**文案：F1 之后采样是渲染后可见文本，里面没有标签，所以弹窗判定只能靠
+短语（旧实现的「泛化文案 + ``role="dialog"`` 模态结构」组合随原始 HTML 采样一起去掉了）。"""
 
 
 @dataclass(frozen=True)
@@ -108,7 +110,11 @@ class Intervention:
     - ``kind``：``login`` / ``captcha`` / ``dialog``（进 HITL 载荷的 ``intervention`` 字段）。
     - ``confidence``：``high`` = 结构性强标记（登录 URL、密码框、验证码短语）；
       ``medium`` = 文本弱标记（中文关键词组、验证码品牌词、确认弹窗）。
-      只用于诊断与文案分级——**是否暂停由「有没有命中」决定，不由置信度决定**。
+      它不只是诊断/文案分级，而是**行为开关**（F2 / T5 审查）：executor 的
+      ``_with_intervention`` 只在 ``high`` 时暂停 HITL（置 ``data["needs_human"]``，图转 hitl）；
+      ``medium`` 只把 ``kind`` 记进 ``data["intervention"]`` 并打日志——每次运行只有一次人工暂停
+      机会（``graph._route_execute_result`` 在 ``hitl_triggered_count > 0`` 后不再中断），
+      弱信号（帮助页文案、页脚品牌词）不配花掉它。
     - ``reason``：命中的具体标记（``url-path:login`` / ``password-input`` /
       ``captcha-keyword:验证码`` / ``keywords:登录+密码`` / ``dialog-phrase:确认对话框``），
       供 trace 与测试定位，不进用户文案。
@@ -129,14 +135,15 @@ def detect_intervention(url: str, html_sample: str, has_password: bool) -> Inter
     1. ``login``（high）：URL 路径段/主机首标签命中登录标记，**或**页面有密码输入框。
     2. ``captcha``：明确的验证码短语（high），其次验证码品牌词（medium）。
     3. ``login``（medium）：中文「入口词」与「凭据词」同时出现。
-    4. ``dialog``（medium）：确认弹窗文案，或「请确认」+ 模态结构。
+    4. ``dialog``（medium）：确认弹窗的**具体短语**（可见文本里没有标签，所以不再有
+       ``role="dialog"`` 结构判定——F1）。
 
     参数容忍脏值（``None`` 当空处理、非 str 先 ``str()``、非法 URL 跳过 URL 判定）：
     检测是 best-effort，绝不因为输入异常而抛错（调用方还要靠它保住动作结果）。
     ``html_sample`` 超过 :data:`MAX_HTML_SAMPLE_CHARS` 的部分一律不看。
     """
     text = "" if html_sample is None else str(html_sample)
-    html = text[:MAX_HTML_SAMPLE_CHARS].lower()
+    sample = text[:MAX_HTML_SAMPLE_CHARS].lower()
     url_text = "" if url is None else str(url)
 
     url_marker = _login_url_marker(url_text)
@@ -145,19 +152,19 @@ def detect_intervention(url: str, html_sample: str, has_password: bool) -> Inter
     if has_password:
         return Intervention("login", "high", "password-input", _LOGIN_PROMPT)
 
-    marker = _first_marker(html, _CAPTCHA_PHRASE_MARKERS)
+    marker = _first_marker(sample, _CAPTCHA_PHRASE_MARKERS)
     if marker is not None:
         return Intervention("captcha", "high", f"captcha-keyword:{marker}", _CAPTCHA_PROMPT)
-    marker = _first_marker(html, _CAPTCHA_BRAND_MARKERS)
+    marker = _first_marker(sample, _CAPTCHA_BRAND_MARKERS)
     if marker is not None:
         return Intervention("captcha", "medium", f"captcha-brand:{marker}", _CAPTCHA_PROMPT)
 
-    entry = _first_marker(html, _LOGIN_ENTRY_KEYWORDS)
-    credential = _first_marker(html, _LOGIN_CREDENTIAL_KEYWORDS)
+    entry = _first_marker(sample, _LOGIN_ENTRY_KEYWORDS)
+    credential = _first_marker(sample, _LOGIN_CREDENTIAL_KEYWORDS)
     if entry is not None and credential is not None:
         return Intervention("login", "medium", f"keywords:{entry}+{credential}", _LOGIN_PROMPT)
 
-    marker = _dialog_marker(html)
+    marker = _dialog_marker(sample)
     if marker is not None:
         return Intervention("dialog", "medium", marker, _DIALOG_PROMPT)
     return None
@@ -197,16 +204,15 @@ def _segment_marker(segment: str) -> str | None:
     return text if text in _LOGIN_PATH_SEGMENTS else None
 
 
-def _dialog_marker(html: str) -> str | None:
-    """确认弹窗标记：具体文案直接命中；泛化的「请确认」需要伴随模态结构。"""
-    marker = _first_marker(html, _DIALOG_PHRASE_MARKERS)
-    if marker is not None:
-        return f"dialog-phrase:{marker}"
-    if _DIALOG_GENERIC_MARKER in html:
-        modal = _first_marker(html, _DIALOG_MODAL_MARKERS)
-        if modal is not None:
-            return f"dialog-modal:{_DIALOG_GENERIC_MARKER}+{modal}"
-    return None
+def _dialog_marker(text: str) -> str | None:
+    """确认弹窗标记：只认**具体短语**（F1 之后输入是渲染后可见文本，里面没有标签）。
+
+    旧实现的「泛化『请确认』+ ``role="dialog"`` 模态结构」组合随原始 HTML 采样一起去掉：
+    模态结构是标签级标记，可见文本里根本不会出现。泛化文案单独出现仍不算——普通下单页/
+    地址页也会写「请确认收货地址」（宁可漏报，不可误报：见模块 docstring）。
+    """
+    marker = _first_marker(text, _DIALOG_PHRASE_MARKERS)
+    return None if marker is None else f"dialog-phrase:{marker}"
 
 
 def _first_marker(text: str, markers: tuple[str, ...]) -> str | None:

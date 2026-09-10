@@ -151,15 +151,23 @@ def test_settings_defaults():
     # P3 Tier3：浏览器设置（默认值即接线默认行为）
     assert s.browser_headless is True
     assert s.browser_max_pages == 3
+    assert s.browser_channel == ""  # F3：空 = 用 Playwright 自带 Chromium
 
 
 def test_settings_browser_fields_follow_bp_env_prefix(monkeypatch):
-    """BP_ 前缀约定：browser 设置与其他字段一样从环境变量读。"""
+    """BP_ 前缀约定：browser 设置与其他字段一样从环境变量读。
+
+    包 ``browser_channel``：本机（PW 1.59，缓存只有 chromium-1208）默认 chromium 启动会报
+    "Executable doesn't exist"，靠 ``BP_BROWSER_CHANNEL=msedge`` 用系统 Edge（T6 §5.6）。
+    注意 v1 遗留的 ``BROWSER_CHANNEL``（无前缀）与本 Settings 无关：v2 只读 ``BP_*``。
+    """
     monkeypatch.setenv("BP_BROWSER_HEADLESS", "false")
     monkeypatch.setenv("BP_BROWSER_MAX_PAGES", "5")
+    monkeypatch.setenv("BP_BROWSER_CHANNEL", "msedge")
     s = Settings(_env_file=None)
     assert s.browser_headless is False
     assert s.browser_max_pages == 5
+    assert s.browser_channel == "msedge"
 
 
 def test_health_endpoint(tmp_path):
@@ -677,7 +685,11 @@ def test_lifespan_manual_saver_survives_app_restart_for_resume(tmp_path):
 
 def test_lifespan_starts_browser_pool_and_injects_it_into_executor(tmp_path):
     """P3 收尾：lifespan 按注入的池 start() 后把（已启动的）池绑到 AppToolExecutor，
-    teardown 时 close() —— 未接线时 6 个浏览器工具只能返回 browser_unavailable。"""
+    teardown 时 close() —— 未接线时 6 个浏览器工具只能返回 browser_unavailable。
+
+    池的配置（headless / max_pages / ``channel``）是构造期属性（F3），随这个实例一起进入
+    executor：构造接线见 :func:`test_default_app_wires_browser_pool_into_executor`。
+    """
     pool = FakeBrowserPool()
     executor = _browser_executor()  # 未带池：绑定必须由 lifespan 完成
     app = create_app(
@@ -719,14 +731,13 @@ def test_lifespan_browser_start_failure_degrades_to_browser_none(tmp_path):
     assert boom.close_calls == 1
 
 
-def test_default_app_wires_browser_pool_into_executor(tmp_path, monkeypatch):
-    """生产接线（gap 本身）：_default_app 按 Settings 构造 BrowserPool，以
-    AppToolExecutor(..., browser=pool) 注入，并把同一实例交给 create_app 管生命周期。
+def _capture_default_app(tmp_path, monkeypatch, **settings_overrides):
+    """跑 ``_default_app()`` 但只捕获它交给 create_app 的 kwargs（不起真浏览器、不跑 lifespan）。
 
-    只把 create_app 换成记录器：不起真浏览器、不跑真 lifespan。
+    ``Settings`` 一并换成只看测试覆写的版本（``_env_file=None``）：本机 ``.env`` 不参与，
+    否则真环境的取值会污染断言。
     """
     import browsepilot.app.main as main_module
-    from browsepilot.app.browser.browser_pool import BrowserPool
 
     captured: dict = {}
 
@@ -742,16 +753,51 @@ def test_default_app_wires_browser_pool_into_executor(tmp_path, monkeypatch):
             _env_file=None,
             trace_dir=str(tmp_path / "traces"),
             session_db_path=str(tmp_path / "sessions.sqlite"),
-            browser_headless=False,
-            browser_max_pages=2,
+            **settings_overrides,
         ),
     )
     main_module._default_app()
+    return captured
+
+
+def test_default_app_wires_browser_pool_into_executor(tmp_path, monkeypatch):
+    """生产接线（gap 本身）：_default_app 按 Settings 构造 BrowserPool，以
+    AppToolExecutor(..., browser=pool) 注入，并把同一实例交给 create_app 管生命周期。
+
+    只把 create_app 换成记录器：不起真浏览器、不跑真 lifespan。
+    """
+    from browsepilot.app.browser.browser_pool import BrowserPool
+
+    captured = _capture_default_app(
+        tmp_path,
+        monkeypatch,
+        browser_headless=False,
+        browser_max_pages=2,
+        browser_channel="msedge",
+    )
 
     pool = captured["browser_pool"]
     assert isinstance(pool, BrowserPool)
     assert (pool.headless, pool.max_pages) == (False, 2)  # 来自 Settings
+    assert pool.channel == "msedge"  # F3：Settings.browser_channel 真的透传到池
     assert captured["executor"]._browser is pool  # 构造注入，与生命周期同源
+
+
+def test_default_app_maps_settings_channel_to_pool(tmp_path, monkeypatch):
+    """F3：``Settings.browser_channel`` → ``BrowserPool(channel=...)`` 的映射规则。
+
+    - 空串（默认）→ ``None``：``channel=""`` 不是合法值（``launch(channel="")`` 直接报错），
+      空串必须收敛成 None（用 Playwright 自带 Chromium）；
+    - 非空原样透传（T6 §5.6：本机 PW 1.59 默认要的 chromium rev 1217 不存在，
+      真实需要系统 Edge 时用 ``BP_BROWSER_CHANNEL=msedge``）。
+    """
+    bundled = _capture_default_app(tmp_path, monkeypatch)
+    assert bundled["browser_pool"].channel is None
+    assert bundled["executor"]._browser is bundled["browser_pool"]
+
+    channeled = _capture_default_app(tmp_path, monkeypatch, browser_channel="msedge")
+    assert channeled["browser_pool"].channel == "msedge"
+    assert channeled["executor"]._browser is channeled["browser_pool"]
 
 
 def test_resume_without_pending_interrupt_errors(tmp_path):

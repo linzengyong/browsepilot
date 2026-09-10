@@ -29,3 +29,7 @@ class Settings(BaseSettings):
     # ── P3 Tier3 浏览器层（BrowserPool；start/close 由 app lifespan 管） ──
     browser_headless: bool = True
     browser_max_pages: int = 3
+    # 浏览器通道（BP_BROWSER_CHANNEL）：空 = Playwright 自带 Chromium；"msedge"/"chrome"
+    # = 用系统浏览器。本机 PW 1.59 默认要的 chromium rev 在本机缓存里不存在，所以真实环境
+    # 靠它逃生（T6 §5.6）；空串在接线处收敛成 None（channel="" 不是合法值）。
+    browser_channel: str = ""

@@ -9,6 +9,11 @@
 覆盖：brief 的两个样例 / URL 标记（路径段 + 主机首标签，含负例）/ 密码框 / 验证码短语与品牌词 /
 中文关键词组（入口词 + 凭据词；单个关键词不算）/ 确认弹窗 / 优先级 / 20KB 上限 /
 脏输入不抛异常 / 纯标准库（可离线、零页面往返）。
+
+F1（T5 审查）之后的契约：``html_sample`` 装的是**渲染后可见文本**（executor 的 ``_sample_html``
+用 ``body.inner_text()``，隐藏子树 / ``<script>`` / i18n bundle 都不在内），所以 ``dialog``
+判定只用短语文案（标签级结构标记不可用）；隐藏 DOM 的误报在接线层修，见
+tests/test_app/test_executor_browser.py 的 F1 用例。
 """
 
 from __future__ import annotations
@@ -289,22 +294,45 @@ def test_dialog_markers(text):
     assert "确认" in r.human_prompt
 
 
-def test_generic_confirm_needs_a_modal_structure():
-    """「请确认」出现在普通下单/地址确认页里的概率太高，单独不算；配模态结构才算。"""
+def test_hidden_login_markup_is_not_in_the_sample_contract():
+    """F1（T5 审查）：电商产品页的可见「登录」导航链接 + ``display:none`` 的「账号/密码」下拉。
+
+    隐藏子树与 ``<script>``/i18n bundle 都在原始 HTML 里、都在用户看不见的地方——而
+    ``html_sample`` 的契约输入是**渲染后可见文本**（``body.inner_text()``；接线见 executor 的
+    ``_sample_html``）。可见文本里只剩导航栏的入口词：只有入口词、没有凭据词 → ``None``。
+    """
     assert (
         detect_intervention(
-            url="https://x.com/checkout", html_sample="<p>请确认收货地址</p>", has_password=False
+            url="https://x.com/product/42", html_sample="首页 登录 购物车", has_password=False
         )
         is None
     )
+
+
+def test_visible_captcha_text_still_fires():
+    """F1 对照组：页面上看得见的验证码文案（用户真要处理的东西）照样命中。"""
     r = detect_intervention(
-        url="https://x.com/checkout",
-        html_sample='<div role="dialog">请确认收货地址</div>',
-        has_password=False,
+        url="https://x.com/checkout", html_sample="请完成人机验证后继续", has_password=False
     )
     assert r is not None
-    assert r.kind == "dialog"
-    assert r.reason.startswith("dialog-")
+    assert r.kind == "captcha"
+
+
+def test_generic_confirm_alone_is_not_a_marker():
+    """「请确认」出现在普通下单/地址确认页里的概率太高，单独不算。
+
+    F1 连带调整：旧实现靠「``请确认`` + ``role="dialog"`` 模态结构」补足特异性，而模态结构是
+    **标签级**标记——采样换成渲染后可见文本后标签不在输入里，这条组合规则随之去掉：可见
+    文本里只剩文案，特异性只能由**具体短语**提供（见 :data:`_DIALOG_PHRASE_MARKERS`）。
+    """
+    assert (
+        detect_intervention(
+            url="https://x.com/checkout",
+            html_sample="请确认收货地址 请选择配送时间",
+            has_password=False,
+        )
+        is None
+    )
 
 
 # ── 采样上限 / 值对象 / 依赖面 ──────────────────────────────────────────────

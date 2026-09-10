@@ -17,23 +17,29 @@ Tier3（T4 接线）要点：
   **并隔离这一页**（丢引用 + 归还池）：后续调用不会继续在违规源上动作，必须先重新
   ``browser_open``（重新过策略门）。两条不复查的路径各有理由：读不出 URL（页面已关/驱动
   异常）不是“跳到了违规地址”；导航失败时读到的是浏览器错误页（``chrome-error://``），
-  复查会把真实的 ``navigation_failed`` 伪装成策略拒绝。**残余**：重定向后导航失败（最终 URL
-  未知）不在复查范围。
+  复查会把真实的 ``navigation_failed`` 伪装成策略拒绝（该页随后被弃用，见 F4）。**残余**：
+  重定向后导航失败（最终 URL 未知）不在复查范围。
 - **D5/D6 HITL 桥**：登录墙/人机验证/确认弹窗必须由人处理——``browser_open``（导航成功后）、
-  ``browser_click``、``browser_type`` 之后采样页面（``page.content()`` 前 20KB + 可见密码框探测，
-  都是 best-effort），交给 ``browser.detect.detect_intervention``；命中就把 ``needs_human=True`` /
-  ``human_prompt`` / ``intervention`` 并进结果 ``data``，P2 的 HITL 机制自动接管
-  （``graph.execute`` 见 ``data["needs_human"]`` 即转 hitl 节点 interrupt）——**图不需要改**。
-  检测绝不改变动作本身的结果：``status``/``content``/``error_type`` 原样保留，检测失败
-  （页面已关、content 读不出）当作“没发现”。成本是每个交互动作一次整页序列化（采样随后被
-  截断到 20KB），这是 D5 的固有代价；也正因为有成本，观察类工具（snapshot/scroll/execute_js）
+  ``browser_click``、``browser_type`` 之后采样页面（**渲染后可见文本**：``body.inner_text()`` 的前
+  20KB + 可见密码框探测，都是 best-effort），交给 ``browser.detect.detect_intervention``；
+  ``high`` 置信命中就把 ``needs_human=True`` / ``human_prompt`` / ``intervention`` 并进结果 ``data``
+  （``medium`` 只记 ``data["intervention"]`` + 日志、**不暂停**——F2：每次运行只有一次人工暂停
+  机会，弱文本信号不配花掉它），P2 的 HITL 机制自动接管（``graph.execute`` 见
+  ``data["needs_human"]`` 即转 hitl 节点 interrupt）——**图不需要改**。检测绝不改变动作本身的结果：
+  ``status``/``content``/``error_type`` 原样保留，检测失败（页面已关、可见文本读不出）当作“没发现”。
+  采样源必须是**可见文本**而不能是原始 HTML（F1）：源码里的 ``display:none`` 隐藏登录下拉、
+  ``<script>`` 与 i18n bundle 会让关键词规则误报（实例：电商产品页的可见「登录」导航链接 +
+  隐藏登录下拉 → 误报 HITL），而误报要花掉唯一的人工暂停机会。成本是每个交互动作一次
+  innerText 提取（随后被截断到 20KB）；也正因为有成本，观察类工具（snapshot/scroll/execute_js）
   不跑检测。
 - **当前页跟踪**：executor 是 app 级共享对象，browser 工具共用**一个** current page
   （``browser_open`` 首次向池索取，之后复用；snapshot/click/type/scroll 都作用在它身上）。
   使用前查 ``is_closed()``（池到上限会回收最老的 busy page，``close()`` 会关掉全部 page）：
   死页立即丢引用，下次 ``browser_open`` 重新取页——否则 current page 指向死页后，每个浏览器
-  调用都永久失败且无法恢复。``aclose()`` 显式把当前页归还池（executor 退役时调用；不调用则
-  该池槽一直占着）——**尚未接到 app lifespan**（P4 议题，不在本次改动范围）。
+  调用都永久失败且无法恢复。**失败导航的页面同样立即弃用**（``_discard_page``，F4）：它停在
+  ``chrome-error://`` 且错误页导航可能还在飞，复用同一页的下一次 ``goto`` 会被它打断
+  （T6 冒烟 S6 确定性复现的假失败）。``aclose()`` 显式把当前页归还池（executor 退役时调用；不
+  调用则该池槽一直占着）——**尚未接到 app lifespan**（P4 议题，不在本次改动范围）。
   并发限制：多会话并行时看到的是同一个页面（会互相串页）；``self._page_lock`` 只保证
   "取页/换页"不交错（并发 open 不会各建一个 page），**不做会话隔离**——会话级隔离要把
   page 放进会话上下文（P4+ 议题）。demo 阶段接受该限制并在此显式记录；``aclose()``/隔离
@@ -79,6 +85,13 @@ _SNAPSHOT_NOTE = "（仅观察，未执行交互）"
 
 _MAX_ERROR_CHARS = 300
 """单条错误描述写进结果的上限（与 actions/policy 同一约定）。"""
+
+_SAMPLE_TIMEOUT_MS = 5_000
+"""可见文本采样的有界等待（毫秒）：与 ``actions.ACTION_TIMEOUT_MS`` 同量级。
+
+``body`` 在导航完成后一般早已就位，但 locator 的自动等待默认 30s——采样是附加的
+best-effort 动作，绝不能把工具调用拖住。
+"""
 
 _BROWSER_MISSING_MSG = "浏览器不可用：AppToolExecutor 未注入 BrowserPool（Tier3 工具降级）"
 
@@ -314,7 +327,8 @@ class AppToolExecutor:
 
         检测放在复查之前：动作就是动作，先如实记下“页面上要人工”再判落点合不合规；落点违规时
         复查会整体覆盖结果（安全门优先，见 :meth:`_revalidate_after_action`）。导航失败路径
-        直接返回：页面停在浏览器错误页（``chrome-error://``），采样没有意义。
+        直接返回：页面停在浏览器错误页（``chrome-error://``），采样没有意义，而且**该页必须弃用**
+        （F4，见 :meth:`_discard_page`）。
         """
         url = _arg(arguments, "url")
         allowed, reason = self._policy.validate(url)
@@ -330,7 +344,10 @@ class AppToolExecutor:
         result = _to_tool_result(await actions.navigate(page, url))
         if result.status != "success":
             # 失败即数据：导航失败时页面停在浏览器错误页（chrome-error://…），复查会把
-            # 真实的 navigation_failed 伪装成策略拒绝，所以失败路径原样返回
+            # 真实的 navigation_failed 伪装成策略拒绝，所以失败路径原样返回。
+            # 但这一页不能再复用（F4）：错误页自身的导航可能还在飞，下一次 goto 会被它打断
+            # （T6 冒烟 S6 确定性复现的假失败）——弃用 + 下次自动重取干净页。
+            await self._discard_page(page)
             return result
         result = await self._with_intervention(page, result)  # D5/D6：登录墙/验证码 → HITL
         return await self._revalidate_after_action(page, "browser_open", result)
@@ -412,20 +429,35 @@ class AppToolExecutor:
             ),
         )
 
-    # ── D5/D6：登录/验证码检测（动作后 best-effort，命中即上 HITL 桥） ──────────────
+    # ── D5/D6：登录/验证码检测（动作后 best-effort；high 命中上 HITL 桥，medium 只记录） ──
 
     async def _with_intervention(self, page: Page, result: ToolResult) -> ToolResult:
-        """动作后检测登录/验证码/弹窗（D5/D6）：命中就把 HITL 载荷并进 ``data``。
+        """动作后检测登录/验证码/弹窗（D5/D6）：按命中**置信度**决定要不要上 HITL 桥（F2）。
 
-        只增三个键（``needs_human`` / ``human_prompt`` / ``intervention``），
-        ``status`` / ``content`` / ``error_type`` 原样保留——动作本身的结果才是数据；
+        - ``high``（登录 URL / 可见密码框 / 验证码短语）：三个键一起并进 ``data``
+          （``needs_human`` / ``human_prompt`` / ``intervention``）。
+        - ``medium``（中文关键词组 / 验证码品牌词 / 确认弹窗短语）：只记
+          ``data["intervention"]`` + 日志，**不置 needs_human**——每次运行只有一次人工暂停机会
+          （``graph._route_execute_result`` 在 ``hitl_triggered_count > 0`` 后不再中断），
+          弱信号（帮助页文案、页脚品牌词、无可见挑战的隐形 reCAPTCHA）不配把它花掉。
+
+        ``status`` / ``content`` / ``error_type`` 一律原样保留——动作本身的结果才是数据；
         其中 ``needs_human`` 在**成功**结果上是“转 hitl 节点暂停”的开关（graph.execute），
         在错误结果上只是诊断信息（错误路径继续走降级链，绝不把失败伪装成“需要人工”的成功）。
-        检测失败（页面已关 / content 读不出）时原样返回：检测是 best-effort，绝不破坏动作。
+        检测失败（页面已关 / 可见文本读不出）时原样返回：检测是 best-effort，绝不破坏动作。
         """
         intervention = await _page_intervention(page)
         if intervention is None:
             return result
+        if intervention.confidence != "high":
+            logger.info(
+                "detector: {} intervention ({}); recording only, not pausing HITL",
+                intervention.kind,
+                intervention.reason,
+            )
+            return result.model_copy(
+                update={"data": {**result.data, "intervention": intervention.kind}}
+            )
         return result.model_copy(
             update={
                 "data": {
@@ -487,6 +519,27 @@ class AppToolExecutor:
         """把“跳到策略外”的页面从当前页摘掉并归还池（best-effort，绝不覆盖动作结果）。"""
         self._page = None
         await self._release_page(page)
+
+    async def _discard_page(self, page: Page | None) -> None:
+        """弃用页面（失败导航后的浏览器错误页）：丢当前页引用 + 让池关掉它，**绝不回 idle**。
+
+        为什么不 ``release()``：归还的页面会被下一个 ``new_page()`` 原样取走，而错误页自身的
+        导航可能还在进行——复用它的下一次 ``goto`` 会报 "interrupted by another navigation to
+        chrome-error://chromewebdata/"（T6 冒烟 S6 确定性复现）。弃用之后下一次 ``browser_open``
+        重新取页，拿到的是干净页。代价：失败后不能再 snapshot 那个错误页（本就没有信息量，
+        错误内容已经在动作结果的 ``error_message`` 里）。
+        best-effort：池不可用 / 替身没实现 discard 时只记日志，绝不改变动作结果。
+        """
+        if page is None:
+            return
+        if self._page is page:
+            self._page = None
+        if self._browser is None:
+            return
+        try:
+            await self._browser.discard(page)
+        except Exception as exc:
+            logger.debug("page discard failed: {}", _describe(exc))
 
     async def _release_page(self, page: Page | None) -> None:
         """把页面还给池（best-effort）：池不可用/未实现 release/页面已关时静默跳过。
@@ -606,20 +659,31 @@ def _page_closed(page: Page) -> bool:
 
 
 async def _sample_html(page: Page) -> str:
-    """页面 HTML 采样：前 ``detect.MAX_HTML_SAMPLE_CHARS`` 字符、小写；读不出当空串。
+    """页面**渲染后可见文本**采样：``body.inner_text()`` 前 ``detect.MAX_HTML_SAMPLE_CHARS``
+    字符、小写；读不出当空串。
 
-    ``Page.content()`` 是整页序列化（协议没有“只取前 20KB”），截断发生在取回之后：
-    这是 D5 的固有代价（每个交互动作一次），换来的是确定性字符串判定与零额外往返。
+    为什么不是 ``page.content()``（原始 HTML，F1 / T5 审查）：关键词规则判的是**用户看得见什么**
+    （登录表单的「账号/密码」、验证码文案、确认弹窗文案），而原始 HTML 里还躺着用户看不见的东西
+    ——``display:none`` 的隐藏登录下拉、``<script>`` / i18n bundle（里面也有「验证码」这类词条）。
+    它们出现在源码里不代表页面上有对应物，而误报要花掉每次运行唯一的人工暂停机会（实例：电商
+    产品页的可见「登录」导航链接 + 隐藏登录下拉 → 旧接线误报 HITL）。
+
+    ``inner_text`` 只返回渲染可见文本：``display:none`` 子树与 ``<script>/<style>`` 都不在内。
+    代价（有意接受）：可见文本里没有标签，所以**标签级**结构标记（``role="dialog"``）不再可用，
+    确认弹窗只能用短语文案判定（见 :mod:`browsepilot.app.browser.detect`）；密码框那条结构探针
+    不受影响（:func:`_has_password_field` 用 ``:visible`` 直接问 DOM）。
+
+    命名沿用 D5/D6 的接线契约（``html_sample``）：它现在装的是可见文本，不再是 HTML 源码。
     """
     try:
-        html = await page.content()
-    except Exception as exc:  # 页面已关 / 驱动异常：检测降级，不影响动作结果
-        logger.debug("detector: page.content() failed: {}", _describe(exc))
+        text = await page.locator("body").inner_text(timeout=_SAMPLE_TIMEOUT_MS)
+    except Exception as exc:  # 页面已关 / 驱动异常 / 没有 body：检测降级，不影响动作结果
+        logger.debug("detector: body.inner_text() failed: {}", _describe(exc))
         return ""
-    if not isinstance(html, str):
+    if not isinstance(text, str):
         return ""
     limit = detect.MAX_HTML_SAMPLE_CHARS
-    return html[:limit].lower()
+    return text[:limit].lower()
 
 
 async def _has_password_field(page: Page) -> bool:

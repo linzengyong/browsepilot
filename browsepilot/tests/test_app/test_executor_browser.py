@@ -4,16 +4,19 @@
 （重定向/点击跳转/JS 跳转回流后的落点也要在策略内，I2）、**当前页跟踪**（open 复用同一个 page；
 snapshot/click/type/scroll 都作用在它身上；池回收后的恢复与 ``aclose()`` 释放，I3）、
 **结构化降级**（未注入池 / 池未启动 / 快照为空 / 动作失败 一律返回 ToolResult，绝不抛）、
-**D5/D6 HITL 桥**（open/click/type 之后采样页面，命中登录/验证码即挂
-``needs_human`` + ``human_prompt`` + ``intervention``；检测失败绝不影响动作结果）。
+**D5/D6 HITL 桥**（open/click/type 之后采样**渲染后可见文本**（F1：``body.inner_text()``；
+原始 HTML 绝不进检测），命中登录/验证码后按置信度处置：high → 挂 ``needs_human`` +
+``human_prompt`` + ``intervention``（F2：medium 只留 ``intervention`` 痕迹、不暂停）；
+检测失败绝不影响动作结果）。
 
 不启真实浏览器（教训 §1）：FakeBrowser / FakePage 双人舞——page 的 ``calls`` 保留跨方法
 的时间顺序（用来 pin "先 aria-ref 定位再 click"、"type 先清空再填"），失败可编程
-（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate / **content / 密码框探测**），
+（goto / networkidle 等待 / snapshot / click / JS 回退 / evaluate / **可见文本 / 密码框探测**），
 跳转可编程（``redirect_url`` / ``click_url`` / ``evaluate_url``，动作后复查的测试缝），
-``html`` / ``password_inputs`` 是登录/验证码检测的测试缝，``closed`` 可以模拟池回收；
-FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()``，
-并记录建页次数与归还（当前页复用、隔离、释放的证据）。
+``visible_text`` / ``password_inputs`` 是登录/验证码检测的测试缝（``html`` 只出现在 F1 负例里，
+``content()`` 是"原始 HTML 被误采样"的探针），``closed`` 可以模拟池回收；
+FakeBrowser 实现 executor 用到的 ``new_page()`` / ``release()`` / ``discard()``（F4），
+并记录建页次数、归还与弃用（当前页复用、隔离、失败页弃用的证据）。
 真浏览器冒烟是 T6 的独立脚本，不入 pytest。
 """
 
@@ -27,7 +30,7 @@ import pytest
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from browsepilot.agent.tools import ToolExecutor
-from browsepilot.app.browser.detect import MAX_HTML_SAMPLE_CHARS
+from browsepilot.app.browser.detect import MAX_HTML_SAMPLE_CHARS, detect_intervention
 from browsepilot.app.browser.policy import NavigationPolicy
 from browsepilot.app.executor import MAX_JS_RESULT_CHARS, AppToolExecutor
 from browsepilot.app.services.weather import Weather
@@ -48,15 +51,40 @@ ARIA_YAML = """- generic [ref=e1]:
 """
 
 DEFAULT_HTML = "<html><body><h1>Example Domain</h1><p>This domain is for use in examples.</p></body></html>"
-"""默认采样 HTML：普通页面，不含任何登录/验证码/弹窗标记（D5/D6 的负对照）。"""
+"""默认原始 HTML：普通页面（F1 之后 executor **不采样**原始 HTML；保留为负例缝）。"""
+
+DEFAULT_TEXT = "Example Domain This domain is for use in examples."
+"""默认可见文本：``body.inner_text()`` 的形状（标签被剥掉，只剩用户看得见的文案）。"""
 
 LOGIN_HTML = (
     "<html><body><form>账号 <input name='user'>密码 <input type='password'>"
     "<button>登录</button></form></body></html>"
 )
-"""登录页采样：中文入口词 + 凭据词 + 密码框（真实登录页的最小形态）。"""
+"""登录页原始 HTML：中文入口词 + 凭据词 + 密码框（真实登录页的最小形态）。"""
+
+LOGIN_TEXT = "账号 密码 登录"
+"""登录页的可见文本：标签被剥掉后仍是入口词 + 凭据词。"""
 
 CAPTCHA_HTML = "<html><body><p>请完成人机验证：点击验证后继续</p></body></html>"
+
+CAPTCHA_TEXT = "请完成人机验证：点击验证后继续"
+"""验证码页的可见文本：用户看得见的“要人来做验证”文案。"""
+
+HIDDEN_LOGIN_HTML = (
+    "<html><body><nav><a href='/signin'>登录</a></nav>"
+    "<div style='display:none'><label>账号</label><input name='user'>"
+    "<label>密码</label><input type='password'></div>"
+    "<div style='display:none'><script>var i18n = {'captcha': '验证码'}</script></div>"
+    "</body></html>"
+)
+"""F1（T5 审查）的实例：电商产品页的常见形态 —— 可见的「登录」导航链接 +
+``display:none`` 的隐藏登录下拉（账号/密码）+ 隐藏 i18n bundle（含「验证码」）。
+
+原始 HTML 里关键词一应俱全（旧接线采样 ``page.content()`` → 入口词 + 凭据词 → 误报
+``login/medium``，把唯一的人工暂停机会花在用户根本看不见的表单上）。"""
+
+HIDDEN_LOGIN_TEXT = "首页 登录 购物车"
+"""上面那个页面的可见文本：只有导航栏的入口词，没有凭据词 → 不命中任何规则（F1）。"""
 
 
 # ── fake page / browser（executor 的测试缝） ──────────────────────────────────
@@ -101,6 +129,13 @@ class FakeLocator:
             raise RuntimeError(f"count unavailable: {self.selector}")
         return self._page.password_inputs if "password" in self.selector else 0
 
+    async def inner_text(self, *, timeout: int | None = None) -> str:
+        """F1 可见文本采样（executor 只对 ``body`` 调用）：隐藏子树与 ``<script>`` 不在其中。"""
+        self._page.calls.append(("inner_text", self.selector))
+        if self._page.fail_inner_text:
+            raise RuntimeError(f"inner_text unavailable: {self.selector}")
+        return self._page.visible_text
+
     async def scroll_into_view_if_needed(self, *, timeout: float | None = None) -> None:
         self._page.calls.append(("scroll_into_view", self.selector))
 
@@ -123,12 +158,14 @@ class FakePage:
         snapshot_tree: str = ARIA_YAML,
         js_result: Any = "Example Domain",
         html: str = DEFAULT_HTML,
+        visible_text: str = DEFAULT_TEXT,
         password_inputs: int = 0,
     ) -> None:
         self.url = url
         self.snapshot_tree = snapshot_tree
         self.js_result = js_result
-        self.html = html  # D5/D6：page.content() 的采样
+        self.html = html  # 原始 HTML：F1 之后 executor 不该再采样它（负例缝）
+        self.visible_text = visible_text  # D5/D6 采样缝：body.inner_text() 的渲染后可见文本
         self.password_inputs = password_inputs  # D5/D6：input[type=password] 的匹配数
         self.calls: list[tuple] = []
         self.goto_calls: list[str] = []
@@ -142,7 +179,7 @@ class FakePage:
         self.fail_click = False
         self.fail_locator_evaluate = False
         self.fail_evaluate = False
-        self.fail_content = False  # D5/D6：采样失败必须降级成“没发现”
+        self.fail_inner_text = False  # D5/D6：采样失败必须降级成“没发现”
         self.fail_password_count = False
         self.mouse = FakeMouse(self)
 
@@ -179,15 +216,17 @@ class FakePage:
         return self.js_result
 
     async def content(self) -> str:
-        """D5/D6 页面采样（executor 只取前 20KB 并小写）。"""
+        """原始 HTML 采样——F1 之后 executor **不该再调用**：留成「被调用即留证据」的探针。
+
+        不删掉它：删了的话误用会变成 ``AttributeError`` → 被采样器的兜底 try/except 吞成
+        空串，故障反而变隐蔽（测试断言也失去 ``("content",)`` 这个直接证据）。
+        """
         self.calls.append(("content",))
-        if self.fail_content:
-            raise RuntimeError("page content unavailable")
         return self.html
 
 
 class FakeBrowser:
-    """BrowserPool 替身：只实现 executor 用到的 new_page()/release()；可注入启动失败。"""
+    """BrowserPool 替身：只实现 executor 用到的 new_page()/release()/discard()；可注入启动失败。"""
 
     def __init__(self, page: FakePage | None = None, *, start_error: Exception | None = None):
         self._page = page
@@ -195,6 +234,7 @@ class FakeBrowser:
         self.created: list[FakePage] = []
         self.new_page_calls = 0
         self.released: list[FakePage] = []
+        self.discarded: list[FakePage] = []
 
     async def start(self) -> None:  # pragma: no cover - 池生命周期由 app 接线负责
         pass
@@ -204,6 +244,11 @@ class FakeBrowser:
 
     async def release(self, page: FakePage) -> None:
         self.released.append(page)
+
+    async def discard(self, page: FakePage) -> None:
+        """F4：弃用页面（真池 = 移出 busy/idle + close）；死页不再被 new_page() 发出去。"""
+        self.discarded.append(page)
+        page.closed = True
 
     async def new_page(self) -> FakePage:
         self.new_page_calls += 1
@@ -381,16 +426,33 @@ async def test_browser_open_reuses_the_same_page_across_calls():
 
 
 @pytest.mark.asyncio
-async def test_browser_open_failure_keeps_page_for_later_observation():
-    """导航失败也是数据：current page 仍然可用（后续 snapshot 继续观察）。"""
+async def test_browser_open_failure_discards_the_poisoned_page():
+    """F4（T6 冒烟 S6 确定性复现的竞态）：失败导航的页面必须被**弃用**，不能留给下一次复用。
+
+    失败导航之后浏览器会把页面带去 ``chrome-error://chromewebdata/``，而这个错误页导航可能
+    还在飞：复用同一页的下一次 ``goto`` 会被它打断（"... is interrupted by another navigation
+    to \"chrome-error://chromewebdata/\""）→ 下一次 browser_open 假失败。
+    弃用（丢引用 + 让池关掉它）+ 下一次重新取干净页，才是不依赖时序的修法。
+    """
     page = FakePage()
     page.fail_goto = True
     browser = FakeBrowser(page)
     ex = make_executor(browser)
+
     failed = await ex.call("browser_open", {"url": "https://example.com/down"})
+
     assert failed.status == "error"
     assert failed.error_type == "navigation_failed"
-    assert (await ex.call("browser_snapshot", {})).status == "success"
+    assert browser.released == []  # 绝不回 idle：脏页会被下一个消费者取走
+    assert browser.discarded == [page]  # 弃用
+    assert page.closed is True  # 池真的关掉了它
+    # 观察类调用也不会续在脏页上动作（死页立即丢引用）
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+    # 下一次导航自动重获**干净**页（不是失败过的那个）
+    again = await ex.call("browser_open", {"url": "https://example.com/up"})
+    assert again.status == "success"
+    assert browser.new_page_calls == 2
+    assert browser.created[-1] is not page
 
 
 @pytest.mark.asyncio
@@ -876,10 +938,102 @@ def _hitl_payload(result) -> dict:
     return {key: result.data[key] for key in ("needs_human", "human_prompt", "intervention")}
 
 
+# ── F1（T5 审查）：只采样**渲染后可见文本**，原始 HTML 里的隐藏标记不算 ──────
+
+
+@pytest.mark.asyncio
+async def test_detection_samples_visible_text_not_raw_html():
+    """采样的**本侧**边界（:func:`_sample_html`）：``body.inner_text()`` 而不是 ``page.content()``。
+
+    原始 HTML 里躺着用户根本看不见的东西（``display:none`` 的隐藏登录下拉、``<script>``、
+    i18n bundle）：它们出现在源码里不代表页面上看得见，而关键词规则判的是“用户看见了什么”。
+    """
+    from browsepilot.app.executor import _sample_html
+
+    page = FakePage(html="<p>验证码</p>", visible_text="Product Detail 商品详情")
+    sample = await _sample_html(page)
+    assert sample == "product detail 商品详情"  # 取自 visible_text（且已小写）
+    assert ("inner_text", "body") in page.calls
+    assert ("content",) not in page.calls  # 原始 HTML 绝不进检测
+
+
+@pytest.mark.asyncio
+async def test_hidden_login_markup_does_not_trigger_hitl():
+    """F1 实例（T5 审查）：可见「登录」导航链接 + ``display:none`` 的账号/密码下拉。
+
+    旧接线采样原始 HTML（``page.content()``）：入口词「登录」与凭据词「账号/密码」同时出现
+    → 误报 HITL，而每次运行只有一次人工暂停机会。新接线只喂渲染后可见文本 → 只剩入口词，
+    没有凭据词 → 不命中任何规则（也不置 ``intervention``）。
+    """
+    page = FakePage(html=HIDDEN_LOGIN_HTML, visible_text=HIDDEN_LOGIN_TEXT, password_inputs=0)
+    result = await make_executor(FakeBrowser(page)).call(
+        "browser_open", {"url": "https://example.com/product/42"}
+    )
+    assert result.status == "success"
+    assert "needs_human" not in result.data
+    assert "intervention" not in result.data
+    assert ("content",) not in page.calls
+    # 反证：同一份原始 HTML 喂给检测器确实会命中（说明本用例不是“什么都没发生”）——
+    # 所以“喂可见文本”这条接线本身就是修复点（检测器是纯函数，分不出字符串的来源）。
+    assert (
+        detect_intervention(
+            url="https://example.com/product/42",
+            html_sample=HIDDEN_LOGIN_HTML,
+            has_password=False,
+        )
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+async def test_visible_captcha_text_still_triggers_hitl():
+    """F1 对照组：换成可见文本不等于放弃检测——页面上看得见的验证码文案照样命中。"""
+    page = FakePage(html=DEFAULT_HTML, visible_text=CAPTCHA_TEXT, password_inputs=0)
+    result = await make_executor(FakeBrowser(page)).call(
+        "browser_open", {"url": "https://example.com/checkout"}
+    )
+    assert result.data["needs_human"] is True
+    assert result.data["intervention"] == "captcha"
+    assert ("inner_text", "body") in page.calls
+
+
+# ── F2（T5 审查）：置信度真正决定要不要暂停 HITL ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_medium_confidence_intervention_is_recorded_but_does_not_pause():
+    """F2：``medium`` = 文本弱标记（中文关键词组 / 验证码品牌词）——只记录，不暂停。
+
+    每次运行只有一次人工暂停机会（``graph._route_execute_result`` 在
+    ``hitl_triggered_count > 0`` 后不再转 hitl），弱信号（帮助页文案、页脚品牌词）不该把它花掉；
+    命中仍进 ``data``，trace / 前端能看到“命中过但没暂停”。
+    """
+    page = FakePage(visible_text="登录 账号 密码", password_inputs=0)  # 入口词 + 凭据词 = medium
+    result = await make_executor(FakeBrowser(page)).call(
+        "browser_open", {"url": "https://example.com/p"}
+    )
+    assert result.status == "success"
+    assert result.data["intervention"] == "login"
+    assert "needs_human" not in result.data  # 图不转 hitl
+    assert "human_prompt" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_high_confidence_intervention_still_pauses():
+    """F2 对照组：``high``（URL 登录标记 / 密码框 / 验证码短语）照旧暂停等人工。"""
+    page = FakePage(visible_text="请输入验证码", password_inputs=0)
+    result = await make_executor(FakeBrowser(page)).call(
+        "browser_open", {"url": "https://example.com/p"}
+    )
+    assert result.status == "success"
+    assert result.data["needs_human"] is True
+    assert result.data["intervention"] == "captcha"
+
+
 @pytest.mark.asyncio
 async def test_browser_open_on_login_page_carries_hitl_payload():
     """D5：动作后落在登录墙 → 挂 needs_human（graph.execute 见它即转 hitl 节点 interrupt）。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     page.redirect_url = "https://example.com/login"  # 入参合法，站点把页面重定向到登录页
     browser = FakeBrowser(page)
     result = await make_executor(browser).call(
@@ -910,7 +1064,7 @@ async def test_browser_open_on_normal_page_has_no_needs_human_key():
 @pytest.mark.asyncio
 async def test_browser_click_on_captcha_page_carries_hitl_payload():
     """D5：点击后页面变成人机验证 → needs_human（intervention=captcha）。"""
-    page = FakePage(html=CAPTCHA_HTML)
+    page = FakePage(html=CAPTCHA_HTML, visible_text=CAPTCHA_TEXT)
     browser = FakeBrowser(page)
     ex = make_executor(browser)
     await ex.call("browser_open", {"url": "https://example.com/"})
@@ -924,7 +1078,7 @@ async def test_browser_click_on_captcha_page_carries_hitl_payload():
 @pytest.mark.asyncio
 async def test_browser_type_into_login_form_carries_hitl_payload():
     """D5：输入之后落在登录表单 → needs_human；动作本身照常完成（先清空再填）。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     browser = FakeBrowser(page)
     ex = make_executor(browser)
     await ex.call("browser_open", {"url": "https://example.com/"})
@@ -942,8 +1096,8 @@ async def test_browser_type_into_login_form_carries_hitl_payload():
 @pytest.mark.asyncio
 async def test_detection_failure_never_breaks_the_action():
     """检测是 best-effort：content()/密码框探测抛错 → 当作“没发现”，动作结果原样可用。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
-    page.fail_content = True
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
+    page.fail_inner_text = True
     page.fail_password_count = True
     browser = FakeBrowser(page)
     result = await make_executor(browser).call("browser_open", {"url": "https://example.com/"})
@@ -959,7 +1113,7 @@ async def test_failed_action_on_login_page_keeps_its_own_status():
     图端只在 success 上转 hitl（graph.execute），所以错误路径上的 flag 是诊断信息：
     降级链照常继续——绝不把一次失败的点击伪装成“需要人工”的成功。
     """
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     page.fail_click = True
     page.fail_locator_evaluate = True
     browser = FakeBrowser(page)
@@ -975,7 +1129,7 @@ async def test_failed_action_on_login_page_keeps_its_own_status():
 @pytest.mark.asyncio
 async def test_click_navigation_out_of_policy_wins_over_intervention():
     """落点在策略外时返回拦截结果（不是 HITL 载荷）：安全门先于人工桥。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     page.click_url = "file:///etc/passwd"
     browser = FakeBrowser(page)
     ex = make_executor(browser)
@@ -989,49 +1143,50 @@ async def test_click_navigation_out_of_policy_wins_over_intervention():
 @pytest.mark.asyncio
 async def test_browser_open_navigation_failure_is_not_sampled():
     """导航失败时页面停在浏览器错误页：不采样、不检测（错误页上没有“需要人工”的信号）。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     page.fail_goto = True
     browser = FakeBrowser(page)
     result = await make_executor(browser).call("browser_open", {"url": "https://example.com/down"})
     assert result.error_type == "navigation_failed"
     assert "needs_human" not in result.data
-    assert ("content",) not in page.calls
+    assert not [call for call in page.calls if call[0] in ("content", "inner_text")]
 
 
 @pytest.mark.asyncio
 async def test_observation_tools_do_not_run_detection():
-    """只有 open/click/type 做检测：snapshot/scroll 不采样（content() 是整页序列化，不白花）。"""
-    page = FakePage(html=LOGIN_HTML, password_inputs=1)
+    """只有 open/click/type 做检测：snapshot/scroll 不采样（采样要在动作之后才有意义）。"""
+    page = FakePage(html=LOGIN_HTML, visible_text=LOGIN_TEXT, password_inputs=1)
     browser = FakeBrowser(page)
     ex = make_executor(browser)
     await ex.call("browser_open", {"url": "https://example.com/"})
     page.calls.clear()
     await ex.call("browser_snapshot", {})
     await ex.call("browser_scroll", {"direction": "down"})
-    assert not [call for call in page.calls if call[0] in ("content", "count")]
+    # 既不读可见文本，也不读原始 HTML（旧接线）——更不做密码框探测
+    assert not [call for call in page.calls if call[0] in ("content", "inner_text", "count")]
 
 
 @pytest.mark.asyncio
-async def test_html_sample_is_truncated_and_lowercased_before_matching():
+async def test_visible_text_sample_is_truncated_and_lowercased_before_matching():
     """采样的**本侧**边界（:func:`_sample_html`）：先截到 20KB 再小写。
 
     为什么单独测这个私有缝：``detect_intervention`` 自己也会截断，所以端到端测试
-    （:func:`test_html_sample_is_bounded_to_20kb`）分不出 executor 有没有截——
-    而这里确实需要它：把可能上 MB 的整页 HTML ``lower()`` 是纯浪费（复制全串）。
+    （:func:`test_visible_text_sample_is_bounded_to_20kb`）分不出 executor 有没有截——
+    而这里确实需要它：把可能上 MB 的可见文本 ``lower()`` 是纯浪费（复制全串）。
     """
     from browsepilot.app.executor import _sample_html
 
-    page = FakePage(html="A" * (MAX_HTML_SAMPLE_CHARS * 2))
+    page = FakePage(visible_text="A" * (MAX_HTML_SAMPLE_CHARS * 2))
     sample = await _sample_html(page)
     assert len(sample) == MAX_HTML_SAMPLE_CHARS
     assert sample == sample.lower()
-    assert ("content",) in page.calls
+    assert ("inner_text", "body") in page.calls
 
 
 @pytest.mark.asyncio
-async def test_html_sample_is_bounded_to_20kb():
+async def test_visible_text_sample_is_bounded_to_20kb():
     """采样有界（教训 §4）：标记落在第 20KB 之后就不算命中，超大页面不会拖慢动作。"""
-    page = FakePage(html="x" * MAX_HTML_SAMPLE_CHARS + "<p>验证码</p>")
+    page = FakePage(visible_text="x" * MAX_HTML_SAMPLE_CHARS + "验证码")
     result = await make_executor(FakeBrowser(page)).call(
         "browser_open", {"url": "https://example.com/"}
     )

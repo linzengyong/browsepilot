@@ -440,6 +440,8 @@ def _default_app() -> FastAPI:
     lifespan 会按 settings.checkpoint_db_path 创建共享 AsyncSqliteSaver。
     BrowserPool 在此同步构造（无 IO），start()/close() 由 lifespan 负责；
     同一实例既构造注入 executor，又作为 browser_pool 交给生命周期管理。
+    池配置全部来自 Settings：headless / max_pages / ``channel``（F3：空串 → None，见
+    ``Settings.browser_channel``——``channel=""`` 不是合法值，会直接启动失败）。
     """
     from browsepilot.agent.tracer import JsonlTracer
     from browsepilot.app.browser.browser_pool import BrowserPool
@@ -456,7 +458,9 @@ def _default_app() -> FastAPI:
         base_url=settings.model_base_url or None,
     )
     browser_pool = BrowserPool(
-        headless=settings.browser_headless, max_pages=settings.browser_max_pages
+        headless=settings.browser_headless,
+        max_pages=settings.browser_max_pages,
+        channel=settings.browser_channel or None,  # F3：空 = 自带 Chromium
     )
     executor = AppToolExecutor(
         WeatherService(), SearchService(), PageFetchService(), browser=browser_pool
