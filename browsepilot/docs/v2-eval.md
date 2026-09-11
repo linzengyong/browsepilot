@@ -30,7 +30,7 @@
 
 > 本节是 P4 **启动时**的快照（对照用）。P4 收口后的场景集（16 个文件）与检查类型（10 种）见 §4/§5，运行口径见 §6。
 >
-> **P5 刷新（2026-09-11，实测口径）**：本节数字保持原样（历史快照）。P5 阶段测试数演进：**801**（P5-T1 删除 v1 测试后，commit `3d51612`）**→ 810**（P5-T3 新增 `tests/test_eval/test_bench.py` 9 条后，HEAD `7304bee`；`uv run pytest tests/ -q` = `810 passed`，`--collect-only` 同样 810）。P5 的性能读数另见 `docs/v2-performance.md`（同一 HEAD）。
+> **P5 刷新（2026-09-11，实测口径）**：本节数字保持原样（历史快照）。P5 阶段测试数演进：**801**（P5-T1 删除 v1 测试后：该读数**达成于 `07bc3bd`**（删 v1 代码），在 `3d51612` 时点实测）**→ 810**（P5-T3 新增 `tests/test_eval/test_bench.py` 9 条后，HEAD `7304bee`；`uv run pytest tests/ -q` = `810 passed`，`--collect-only` 同样 810）。P5 的性能读数另见 `docs/v2-performance.md`（同一 HEAD）。
 
 **P3 → P4 交接要点**（来自 P3 final review + 收口修复）：
 - tier3 策略链 = `[browser_open, browser_snapshot]`；type/click 未入链（场景需标 `enabled: false`）
@@ -356,7 +356,7 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 - **本地等价验证**：`bash browsepilot/eval/gate.sh`（§6.1）逐条跑 CI 的四步，无网络 / 无 key / 无浏览器；
   P5-T0b 当次（2026-09-11）全绿 **exit 0**：`pytest tests/ -q` = **868 passed**、`ruff check src/ eval/ tests/`
   = clean、`mypy src/browsepilot/` = clean、`python -m eval.run_eval --mock` = `passed=8 skipped=4 disabled=4`（exit 0）。
-  **P5 后续读数（2026-09-11）**：本节的 868 是 P5-T0b 当次的历史读数；P5-T1 删除 v1 测试后为 **801**、
+  **P5 后续读数（2026-09-11）**：本节的 868 是 P5-T0b 当次的历史读数；P5-T1 删除 v1 测试后为 **801**（达成于 `07bc3bd`，在 `3d51612` 时点实测）、
   P5-T3 新增 9 条 bench 测试后当前基线 = **810 passed**（§2 的 P5 刷新注 / §6.1）；gate 的命令与口径未变。
   语义与 CI **完全同口径**（同一个脚本、同一组命令、同一份 mock 场景集），差别只在"谁来跑"：CI 是
   ubuntu-latest + `uv sync --all-extras --frozen`，本地是当前开发机（Python 3.14，依赖由 `uv.lock` 钉住）。

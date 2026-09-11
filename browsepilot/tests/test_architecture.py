@@ -7,6 +7,14 @@ import browsepilot  # noqa: F401  (fails until src/browsepilot exists)
 
 PKG = Path(__file__).resolve().parent.parent / "src" / "browsepilot"
 
+# 扫描覆盖面预期（覆盖度断言）：三条守卫都建立在"扫描结果"上 —— 目录被改名/误删时
+# ``for path in []`` 会让守卫**真空通过**（"三条全绿"什么都没守卫）。所以下面把每个
+# 扫描面真能扫到的模块数（model 5 / agent 9 / app.browser 6）与包内总数（32）钉死，
+# 由 ``_layer_files()`` 在每次扫描时验证。模块增减时请同步更新这两行 —— 这是防真空
+# 通过的必要代价：改包结构必须显式改这里，而不是静默少扫一个目录。
+_EXPECTED_MODULES = {"model": 5, "agent": 9, "app/browser": 6}
+_EXPECTED_PACKAGE_TOTAL = 32  # model 5 + agent 9 + app 17（含 app.browser 6 / app.services 5）+ 包根 1
+
 
 def _imported_modules(path: Path):
     tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -18,8 +26,24 @@ def _imported_modules(path: Path):
                 yield alias.name
 
 
-def _layer_files(layer: str):
-    return sorted((PKG / layer).rglob("*.py"))
+def _scan(root: Path) -> list[Path]:
+    return sorted(root.rglob("*.py"))
+
+
+def _layer_files(layer: str) -> list[Path]:
+    """层内模块清单；**扫描结果不符合预期计数时直接失败**（而不是返回空列表）。"""
+    files = _scan(PKG.joinpath(*layer.split("/")))
+    expected = _EXPECTED_MODULES[layer]
+    assert len(files) == expected, (
+        f"{layer}/ 扫到 {len(files)} 个模块，期望 {expected}"
+        " —— 目录改名/误删？守卫会真空通过"
+    )
+    total = len(_scan(PKG))
+    assert total == _EXPECTED_PACKAGE_TOTAL, (
+        f"包内模块总数 {total} != {_EXPECTED_PACKAGE_TOTAL}"
+        " —— 包结构变了，请复核三条守卫的扫描面（见本文件顶部注释）"
+    )
+    return files
 
 
 def test_model_layer_never_imports_upper_layers():
@@ -49,7 +73,7 @@ def test_app_browser_layer_is_self_contained():
     ``browsepilot.app.config``，其实一个 app 层模块都不依赖）；P3 final review I4 要求它真的有
     测试，而不只是文档承诺。
     """
-    for path in sorted((PKG / "app" / "browser").rglob("*.py")):
+    for path in _layer_files("app/browser"):
         for mod in _imported_modules(path):
             assert not mod.startswith("browsepilot.agent"), f"{path} imports {mod}"
             assert (

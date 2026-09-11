@@ -233,7 +233,7 @@ Tracer 旁路：`TracingModelProvider` 把每次 chat/stream/structured 记成 `
 | D7 | **域名白名单改为可配置安全策略，默认不拦截合法 https** | 原白名单是 P0 任务失败的根因之一 |
 | D8 | **版本策略**：原仓库新分支 `v2.0` | 类似大版本升级，保留历史 |
 
-**实现对照**：D1 = `StateGraph` + `AsyncSqliteSaver`；D2 = `LiteLLMProvider` + 自有 `Message/Usage/Cost`；D3 = `Tracer`/`JsonlTracer`（Langfuse/LangSmith 未接）；D4 = `_STRATEGY_CHAIN` + `router`；D5 = `frontend-vue/` 未重建；D6 = **未实现**（§6）；D7 = `NavigationPolicy("allow_https")`；D8 = 分支 `v2.0`（`browsepilot.__version__ = "2.0.0"`；`pyproject.toml` 的 `version` 仍为 `0.1.0`，待 P5 发布任务收敛）。
+**实现对照**：D1 = `StateGraph` + `AsyncSqliteSaver`；D2 = `LiteLLMProvider` + 自有 `Message/Usage/Cost`；D3 = `Tracer`/`JsonlTracer`（Langfuse/LangSmith 未接）；D4 = `_STRATEGY_CHAIN` + `router`；D5 = `frontend-vue/` 未重建；D6 = **未实现**（§6）；D7 = `NavigationPolicy("allow_https")`；D8 = 分支 `v2.0`（`browsepilot.__version__ = "2.0.0"`；`pyproject.toml` 的 `version` 已于 P5-T5 收敛为 `2.0.0`，见 `docs/v2-release.md`）。
 
 ### 5.1 分层红线（spec §7.2 第 3 条）
 
@@ -248,6 +248,8 @@ Tracer 旁路：`TracingModelProvider` 把每次 chat/stream/structured 记成 `
 | `test_agent_layer_never_imports_app_or_browser` | `agent/` 不 import `browsepilot.app`，也**不直接 import playwright**（浏览器驱动是 app.browser 的内部细节） |
 | `test_app_browser_layer_is_self_contained` | `app/browser/` 不 import `browsepilot.agent`，且 app 层内只允许 `browsepilot.app.browser.*`（配置以裸参数传入） |
 
+三条守卫都建立在"扫描到的模块清单"上，所以 `_layer_files()` 另带**扫描覆盖度前置断言**（model 5 / agent 9 / app.browser 6 个模块；包内总数 32）：目录改名/误删会让 `for path in []` **真空通过**，计数不符即失败（模块增减时需同步改期望值）。
+
 `eval/` 不在这三条守卫里；另有一条同类约定：`src/` 不反向依赖 `eval/`（实测 `grep -rn "import eval\|from eval" src/ --include="*.py"` = 0 命中）。
 
 ## 6. 未实现 / 未验证清单（诚实面）
@@ -260,10 +262,17 @@ Tracer 旁路：`TracingModelProvider` 把每次 chat/stream/structured 记成 `
 | **Tracer 分片** | 进程级单 tracer（一进程一 trace_id/一个 JSONL 文件）；按会话/任务分文件未实现 | `app/main.py::_default_app`；§4.5 |
 | **`aclose()` 未接 lifespan** | 评测 harness 逐场景调用；app 侧无归还点（长跑页 churn） | `executor.aclose()` docstring |
 | **4 个 Settings 字段未接线** | `session_timeout_seconds` / `max_steps` / `max_replans` / `consecutive_failures_threshold` 仅在 `config.py` 定义（一处默认值断言）；当前图不读 | `grep -rn` 全仓（除 config.py 外仅 `tests/test_app/test_main.py` 断言默认值） |
-| **版本号不一致** | `pyproject.toml` = `0.1.0` vs `browsepilot.__version__` = `"2.0.0"`（`/health` 报的是后者） | `pyproject.toml`；`src/browsepilot/__init__.py` |
 | **`skills/` 目录** | v1 遗留，v2 代码零引用（`grep -rn "skills" src/ eval/ tests/ --include="*.py"` = 0 命中）；去留待决策 | P5 计划「删除范围」 |
 | **HITL 端到端链路** | **未验证**（本机到 github.com/login 30s 超时，登录墙检测不可能触发）；`needs_human` 既不是通过也不是已确认缺陷 | `docs/v2-eval.md` §8.2 |
 | **cost_usd / 并发 HTTP 读数** | 未采集（LiteLLM 价格表超时；`/health` 只有 TestClient 口径） | `docs/v2-eval.md` §8.1；`docs/v2-performance.md` §5 |
+
+### 6.1 P5 已关闭（曾列于 §6 主表，收尾时解决）
+
+| 项 | 处置 | 证据 |
+|----|------|------|
+| **版本号不一致** | **已于 P5-T5 收敛**：`pyproject.toml` 的 `version`、`uv.lock`、`browsepilot.__version__` 三处统一为 `2.0.0`（`/health` 报 `2.0.0`） | `docs/v2-release.md` §一（发布验收证据）/§八（提交）；本文件 §5 D8 对照组 |
+
+> §6 主表写于 P5-T4（HEAD `7304bee`），是当时的实测状态；本小节记录其后的收敛结果。
 
 ---
 

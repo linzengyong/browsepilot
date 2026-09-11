@@ -225,11 +225,11 @@ curl -o /dev/null -w '%{http_code}' http://localhost:5173/src/main.ts # 200（11
 
 | # | 项 | 影响 | 处置 |
 |---|----|------|------|
-| 1 | **根 `README.md` 仍是 v1 描述**（`backend/app/` :8000、`browser_mcp/` :9400、目录树含已删除目录） | 新同事按 README 起步会走错路径；`browsepilot/docs/v2-deploy.md` 是当前的正确入口 | P5-T4 Step 3 明确需要用户裁决（工作树携带会话前的 `CLAUDE.md` / `README.md` / `.env.example` 未提交改动）；本次未触碰根文件 —— **发布后第一优先跟进项** |
+| 1 | **根 `README.md` / `CLAUDE.md` 仍是 v1 描述**（README：`backend/app/` :8000、`browser_mcp/` :9400、目录树含已删除目录；`CLAUDE.md`：`backend/app/` 七节点图、`browser_mcp` 模块、":9400 MCP 服务器"、`OPENAI_*` 环境变量 —— 同样未随 V2 更新） | 新同事按 README / `CLAUDE.md` 起步会走错路径；`browsepilot/docs/v2-deploy.md` 是当前的正确入口 | P5-T4 Step 3 明确需要用户裁决（工作树携带会话前的 `CLAUDE.md` / `README.md` / `.env.example` 未提交改动）；本次未触碰根文件 —— **发布后第一优先跟进项**（README 与 `CLAUDE.md` 并入同一跟进项） |
 | 2 | 无 git tag、未推送远程 | 无法用 tag 锚定 V2.0.0，CI 仍未跑过真实 runner（同 4.1-13） | 计划明确"不推送"；如需 tag，一行命令即可（由用户决定） |
 | 3 | A2A 端口未实现 | 外部 agent 无法按标准协议调用（spec D6 的承诺尚未兑现） | 待用户决策实现深度（§三 3.1） |
 | 4 | 前端未做浏览器内完整 UI 手测 | 界面交互（多轮、会话切换、流式渲染）未经人工确认 | 本次仅命令行验证首页/模块/代理/SSE；真实浏览器 UI 手测属人工验收 |
-| 5 | `uv.lock` 随版本号机械更新（1 行） | 无 —— 这是必需的伴随改动，否则 CI 的 `uv sync --frozen` 与 `pyproject.toml` 不一致 | 已随发布提交；`uv lock --check` 通过（182 packages） |
+| 5 | `uv.lock` 随版本号机械更新（1 行） | 无 —— 这是必需的伴随改动，否则 CI 的 `uv sync --frozen` 与 `pyproject.toml` 不一致 | 已随发布提交；`uv lock --check` 通过（182 packages；同日交付前依赖收敛后为 **120 packages** —— 删掉零 import 的直接依赖、补声明 `aiosqlite`） |
 
 ---
 
@@ -250,9 +250,9 @@ curl -o /dev/null -w '%{http_code}' http://localhost:5173/src/main.ts # 200（11
 
 ## 六、范围与冻结确认
 
-- 本任务（P5-T5）改动仅 **5 个文件**：`pyproject.toml`（版本）、`uv.lock`（版本机械同步）、
-  `CHANGELOG.md`（新建）、`docs/v2-release.md`（新建）、`src/browsepilot/__init__.py`
-  （**未改** —— 已是 `2.0.0`，无需收敛）。
+- 本任务（P5-T5）改动仅 **4 个文件**：`pyproject.toml`（版本）、`uv.lock`（版本机械同步）、
+  `CHANGELOG.md`（新建）、`docs/v2-release.md`（新建）—— 与 §八 的提交清单一致。
+  （`src/browsepilot/__init__.py` **未改** —— 已是 `2.0.0`，不属本次改动。）
 - 未触碰：根 `README.md` / `CLAUDE.md` / `.env.example` / `skills/` / `frontend-vue/` / `eval/` /
   `tests/` / `src/browsepilot/` 业务代码。
 - v1 代码冻结在 P5-T1 结束：`backend/`、`browser_mcp/`、`mcp_settings.json` 及 5 个引用旧模块的测试
