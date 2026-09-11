@@ -16,17 +16,28 @@
   ``latency_samples`` 一并给出，样本少时别把 P95 当结论。
 - token/cost 遵循 fail-loud：采集不到就 ``None``（**不进样本、不填 0**），
   ``total_tokens`` / ``total_cost_usd`` 只对已知样本求和（``token_samples`` / ``cost_samples``
-  说明有几个样本）。报表里的 0 只可能是真的 0。
+  说明有几个样本）。报表里的 0 只可能是真的 0：样本数为 0 时 JSON 写 ``null``（不是 0），
+  跨轮方差同口径 —— 没测到的指标不进方差，MD 里那一行写"—（未提供）"。
+- token 覆盖度（P4-T3 审查 I2 的数据面）：``measured_calls`` / ``model_calls`` 逐样本累加，
+  让 token 总和能被读成"N/M 调用有计量"（``structured`` / ``stream`` 没有 usage 面 → 总和是下限）。
 - 延迟/成功率在 :class:`Stats` 里就四舍五入（ms 2 位、率 4 位、成本 6 位）：报告是展示物，
   微秒级尾数不是信息。
 
 **双格式**（P4-D4）：``<timestamp>.json`` 进 ``data/eval-reports/``（data/ 是 gitignore，不入库），
 ``<timestamp>.md`` 给人读。两者同一时间戳、同一份数据：环境行（日期/模式/模型/git HEAD 短号）+
 汇总 + per-tier 拆分 + 场景表（id/tier/tags/PASS|FAIL|SKIP|DISABLED/耗时/tokens/stop_reason/失败明细）。
+环境行随运行形态补充 —— 报告**被单独引用**时也不能误读：
+
+- ``browser_pool``（real 模式）：``started`` / ``unavailable (start failed)``；后者在 MD 里加一条
+  显眼的环境警告行 —— tier3 的 0% 是环境归因（``browser_unavailable``），不是任务失败（P4-D5）。
+- mock 模式：MD 环境行下加一条 banner（mock 数据不代表模型质量）。
+- 同一秒内的第二次运行不覆盖上一次：文件名冲突时加 ``-1`` / ``-2`` 后缀（JSON/MD 成对同戳）。
 
 **多轮**（P4-D7）：``--repeat N`` 的每一轮各自聚合（:class:`Round`），跨轮给 min/max/mean/stdev
-（:class:`Variance`）与"哪条场景跨轮结论不一致"（:func:`flaky_scenarios`）——P1 的教训是
-"单轮 100% 可靠"不足以支撑"可靠"，需要方差证据。单轮报告没有跨轮段（没有轮可跨）。
+（:class:`Variance`；**总体**标准差 ``statistics.pstdev``，报表表头写明"标准差（总体）"）与"哪条场景跨轮
+结论不一致"（:func:`flaky_scenarios`）——P1 的教训是"单轮 100% 可靠"不足以支撑"可靠"，需要方差证据。
+单轮报告没有跨轮段（没有轮可跨）；多轮时 JSON 顶层带 ``"summary_scope": "pooled_over_rounds"``
+—— ``summary`` 是**跨轮样本池**（每轮各计一遍），不是某一次运行。
 
 **路径规则**（``--json`` / ``--md``）：带后缀 = 文件；结尾分隔符 / 已存在目录 / 无后缀 = 目录，
 写入 ``<目录>/<时间戳>.<后缀>``（P4-D7 的 ``--md data/eval-reports/`` 就是这个形状）。
@@ -52,6 +63,16 @@ DISABLED = "DISABLED"
 DASH = "—"
 """报表里"这个字段没有数据"的显示值：与 0 区分开（0 只可能是真的 0）。"""
 
+UNAVAILABLE = f"{DASH}（未提供）"
+"""数值型指标"没测到"的显示值（token / 成本 / 跨轮方差行）：说"未提供"，不说 0。"""
+
+BROWSER_POOL_STARTED = "started"
+BROWSER_POOL_UNAVAILABLE = "unavailable (start failed)"
+"""环境行 ``browser_pool`` 的两个取值（P4-D5 / I2：池起不来时 tier3 的失败要能归因到环境）。"""
+
+MOCK_BANNER = "> 本次为 mock 数据（FakeProvider/FakeExecutor），不代表模型质量。"
+"""mock 报告顶部的 banner：这些数字不度量模型质量（免得被当成真实评测引用）。"""
+
 TIMESTAMP_FORMAT = "%Y%m%d-%H%M%S"
 """报告文件名的时间戳格式（文件名安全，本地时区）。"""
 
@@ -71,10 +92,16 @@ _TIER_HEADERS = (
 )
 _ROUND_HEADERS = ("轮次",) + _TIER_HEADERS[1:]
 _SUMMARY_HEADERS = ("指标", "值")
-_VARIANCE_HEADERS = ("指标", "最小", "最大", "均值", "标准差")
+_VARIANCE_HEADERS = ("指标", "最小", "最大", "均值", "标准差（总体）")
 
-_ENV_LABELS = {"date": "日期", "mode": "模式", "model": "模型", "git_commit": "git"}
-_ENV_ORDER = ("date", "mode", "model", "git_commit")
+_ENV_LABELS = {
+    "date": "日期",
+    "mode": "模式",
+    "model": "模型",
+    "git_commit": "git",
+    "browser_pool": "浏览器池",
+}
+_ENV_ORDER = ("date", "mode", "model", "git_commit", "browser_pool")
 
 
 # ── 结果行 ───────────────────────────────────────────────────────────
@@ -87,6 +114,11 @@ class ScenarioResult:
     ``mode`` 是**本次运行**的模式（mock/real），不是场景声明的 ``mode``（后者解释的是"为什么跳过"，
     写在 ``skip_reason`` 里）。``passed`` 只对"跑过"的场景有意义：跳过/停用的行 ``passed=False``，
     状态由 :attr:`status` 按"停用 → 跳过 → 通过/失败"的次序判定。
+
+    ``measured_calls`` / ``model_calls`` 是 token 数字的**覆盖度**（P4-T3 审查 I2 的自描述快照）：
+    前者 = 真报了用量的模型调用数（N），后者 = 本场景发生的全部模型调用（M，含没有 usage 面的
+    structured/stream）—— 读者据此把 ``tokens`` 读成"N/M 调用有计量"的**下限**。拿不到就两者
+    都缺席（未知不是 0）。
     """
 
     id: str
@@ -100,6 +132,8 @@ class ScenarioResult:
     duration_ms: float | None = None
     tokens: int | None = None
     cost_usd: float | None = None
+    measured_calls: int | None = None
+    model_calls: int | None = None
     stop_reason: str | None = None
     failure_detail: str | None = None
     skip_reason: str | None = None
@@ -136,6 +170,8 @@ class ScenarioResult:
             "duration_ms": self.duration_ms,
             "tokens": self.tokens,
             "cost_usd": self.cost_usd,
+            "measured_calls": self.measured_calls,
+            "model_calls": self.model_calls,
             "stop_reason": self.stop_reason,
             "failure_detail": self.failure_detail,
             "skip_reason": self.skip_reason,
@@ -166,6 +202,8 @@ class Stats:
     token_samples: int = 0
     total_cost_usd: float = 0.0
     cost_samples: int = 0
+    measured_calls: int = 0  # token 有计量的模型调用数（已知样本求和；0 = 没有这种样本）
+    model_calls: int = 0  # 这些样本的模型调用总数（token 覆盖度的诚实分母）
 
 
 @dataclass(frozen=True)
@@ -205,12 +243,19 @@ def _stats(results: Sequence[ScenarioResult]) -> Stats:
     durations = [result.duration_ms for result in executed if result.duration_ms is not None]
     tokens = [result.tokens for result in executed if result.tokens is not None]
     costs = [result.cost_usd for result in executed if result.cost_usd is not None]
+    coverage = [
+        (result.measured_calls, result.model_calls)
+        for result in executed
+        if result.measured_calls is not None and result.model_calls is not None
+    ]
     return Stats(
         total=len(results),
         passed=passed,
         failed=failed,
         fragile_failed=fragile_failed,
-        skipped=sum(1 for result in results if result.skipped),
+        # 停用的行即便还带着 skipped=True 也只算一次：
+        # ``total == executed + skipped + disabled`` 必须无条件成立（汇总行自己要对得上账）。
+        skipped=sum(1 for result in results if result.skipped and not result.disabled),
         disabled=sum(1 for result in results if result.disabled),
         executed=len(executed),
         success_rate=round(passed / len(executed), 4) if executed else None,
@@ -223,6 +268,8 @@ def _stats(results: Sequence[ScenarioResult]) -> Stats:
         token_samples=len(tokens),
         total_cost_usd=round(sum(costs), 6),
         cost_samples=len(costs),
+        measured_calls=sum(measured for measured, _ in coverage),
+        model_calls=sum(model for _, model in coverage),
     )
 
 
@@ -237,6 +284,10 @@ def aggregate(results: Sequence[ScenarioResult]) -> Aggregates:
         **{f.name: getattr(summary, f.name) for f in fields(Stats)},
         per_tier={tier: _stats(by_tier[tier]) for tier in sorted(by_tier)},
     )
+
+
+RunStats = aggregate
+"""``aggregate`` 的兼容别名（P4-D3 计划里的名字是 ``RunStats``；同一函数，零成本消除歧义）。"""
 
 
 @dataclass(frozen=True)
@@ -268,7 +319,8 @@ VARIANCE_METRICS: dict[str, str] = {
 
 @dataclass(frozen=True)
 class Variance:
-    """跨轮波动（总体标准差；1 轮时 stdev=0，此时"波动"没有意义 —— 由报告标注轮次）。"""
+    """跨轮波动（**总体**标准差 ``statistics.pstdev``，报表表头写明；1 轮时 stdev=0，
+    此时"波动"没有意义 —— 由报告标注轮次）。"""
 
     min: float
     max: float
@@ -276,11 +328,33 @@ class Variance:
     stdev: float
 
 
+VARIANCE_SAMPLE_FIELDS: dict[str, str] = {
+    "latency_ms_p50": "latency_samples",
+    "latency_ms_p95": "latency_samples",
+    "total_tokens": "token_samples",
+    "total_cost_usd": "cost_samples",
+}
+"""指标的"样本数门"字段：该轮样本数为 0 = **没测到**这个指标（``total_tokens`` 的默认 0 是
+"空集求和"，不是"测到 0 token"）→ 那一轮不进方差，避免把缺席渲染成 0。"""
+
+
 def variance(rounds: Sequence[Round], metric: str) -> Variance | None:
-    """某个指标跨轮的 min/max/mean/stdev；该指标全为 ``None``（没有样本）→ ``None``。"""
-    values = [
-        float(value) for value in (getattr(r.summary, metric) for r in rounds) if value is not None
-    ]
+    """某个指标跨轮的 min/max/mean/stdev（**总体**标准差）。
+
+    只算**测到过**的轮：指标值为 ``None``（没有样本）、或该轮的样本数门
+    （:data:`VARIANCE_SAMPLE_FIELDS`）为 0 时跳过；一轮都没测到 → ``None``（调用方不渲染该行/
+    该键，而不是 0）。
+    """
+    sample_field = VARIANCE_SAMPLE_FIELDS.get(metric)
+    values: list[float] = []
+    for round_ in rounds:
+        summary = round_.summary
+        if sample_field is not None and getattr(summary, sample_field) == 0:
+            continue  # 这一轮没测到 → 未知（不是 0）
+        value = getattr(summary, metric)
+        if value is None:
+            continue
+        values.append(float(value))
     if not values:
         return None
     return Variance(
@@ -292,7 +366,11 @@ def variance(rounds: Sequence[Round], metric: str) -> Variance | None:
 
 
 def round_variances(rounds: Sequence[Round]) -> dict[str, Variance]:
-    """全部 :data:`VARIANCE_METRICS` 的跨轮波动（没有样本的指标不出现）。"""
+    """全部 :data:`VARIANCE_METRICS` 的跨轮波动（**没测到的指标不出现**）。
+
+    JSON 里就是键缺席（而不是 ``min=max=mean=stdev=0`` —— 那会被读成"波动为 0"）；
+    MD 的方差表反过来把没测到的行渲染成"—（未提供）"（人读的报表要说得出口）。
+    """
     computed = ((metric, variance(rounds, metric)) for metric in VARIANCE_METRICS)
     return {metric: value for metric, value in computed if value is not None}
 
@@ -368,16 +446,34 @@ def timestamp(when: datetime | None = None) -> str:
     return (when or datetime.now().astimezone()).strftime(TIMESTAMP_FORMAT)
 
 
+def browser_pool_status(started: bool) -> str:
+    """``harness.pool_lifecycle`` 的 ``started`` → 环境行取值（P4-D5 / I2）。
+
+    池起不来时 tier3 的工具全部返回 ``browser_unavailable``，tier3 的 0% 是**环境**归因；
+    报告得自己能说出这件事（否则单独引用一份报告时只看到一行 0%）。
+    """
+    return BROWSER_POOL_STARTED if started else BROWSER_POOL_UNAVAILABLE
+
+
 def resolve_output_path(path: str | Path, *, suffix: str, stamp: str | None = None) -> Path:
     """把 ``--json`` / ``--md`` 的取值解析成**具体文件路径**（父目录自动创建）。
 
     规则：结尾分隔符 / 已存在目录 / **无后缀** → 目录，写入 ``<目录>/<时间戳><suffix>``
     （P4-D4 的 ``<timestamp>.json`` 形状）；带后缀 → 就是文件路径。
+
+    目录形态下同名文件已存在（同一秒内的第二次运行）→ 加 ``-1`` / ``-2`` … 后缀：**报告不得
+    静默覆盖上一次的报告**（否则"同一秒跑两次"就丢了一份数据）。后缀按同一 ``suffix`` 各算各的，
+    所以同一秒内**成套**写出的 JSON/MD 会拿到同一个后缀（成对同戳）。
     """
     raw = str(path)
     target = Path(path)
     if raw.endswith(("/", "\\")) or target.is_dir() or target.suffix == "":
-        target = target / f"{stamp or timestamp()}{suffix}"
+        base = target / f"{stamp or timestamp()}{suffix}"
+        target = base
+        index = 1
+        while target.exists():
+            target = base.with_name(f"{base.stem}-{index}{base.suffix}")
+            index += 1
     target.parent.mkdir(parents=True, exist_ok=True)
     return target
 
@@ -389,7 +485,18 @@ _STATS_KEYS = tuple(f.name for f in fields(Stats))
 
 
 def _stats_dict(stats: Stats) -> dict[str, Any]:
-    return {name: getattr(stats, name) for name in _STATS_KEYS}
+    """``Stats`` → JSON：样本数为 0 的总量写 ``null``（**不是 0**）。
+
+    ``total_tokens`` / ``total_cost_usd`` 的字段默认 0 是"空集求和"的形状，不是测量结果；
+    同一个报告里汇总段写"未提供"、JSON 写 0 是自相矛盾的（0 只可能是真的 0）。
+    有几个样本由 ``token_samples`` / ``cost_samples`` 同时给出。
+    """
+    data = {name: getattr(stats, name) for name in _STATS_KEYS}
+    if not stats.token_samples:
+        data["total_tokens"] = None
+    if not stats.cost_samples:
+        data["total_cost_usd"] = None
+    return data
 
 
 def _rounds(
@@ -430,8 +537,12 @@ def write_json(
         ],
     }
     if len(round_list) > 1:
+        # 顶层标口径：``summary`` 是**跨轮样本池**（每轮各计一遍），别被读成"跑了 N 条场景"。
+        payload["summary_scope"] = "pooled_over_rounds"
         payload["variance"] = {
-            metric: asdict(value) for metric, value in round_variances(round_list).items()
+            # stdev_kind：stdev 是**总体**标准差（``statistics.pstdev``）—— 数字被引用时要能自证口径
+            metric: {**asdict(value), "stdev_kind": "population"}
+            for metric, value in round_variances(round_list).items()
         }
         payload["flaky"] = flaky_scenarios(round_list)
     target = resolve_output_path(path, suffix=".json", stamp=stamp)
@@ -469,14 +580,20 @@ def _fmt_rate(stats: Stats) -> str:
 
 
 def _fmt_tokens(stats: Stats) -> str:
+    """token 总和 + 它是什么口径：``N 条样本`` + ``N/M 调用有计量``（不满就写"下限"）。"""
     if not stats.token_samples:
-        return f"{DASH}（未提供）"
-    return f"{stats.total_tokens}（{stats.token_samples} 条样本）"
+        return UNAVAILABLE
+    coverage = ""
+    if stats.model_calls:
+        coverage = f"；{stats.measured_calls}/{stats.model_calls} 调用有计量"
+        if stats.measured_calls < stats.model_calls:
+            coverage += "，未计量的调用没进总和 → 是下限"
+    return f"{stats.total_tokens}（{stats.token_samples} 条样本{coverage}）"
 
 
 def _fmt_cost(stats: Stats) -> str:
     if not stats.cost_samples:
-        return f"{DASH}（未提供）"
+        return UNAVAILABLE
     return f"${stats.total_cost_usd:.6f}（{stats.cost_samples} 条样本）"
 
 
@@ -542,12 +659,22 @@ _VARIANCE_FORMATS = {
 
 
 def _variance_table(rounds: Sequence[Round]) -> list[str]:
+    """跨轮方差表：**没测到的指标照旧占一行**，值写"—（未提供）"（不是 0）。
+
+    JSON 里这类指标直接缺键（机读口径），MD 反过来要说得出口：读者看到"总 token"这一行
+    才知道这个指标是被跟踪的，只是这次没有样本 —— 而不是"报告不统计 token"。
+    """
+    measured = round_variances(rounds)
     rows = []
-    for metric, value in round_variances(rounds).items():
+    for metric, label in VARIANCE_METRICS.items():
+        value = measured.get(metric)
+        if value is None:
+            rows.append([label, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE, UNAVAILABLE])
+            continue
         fmt = _VARIANCE_FORMATS.get(metric, "{:.4f}")
         rows.append(
             [
-                VARIANCE_METRICS.get(metric, metric),
+                label,
                 fmt.format(value.min),
                 fmt.format(value.max),
                 fmt.format(value.mean),
@@ -581,6 +708,19 @@ def _scenario_table(results: Sequence[ScenarioResult]) -> list[str]:
     return _md_table(_SCENARIO_HEADERS, rows)
 
 
+def _browser_pool_warning(aggregates: Aggregates) -> str:
+    """池没起来的显眼警告（P4-D5 / I2）：tier3 的失败归因环境，不是任务失败。"""
+    text = (
+        f"> ⚠️ 环境警告：浏览器池未启动（`browser_pool={BROWSER_POOL_UNAVAILABLE}`）—— "
+        "tier3 的浏览器工具一律返回 `browser_unavailable`，这些失败归因于**环境**，不是任务失败。"
+    )
+    tier3 = aggregates.per_tier.get("tier3")
+    if tier3 is not None:
+        failures = tier3.failed + tier3.fragile_failed
+        text += f"（tier3 本次：执行 {tier3.executed} 条，失败 {failures} 条）"
+    return text
+
+
 def write_markdown(
     aggregates: Aggregates,
     results: Sequence[ScenarioResult],
@@ -590,10 +730,18 @@ def write_markdown(
     rounds: Sequence[Round] | None = None,
     stamp: str | None = None,
 ) -> Path:
-    """写人读报告（环境行 + 汇总 + 分层 + 跨轮/波动/flaky + 场景表）；返回实际写入的路径。"""
+    """写人读报告（环境行 + 汇总 + 分层 + 跨轮/波动/flaky + 场景表）；返回实际写入的路径。
+
+    环境行下自带两条"免得被误读"的声明：mock banner（这些数字不度量模型质量）与
+    池未启动警告（tier3 的失败归因环境）。
+    """
     round_list = _rounds(rounds, results, aggregates)
     env = dict(environment or {})
     lines: list[str] = ["# BrowsePilot 评测报告", "", *_env_lines(env)]
+    if env.get("browser_pool") == BROWSER_POOL_UNAVAILABLE:
+        lines += ["", _browser_pool_warning(aggregates)]
+    if env.get("mode") == "mock":
+        lines += ["", MOCK_BANNER]
     lines += ["", "## 汇总", ""]
     if len(round_list) > 1:
         # 多轮时汇总是**样本池**（每轮各计一遍）：不写这句话，"场景数 32" 会被读成跑了 32 条场景。

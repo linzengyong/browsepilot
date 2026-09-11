@@ -50,6 +50,11 @@ Modes:
 - ``--repeat N``（P4-D7）：同一场景集重复 N 轮，报告含**每轮**结果 + 跨轮方差
   （成功率/延迟 min-max + stdev）与 flaky 标注。exit code 语义不变：**任何**一轮出现非 fragile
   失败就 gate（0/1 之外不新增码）。
+- 环境行（P4-D5）：real 模式写 ``browser_pool`` = ``started`` / ``unavailable (start failed)``
+  （``harness.pool_lifecycle`` 的 ``started`` 透传），池起不来时 MD 另加一条显眼的环境警告行 ——
+  tier3 的失败要能**在报告里**归因环境，而不是只有日志里一条 WARNING；mock 没有池，不写这个键。
+- 用量覆盖度（P4-T3 I2 的数据面）：每条结果行带 ``measured_calls`` / ``model_calls``，
+  MD 汇总读作"N/M 调用有计量（未计量的没进总和 → 下限）"。
 - 空跑（``--tag`` 选不中任何可运行场景）不写报告：`run_all` 已经非零退出，没有数据可报。
 """
 
@@ -57,8 +62,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from browsepilot.agent.tracer import JsonlTracer, Tracer
 from eval import harness, report
@@ -79,6 +86,23 @@ def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
     """
     result = run_check(outcome, check)
     return result.passed, result.detail
+
+
+def _usage_coverage(usage: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    """``token_usage`` 快照 → ``(有计量的调用数 N, 模型调用总数 M)``。
+
+    ``chat_calls`` 是唯一有 usage 面的口，``estimated_calls`` 是其中 provider 没回报用量的次数，
+    两者相减 = 真的计进了 token 的调用数；``model_calls``（含没有 usage 面的 structured/stream）
+    是**诚实分母**。报告据此把 token 总和读成"N/M 调用有计量"的**下限**（P4-T3 审查 I2）。
+
+    快照缺席（一个数字都没有）或分母拿不到时返回 ``(None, None)`` —— 未知不是 0，
+    也不编造一个分母。
+    """
+    model_calls = usage.get("model_calls")
+    chat_calls = usage.get("chat_calls")
+    if model_calls is None or chat_calls is None:
+        return None, None
+    return int(chat_calls) - int(usage.get("estimated_calls") or 0), int(model_calls)
 
 
 async def _run_scenario(
@@ -211,6 +235,7 @@ async def run_all(
         # 报告侧的失败明细只留**失败**的那几条（通过项不是"根因"）；采集不到的数字保持缺席（不填 0）。
         failures = "; ".join(text for passed_check, text in checks if not passed_check) or None
         usage = outcome.get("token_usage") or {}
+        measured_calls, model_calls = _usage_coverage(usage)
         if results is not None:
             results.append(
                 ScenarioResult(
@@ -219,6 +244,8 @@ async def run_all(
                     duration_ms=outcome.get("duration_ms"),
                     tokens=usage.get("total_tokens"),
                     cost_usd=usage.get("cost_usd"),
+                    measured_calls=measured_calls,
+                    model_calls=model_calls,
                     stop_reason=outcome.get("stop_reason"),
                     failure_detail=failures,
                 )
@@ -248,12 +275,17 @@ def _write_reports(
     tags: list[str] | None,
     json_path: str | None,
     md_path: str | None,
+    browser_pool: str | None = None,
 ) -> None:
     """把若干轮的结果落成 JSON/Markdown 报告（同一时间戳 → 两个文件名成对）。
 
     汇总口径：``summary`` = **跨轮样本池**（每轮各算一遍；多轮报告另给每轮表与方差，
     见 :mod:`eval.report`）。环境行带上模型 id 与 git HEAD 短号 —— 报告要能回答
     "这批数字是哪份代码、哪个模型、什么时候跑出来的"。
+
+    ``browser_pool``（real 模式）= :func:`eval.report.browser_pool_status` 的取值：池起不来时
+    tier3 的失败要能**在报告里**归因到环境（P4-D5 / I2）；mock 模式没有池，传 ``None``
+    就不写入这个键（不塞假状态）。
     """
     stamp = report.timestamp()
     pooled = [result for round_ in rounds for result in round_.results]
@@ -261,7 +293,11 @@ def _write_reports(
     env = report.environment(
         mode=mode,
         model=model,
-        extra={"repeats": len(rounds), "tags": sorted(tags) if tags else None},
+        extra={
+            "repeats": len(rounds),
+            "tags": sorted(tags) if tags else None,
+            "browser_pool": browser_pool,
+        },
     )
     if json_path:
         target = report.write_json(
@@ -287,6 +323,7 @@ async def run_rounds(
     json_path: str | None = None,
     md_path: str | None = None,
     model: str | None = None,
+    browser_pool: str | None = None,
 ) -> int:
     """跑 ``repeat`` 轮同一场景集 → 汇总 → （可选）写报告；返回 exit code（0/1）。
 
@@ -294,6 +331,7 @@ async def run_rounds(
     - exit code 与单轮同语义：任何一轮出现非 fragile 失败就 gate（fragile 失败只计数）。
     - 空跑（``--tag`` 选不中可运行场景）时 ``run_all`` 返回 1 且一条结果都没有：不写报告、
       也不再重复 N 遍（没有数据可报，日志里已经报了原因）。
+    - ``browser_pool`` 进环境行（real 模式 = 池启动状态；见 :func:`_write_reports`）。
     """
     if repeat < 1:
         raise ValueError(f"repeat must be >= 1, got {repeat}")
@@ -320,7 +358,13 @@ async def run_rounds(
         rounds.append(Round(index=index, results=results))
     if rounds and (json_path or md_path):
         _write_reports(
-            rounds, mode=mode, model=model, tags=tags, json_path=json_path, md_path=md_path
+            rounds,
+            mode=mode,
+            model=model,
+            tags=tags,
+            json_path=json_path,
+            md_path=md_path,
+            browser_pool=browser_pool,
         )
     return exit_code
 
@@ -351,9 +395,12 @@ async def _run_real(
     池的生命周期在 :func:`eval.harness.pool_lifecycle` 里（含降级与异常安全）；``teardown``
     是逐场景的页面归还点（C2③）。池跨**全部轮次**只起一次（多轮之间不给模型换环境），
     否则 P4-D7 的"方差"里混进了池起停的噪声。模型 id 进环境行。
+
+    ``pool_lifecycle`` 的 ``started`` **透传到报告环境行**（P4-D5 / I2）：池起不来时 tier3 全部
+    ``browser_unavailable``，报告必须能自己说出"这些失败归因环境"，而不是只用一行 0% 说话。
     """
     provider, executor, pool = _real_stack()
-    async with harness.pool_lifecycle(pool, executor):
+    async with harness.pool_lifecycle(pool, executor) as started:
         return await run_rounds(
             provider=provider,
             executor=executor,
@@ -365,6 +412,7 @@ async def _run_real(
             json_path=json_path,
             md_path=md_path,
             model=getattr(provider, "model", None),
+            browser_pool=report.browser_pool_status(started),
         )
 
 
