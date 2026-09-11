@@ -8,7 +8,11 @@ defaults to tier1/search. execute runs a per-intent strategy chain
 ToolExecutor, and records every failed attempt in degradation_log until a
 strategy succeeds or all fail (all_strategies_failed). answer synthesizes
 the final reply from result_data (chitchat/knowledge_qa answer directly;
-tool failures are explained explicitly, never fabricated).
+tool failures are explained explicitly, never fabricated). Answers built on a
+degraded (fallback) path must disclose it (spec §2 「带说明的降级回答」): the payload
+carries ``degraded_from`` and the system prompt requires the model to state what
+failed and why, and never to present the fallback result as the answer to the
+original question.
 """
 
 from __future__ import annotations
@@ -55,6 +59,11 @@ def _answer_payload(state: AgentState) -> dict:
     不是给答案模型的数据：resume 之后人已经做完了，agent 的下一步是交答案而不是再请求一次暂停
     （P3 收口 re-review F4：光靠 system 里那句“人工已经做完”挡不住数据里的“需要人工”）——
     所以**无条件**剥掉。
+
+    降级**后仍拿到数据**的路径另注入 ``degraded_from``（T5 跟进 / spec §2「带说明的降级回答」）：
+    兜底成功时模型只看到“一份成功的数据”，没人告诉它这份数据是绕道来的，它就会把兜底结果当作
+    原问题的答案（P4-T5 真实模式实证：把搜到的“三亚亚特兰蒂斯水世界”的天气答成用户问的
+    “亚特兰蒂斯”的天气）。全败路径不注入（见 :func:`_degraded_provenance`）。
     """
     data = dict(state.result_data)
     data.pop("needs_human", None)
@@ -62,7 +71,30 @@ def _answer_payload(state: AgentState) -> dict:
         data.pop("human_prompt", None)
         data.pop("intervention", None)
         data["human_response"] = state.human_response
+    degraded_from = _degraded_provenance(state)
+    if degraded_from:
+        data["degraded_from"] = degraded_from
     return data
+
+
+def _degraded_provenance(state: AgentState) -> list[dict]:
+    """降级**后仍拿到数据**时要交给答案模型的来源说明（T5 跟进 / spec §2「带说明的降级回答」）。
+
+    P4-T5 真实模式抽查的实证缺陷：prompt「亚特兰蒂斯今天天气怎么样？」→ weather ``city_not_found``
+    → 设计内的 search 兜底搜到【三亚亚特兰蒂斯水世界】→ 模型隐式换了实体，把水世界的天气当作
+    “亚特兰蒂斯”的天气答出去（5 次 4 次）。兜底链本身没问题，缺陷在**答案不说明来源**：模型只
+    看得到“一份成功的数据”，无从知道它是绕道来的，也就无从声明原始尝试失败过。
+
+    所以把 ``degradation_log``（strategy/error/message，按 (strategy, error) 去重后）作为
+    ``degraded_from`` 一起交给模型。全败路径**不交**：那条路径的 answer 分支自己逐条渲染
+    ``result_data["degradation"]`` 说明原因（今天的 error 形状只有 ``all_strategies_failed``），
+    再交一份就是把同一件事说两遍；而 ``result_data`` 里只要带 error，答案就不走 payload 这条路。
+    """
+    if not state.degradation_log:
+        return []
+    if state.result_data.get("error"):
+        return []
+    return _merge_degradation([], state.degradation_log)
 
 
 def _merge_degradation(existing: list[dict], new: list[dict]) -> list[dict]:
@@ -132,6 +164,19 @@ def _partial_note(data: dict) -> str:
         "（要么只观察了当时打开的页面，要么只打开了页面却没取到内容）。"
         "回答时明确说出已经看到什么、还有什么没完成，不要说任务已完成，也不要编造页面内容。"
     )
+
+
+#: 降级成功路径的 system 规则（T5 跟进 / spec §2「带说明的降级回答」）。
+#: 只在 payload 里真的有 ``degraded_from`` 时拼接（没降级就不提降级，不稀释正常回答）：
+#: 数据面给了模型“哪些尝试失败过”，这条规则要求它把它说出口，而不是把兜底结果当原问题的答案。
+_DEGRADED_ANSWER_RULE = (
+    "注意：数据里的 degraded_from 是这份数据**降级前的失败尝试**（原始尝试的顺序、错误类型与原因）。"
+    "出现 degraded_from 时必须：①先说明原始尝试失败了、失败原因是什么（用「未能找到…」「无法获取…」"
+    "这类说法明确讲出来，不得略过）；②再说明现在这份数据来自哪条兜底路径（例如「未找到名为"
+    "\"亚特兰蒂斯\"的城市天气，以下是与该名称相关的搜索结果：…」）；③不得把兜底结果当作原问题的"
+    "答案直接陈述：不得用兜底结果里的实体替换原问题里的实体，也不得把兜底结果里该实体的具体数值"
+    "（如温度）当作原问题的答案给出。"
+)
 
 
 #: 链上“成功后仍需继续”的步骤（C2）：``browser_open`` 只是**导航**，而浏览器任务的目标在页面上
@@ -380,8 +425,14 @@ def build_graph(
                 # C1：人工反馈进上下文（resume 后不读 human_response 等于把人工确认丢掉），
                 # 并在 system 里把"人工已经做完"说清楚——否则模型会顺着数据里那句
                 # "请手动登录"再要求人工操作一遍。
+                # T5 跟进（spec §2「带说明的降级回答」）：payload 里出现 degraded_from（数据来自
+                # 兜底路径）就拼上行为规则——“原始尝试失败了、为什么”“不得把兜底结果当作原问题
+                # 的答案”。规则和数据面同时在场：只说其中一面，模型都可能跳过“没找到”这段。
                 human_note = _human_feedback_note(state.human_response)
+                payload = _answer_payload(state)
                 system_content = "你是信息助手。用中文简洁回答，基于给定数据，不要编造。"
+                if "degraded_from" in payload:
+                    system_content += _DEGRADED_ANSWER_RULE
                 if human_note:
                     system_content += (
                         "人工已经完成了先前需要人工处理的操作（登录/人机验证等）；"
@@ -395,7 +446,7 @@ def build_graph(
                             content=(
                                 f"历史对话：\n{history_text}\n\n"
                                 f"任务：{state.task}\n"
-                                f"数据：{json.dumps(_answer_payload(state), ensure_ascii=False)}"
+                                f"数据：{json.dumps(payload, ensure_ascii=False)}"
                                 f"{_partial_note(state.result_data)}"
                                 f"{human_note}"
                             ),

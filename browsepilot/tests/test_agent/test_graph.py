@@ -52,9 +52,13 @@ class StubProvider:
     def __init__(self):
         self.structured_calls = 0
         self.last_user_content = ""
+        self.last_system_content = ""
 
     async def chat(self, messages, *, model=None):
         self.last_user_content = messages[-1].content
+        first = messages[0] if messages else None
+        if first is not None and first.role == "system":
+            self.last_system_content = first.content
         return ChatResult(text=f"answer for {messages[-1].content[:20]}")
 
     async def stream(self, messages, *, model=None):
@@ -489,6 +493,103 @@ async def test_weather_falls_back_to_search(tmp_path):
         ("weather", "error"),
         ("search", "success"),
     ]
+
+
+# ── T5 跟进：降级路径的答案必须说明来源（spec §2「带说明的降级回答」） ──────────
+
+#: 降级成功场景的降级记录（真实形状：weather 城市未命中 → search 兜底成功）
+_CITY_NOT_FOUND = {
+    "strategy": "weather",
+    "error": "city_not_found",
+    "message": "no coordinates for city: '亚特兰蒂斯'",
+}
+
+
+def test_answer_payload_discloses_degraded_provenance_when_fallback_succeeds():
+    """兜底**成功**时，答案模型必须拿到这份数据的降级来源（strategy/error/message）。
+
+    P4-T5 真实模式抽查抓到的第一个产品缺陷：prompt「亚特兰蒂斯今天天气怎么样？」→ weather
+    ``city_not_found`` → 设计内的 search 兜底搜到「三亚亚特兰蒂斯水世界」→ 模型隐式换了实体，
+    把水世界的天气当作"亚特兰蒂斯"的天气答了出去（5 次 4 次）。兜底本身没问题，缺陷是答案**不说明
+    来源**：既不提原始尝试失败，也不提这份数据是绕道来的（spec §2：降级 → 带说明的降级回答）。
+
+    所以 ``_answer_payload`` 把降级记录去重后作为 ``degraded_from`` 一起交给模型。
+    """
+    state = AgentState(
+        result_data={"results": [{"title": "三亚亚特兰蒂斯水世界", "url": "https://x.example"}]},
+        degradation_log=[dict(_CITY_NOT_FOUND)],
+    )
+    data = _answer_payload(state)
+    assert data["degraded_from"] == [_CITY_NOT_FOUND]  # 来源说明进上下文
+    assert data["results"][0]["title"] == "三亚亚特兰蒂斯水世界"  # 数据面照常
+
+
+def test_answer_payload_dedupes_replayed_degradation_entries():
+    """来源说明与 ``degradation_log`` 同一把去重钥匙：resume 重放不把同一条降级说两遍。"""
+    other = {"strategy": "fetch_page", "error": "fetch_failed", "message": "连接超时"}
+    state = AgentState(
+        result_data={"results": []},
+        degradation_log=[dict(_CITY_NOT_FOUND), dict(_CITY_NOT_FOUND), other],
+    )
+    assert _answer_payload(state)["degraded_from"] == [_CITY_NOT_FOUND, other]
+
+
+def test_answer_payload_omits_provenance_on_the_all_failed_path():
+    """全败路径不受影响：answer 的 error 分支自己逐条渲染 ``result_data["degradation"]``，
+    再注入一份 ``degraded_from`` 就是把同一件事说两遍。"""
+    entry = {"strategy": "weather", "error": "service_error", "message": "boom"}
+    state = AgentState(
+        result_data={"error": "all_strategies_failed", "degradation": [entry]},
+        degradation_log=[entry],
+    )
+    assert "degraded_from" not in _answer_payload(state)
+
+
+@pytest.mark.asyncio
+async def test_degraded_fallback_answer_prompt_discloses_its_source(tmp_path):
+    """降级成功场景（weather 未命中 → search 兜底）的 answer prompt：
+    数据里有来源说明 + system 里有一条"必须说明来源"的规则（否则模型照旧隐式换实体）。"""
+    tracer = JsonlTracer(trace_id="t20", out_dir=tmp_path / "traces")
+    provider = StubProvider()
+    graph = build_graph(FlakyExecutor(), tracer, provider)
+    result = await graph.ainvoke(AgentState(task="亚特兰蒂斯今天天气怎么样？"))
+    assert result["intent"] == "weather"
+    assert result["degradation_log"][0]["error"] == "city_not_found"
+
+    prompt = provider.last_user_content
+    assert "degraded_from" in prompt
+    assert "city_not_found" in prompt
+    assert "无此城市" in prompt  # message 原文：模型要能说清"原始尝试为什么失败"
+
+    system = provider.last_system_content
+    assert "degraded_from" in system
+    assert "原始尝试" in system
+    assert "不得把兜底结果当作原问题的答案直接陈述" in system
+
+
+@pytest.mark.asyncio
+async def test_undegraded_answer_prompt_carries_no_provenance_note(tmp_path):
+    """没有降级（链上首次尝试即成功）→ 不提降级：规则只在真降级时出现，不稀释正常回答。"""
+    tracer = JsonlTracer(trace_id="t21", out_dir=tmp_path / "traces")
+    provider = StubProvider()
+    graph = build_graph(StubExecutor(), tracer, provider)
+    await graph.ainvoke(AgentState(task="北京今天天气怎么样？"))
+    assert "degraded_from" not in provider.last_user_content
+    assert "degraded_from" not in provider.last_system_content
+
+
+@pytest.mark.asyncio
+async def test_all_failed_answer_renders_the_reasons_exactly_once(tmp_path):
+    """全败路径照旧：模板逐条渲染失败原因，不因为新增来源说明而重复渲染。"""
+    tracer = JsonlTracer(trace_id="t22", out_dir=tmp_path / "traces")
+    provider = StubProvider()
+    graph = build_graph(FailingExecutor(), tracer, provider)
+    result = await graph.ainvoke(AgentState(task="北京天气怎么样？"))
+    assert result["result_data"]["error"] == "all_strategies_failed"
+    answer = result["final_answer"]
+    assert answer.count("抱歉，这个任务暂时无法完成") == 1
+    assert "weather: boom" in answer and "search: boom" in answer
+    assert provider.last_user_content == ""  # 全败不走 answer 模型，只有模板渲染
 
 
 @pytest.mark.asyncio
