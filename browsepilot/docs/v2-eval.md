@@ -1,6 +1,10 @@
 # BrowsePilot V2 评测体系
 
 > 本文档在 P4 阶段完成（T8）：评测哲学（§3）· 场景规范（§4）· 检查类型（§5）· 运行指南（§6）· 3 轮真实数据与量化结果（§7）· 已知限制（§8）。
+>
+> **P5 刷新（2026-09-11，P5 Task 4）**：测试数基线更新到 **810**（§2/§6.1/§6.5）· P5-T0 的两处口径修正（§3.4/§5.1/§5.2/§5.3/§5.4：覆盖度分母不因"没有数字"而消失；`tier_is`/`stop_reason_is` 缺 `expected` → FAIL）· 新增交叉引用与历史读数注。
+>
+> **相关文档**：架构 `docs/v2-architecture.md` · 部署与环境变量全表 `docs/v2-deploy.md` · 性能基线 `docs/v2-performance.md`。
 
 ## 1. 环境与运行前提
 
@@ -25,6 +29,8 @@
 | 检查类型 | 3（field / contains_keyword / 未知→失败） | `eval/run_eval.py:check_outcome` |
 
 > 本节是 P4 **启动时**的快照（对照用）。P4 收口后的场景集（16 个文件）与检查类型（10 种）见 §4/§5，运行口径见 §6。
+>
+> **P5 刷新（2026-09-11，实测口径）**：本节数字保持原样（历史快照）。P5 阶段测试数演进：**801**（P5-T1 删除 v1 测试后，commit `3d51612`）**→ 810**（P5-T3 新增 `tests/test_eval/test_bench.py` 9 条后，HEAD `7304bee`；`uv run pytest tests/ -q` = `810 passed`，`--collect-only` 同样 810）。P5 的性能读数另见 `docs/v2-performance.md`（同一 HEAD）。
 
 **P3 → P4 交接要点**（来自 P3 final review + 收口修复）：
 - tier3 策略链 = `[browser_open, browser_snapshot]`；type/click 未入链（场景需标 `enabled: false`）
@@ -92,7 +98,7 @@ tag（§4.3）决定场景在哪个面里是"必过"，`--tag` 取任一匹配�
 "不知道"与"是 0"必须区分开 —— 报告里的每个数字都要能回答"它从哪来"：
 
 - **断言层**：`tokens_below` / `latency_below` / `tools_called` 拿不到数据时给可诊断的 FAIL（detail 指明缺哪个注入字段），绝不按空值通过；`field` / `contains_keyword` 缺声明同样是 FAIL；
-- **采集层**：harness 采不到用量时 `token_usage` 字段**缺席**（`UsageAccumulator.snapshot()` 返回 `None`），不填 0；provider 只报 total 时 `input_tokens` / `output_tokens` 缺席（未知不是 0）；`cost_usd` 只在 > 0 时出现（0 多半是"算不出价"）；
+- **采集层（P5-T0 修正）**：harness 采不到 **token 数字**时 token 键缺席（不填 0），但快照**照发** —— `usage_source` / `chat_calls` / `model_calls` 是采集到的事实，分母不能因为"没有数字"而少算（无数字时未计量的 chat 记为 `estimated_calls`）；**一次模型调用都没有时**整条 `token_usage` 才缺席（`UsageAccumulator.snapshot()` 返回 `None`）。provider 只报 total 时 `input_tokens` / `output_tokens` 缺席（未知不是 0）；`cost_usd` 只在 > 0 时出现（0 多半是"算不出价"）；
 - **聚合层**：`report.py` 里 `None` 不进样本、不填 0；样本数为 0 时 JSON 写 `null`、MD 写"—（未提供）"；每场景带 `measured_calls` / `model_calls`（token 覆盖度的诚实分母，§5.3）；
 - **加载层**：未知 tag / 未知字段 / 未知 mode、空 checks、非正 `timeout_seconds`、重复 id、空目录 → `ScenarioLoadError`（报文件名）：一次笔误不得静默变成"少跑一条场景"或"少断言一条"。
 
@@ -245,8 +251,8 @@ checks:
 | `contains_keyword` | `final_answer` 含**任一** keyword | `keywords` | `outcome["final_answer"]` | 缺 `keywords` → FAIL；answer 缺席/非字符串按空串 → FAIL |
 | `not_contains` | `final_answer` 不含**任何** keyword | `keywords` | `outcome["final_answer"]` | 缺 `keywords` → FAIL；answer 缺席按空串 → 通过（边界见 §5.4） |
 | `tools_called` | 工具名断言：`contains`（默认，全出现）/ `not_contains` / `exact_sequence`（有序子序列） | `tools`（`keywords` 是别名）/ `mode` | `execution_log[*]["tool"]`（v2 graph 不写）→ harness 注入 `outcome["tool_calls"]`（`call()` 的全部工具名，含失败；多轮累加） | 缺期望工具 → FAIL；未知 `mode` → FAIL；无调用记录且期望非空 → FAIL |
-| `tier_is` | `outcome["tier"] == expected` | `expected` | run_task state（路由**实际**层级） | 不等 → FAIL；`expected` 未强制的边界见 §5.4 |
-| `stop_reason_is` | `outcome["stop_reason"] == expected` | `expected` | run_task state | 不等 → FAIL；同上 |
+| `tier_is` | `outcome["tier"] == expected` | `expected` | run_task state（路由**实际**层级） | 缺 `expected` → FAIL（P5-T0 后空声明不再算通过）；不等 → FAIL |
+| `stop_reason_is` | `outcome["stop_reason"] == expected` | `expected` | run_task state | 缺 `expected` → FAIL；不等 → FAIL（同 `tier_is`） |
 | `tokens_below` | 总 token ≤ `limit` | `limit` | `token_usage.total_tokens` → `usage.total_tokens` → 扁平 `total_tokens`（当前只有 harness 注入） | 缺 `limit` → FAIL；无用量数据 → FAIL（"没数据不算通过"） |
 | `latency_below` | 总耗时 ≤ `limit_ms` | `limit_ms` | `outcome["duration_ms"]`（整场景墙钟）→ 否则 `execution_log[*]["duration_ms"]` 之和（**工具耗时之和**，不含模型调用） | 缺 `limit_ms` → FAIL；无耗时数据 → FAIL |
 | `degradation_absent` | `degradation_log` 为空 | 无 | run_task state（策略链每次失败的降级记录） | 有记录 → FAIL（detail 带条数 + 策略名）；字段缺席与空列表同判通过（正向断言"没有降级"） |
@@ -261,18 +267,18 @@ checks:
 | `tier` / `stop_reason` / `final_answer` / `result_data` / `degradation_log` / `pending_human_action` | `run_task` 返回的 `AgentState` dict | 产品的真实状态；`AgentState.execution_log` 有字段但 v2 graph **从不写** → `tools_called` 不能依赖它 |
 | `tool_calls` | harness `ToolCallRecorder.call` | 本次场景**尝试过**的全部工具名（含失败调用）；多轮 = 各轮累加；无调用 → `[]` |
 | `duration_ms` | harness `time.perf_counter()` | 整场景（含全部轮次）墙钟毫秒 |
-| `token_usage` | harness `UsageAccumulator.snapshot()` | 见 §5.3；**一个可用数字都没有时字段缺席**（不填 0） |
+| `token_usage` | harness `UsageAccumulator.snapshot()` | 见 §5.3；**无 token 数字时仍发覆盖度键**（`usage_source` / `chat_calls` / `model_calls`，不填 0）；**一次模型调用都没有时整条缺席**（P5-T0 修正） |
 
 ### 5.3 chat-only 用量口径（token / cost 的下界）
 
-- 快照键（自描述，P4-T3 审查 I2）：`total_tokens`；`usage_source="chat_only"`；`chat_calls`（有 usage 面的调用数）；`model_calls`（实际发生的全部模型调用 = chat + structured + stream，**诚实分母**）；可选 `input_tokens` / `output_tokens`（仅当两者之和 > 0）；可选 `estimated_calls`（chat 里没报上量的次数）；可选 `cost_usd`（仅当 > 0）。
+- 快照键（自描述，P4-T3 审查 I2；覆盖度口径按 P5-T0 修正）：**只要发生过模型调用就发**的覆盖度键 —— `usage_source="chat_only"`（这组数字只覆盖 chat 调用；`chat_calls=0` 时同时说明"没有 chat 调用可计量"）、`chat_calls`（有 usage 面的调用数）、`model_calls`（实际发生的全部模型调用 = chat + structured + stream，**诚实分母**）；token 数字键**没有可用数字时一律不出现** —— `total_tokens`（优先 provider 报的 total，缺失时退化为 input+output）、`input_tokens` / `output_tokens`（仅当两者之和 > 0）；`estimated_calls`（chat 里没报上量的次数；无数字时 = `chat_calls`）；`cost_usd`（仅当 > 0）。
 - **为什么只有 chat**：`structured` 返回 schema 实例（litellm 的 usage 在重试循环里被丢）、`stream` 按 port 只 yield 字符串 —— 两个口都没有 usage 面。`UsageTrackingProvider` 只加一层"记账"（返回值原样透传），不改任何语义。
 - 因此 token / 成本是**下限**：T7 三轮样本池 `measured_calls=30 / model_calls=63`（47.6%），`total_tokens=10191` 是下限而不是"总消耗"（§7.7）；报告每条结果行带 `measured_calls` / `model_calls`，MD 汇总读作"N/M 调用有计量"。
-- 采集不到 → 字段缺席 → `tokens_below` FAIL；报告写 `null` / "—（未提供）"（§3.4）。
+- 没有 token 数字 → token 键缺席（快照仍在，覆盖度分母不少算）→ `tokens_below` FAIL；报告写 `null` / "—（未提供）"（§3.4）。**一次模型调用都没有时**整条 `token_usage` 才缺席（例：全败模板答案路径不调模型 —— P5-T0 修正）。
 
 ### 5.4 一致性边界（逐条核对 `checks.py` 得到的精确行为）
 
-- `tier_is` / `stop_reason_is` 未强制 `expected`：`expected` 缺席且 outcome 无该键时 `None == None` 判定**通过** —— 当前 16 个文件全部显式声明（已核对）；新增场景必须写 `expected`。
+- `tier_is` / `stop_reason_is` 缺 `expected` → **FAIL**（P5-T0 加的守卫：`expected` 缺席且 outcome 无该键时 `None == None` 不再判通过 —— 空声明不得算通过，与 `field` 同一条原则）。当前 16 个文件全部显式声明 `expected`（已核对）；新增场景必须写 `expected`。
 - `not_contains` 在 `final_answer` 缺席/非字符串时按空串处理 → **通过**（没有可匹配的文本）；所以"不得编造 / 不得抛栈"类断言应与"必须有数据"的断言成对出现（当前配 `contains_keyword`）。
 - `degradation_absent` 在 `degradation_log` 缺席时与空列表同判 → 通过（它是正向断言"没有降级"，不是"有数据才能判"）。
 - `needs_human` 用 `bool()` 真值判定（`pending_human_action` 非假即通过）。
@@ -300,6 +306,8 @@ cd browsepilot && bash eval/gate.sh    # 或仓库根：bash browsepilot/eval/ga
 | 4 | `uv run python -m eval.run_eval --mock` | 评测回归（FakeProvider/FakeExecutor：无网络 / 无 key / 无浏览器） |
 
 mock 的日志形状（当前 16 条场景）：`passed=8 skipped=4 disabled=4`，exit 0。4 条 SKIP = tier3/HITL/多轮（Fake 没有浏览器，"跑不了"不是"跑失败了"）；4 条 DISABLED = 3 条 `p0_*` 归档场景 + `t3_browser_interaction`（交互链未入图）。数字随场景集演进，**判据始终是 exit code**。
+
+**当前基线（P5-T3 后，2026-09-11，HEAD `7304bee`）**：步骤 1 = **810 passed**（步骤 2/3 = clean、步骤 4 = `passed=8 skipped=4 disabled=4`，exit 0）；数字演进与出处见 §2 的 P5 刷新注。环境变量（`BP_*` 全表）与启动方式见 `docs/v2-deploy.md`；分层与机制见 `docs/v2-architecture.md`。
 
 ### 6.2 CI 跑什么 / 不跑什么（P4-D8）
 
@@ -348,6 +356,8 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 - **本地等价验证**：`bash browsepilot/eval/gate.sh`（§6.1）逐条跑 CI 的四步，无网络 / 无 key / 无浏览器；
   P5-T0b 当次（2026-09-11）全绿 **exit 0**：`pytest tests/ -q` = **868 passed**、`ruff check src/ eval/ tests/`
   = clean、`mypy src/browsepilot/` = clean、`python -m eval.run_eval --mock` = `passed=8 skipped=4 disabled=4`（exit 0）。
+  **P5 后续读数（2026-09-11）**：本节的 868 是 P5-T0b 当次的历史读数；P5-T1 删除 v1 测试后为 **801**、
+  P5-T3 新增 9 条 bench 测试后当前基线 = **810 passed**（§2 的 P5 刷新注 / §6.1）；gate 的命令与口径未变。
   语义与 CI **完全同口径**（同一个脚本、同一组命令、同一份 mock 场景集），差别只在"谁来跑"：CI 是
   ubuntu-latest + `uv sync --all-extras --frozen`，本地是当前开发机（Python 3.14，依赖由 `uv.lock` 钉住）。
 - **发布报告必须如实标注**：引用 CI 时写"workflow 已就绪 + 本地 `gate.sh` 等价验证（exit 0）"，
@@ -459,7 +469,7 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 
 - **token 是 chat-only 下限**：`usage_source=chat_only`——`structured`/`stream` 调用没有 usage 面，不进总和。3 轮样本池里 **30/63 次模型调用有计量（47.6%）**，所以 10191 是**下限**而不是"总消耗"（报告里就是这个口径，每场景还带 `measured_calls/model_calls`）。
 - **成本未采集**：3 轮 `cost_samples=0`、`total_cost_usd=null`。每次运行启动时 LiteLLM 取远端价格表失败（log：`Failed to fetch remote model cost map from https://raw.githubusercontent.com/… : timed out. Falling back to local backup`），本地备份也没给出该模型的成本 → 写"未采集"，不估算。
-- **1 条场景天然没有 token 数**：`t2_read_page_failure` 3 轮 token 均缺席——它走模板答案路径（`token_usage=null`，0 次模型调用），是"未知不是 0"的如实处理（所以每轮 `token_samples=9/10`），不是采集故障。
+- **1 条场景天然没有 token 数**：`t2_read_page_failure` 3 轮 token 均缺席——它走模板答案路径，是"未知不是 0"的如实处理（所以每轮 `token_samples=9/10`），不是采集故障。**P5-T0 口径注**：当时 `token_usage` 整条为 `null`；同一形状在 P5-T0 之后会发覆盖度快照（`chat_calls=0`、`model_calls=2` —— fetch_page / browser_open 各一次 structured 参数提取，无 token 键），历史数字按本注读。
 - **延迟读数含依赖网络时间**：P95 跨轮 20053 → 33315 ms（stdev 5514.86），单条极值 45503.05 ms（R3 `t2_search_structural`）；这把 P95 变成"依赖延迟 + 模型时间"的混合读数，引用时别只贴 P95。
 - **样本量**：3 轮 × 10 场景 = 30 次场景运行（每场景 3 次）。这是**同一场景集重复跑**的波动，不是跨模型 / 跨日 / 跨网络的抽样；换模型（或换网络出口）结论不保证迁移。
 - **mock 数据不代表模型质量**：CI 门禁跑 FakeProvider/FakeExecutor（§6.2），只能证明断言与管线可复现；本节所有数字都是真实模式，二者不可混用。
@@ -473,7 +483,7 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 
 - **token 口径**：`structured` / `stream` 没有 usage 面（§5.3）→ 只有 `chat` 调用计入，`model_calls` 是诚实分母。T7 三轮样本池 **30/63 次模型调用有计量（47.6%）**，`total_tokens=10191` 是**下限**而不是"总消耗"；每轮的 `token_samples`（3 轮均为 9/10）暴露覆盖面。引用这些数字时必须带上"下限"口径。
 - **cost 未采集**：3 轮 `cost_samples=0`、`total_cost_usd=null`。原因：每次运行启动时 LiteLLM 取远端价格表失败（`Failed to fetch remote model cost map from https://raw.githubusercontent.com/… : timed out. Falling back to local backup`），本地备份也没有该模型的价格 → 写"未采集"，不估算。
-- **"缺席"不是 0**：`t2_read_page_failure` 3 轮 token 均缺席（模板答案路径，0 次模型调用）；报告按"未知"处理（`null` / 样本数），不是采集故障。
+- **"缺席"不是 0**：`t2_read_page_failure` 3 轮 token 均缺席（模板答案路径，0 次 chat 调用）；报告按"未知"处理（`null` / 样本数），不是采集故障。P5-T0 起"没有 token 数字"与"整条 `token_usage` 缺席"是两回事——覆盖度键照发（§5.2/§5.3）。
 
 ### 8.2 HITL 链路未端到端验证（环境阻塞）
 
