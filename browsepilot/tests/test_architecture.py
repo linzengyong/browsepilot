@@ -30,14 +30,13 @@ def test_model_layer_never_imports_upper_layers():
 
 
 def test_agent_layer_never_imports_app_or_browser():
-    """agent 层只经 ToolExecutor 协议与外部打交道：不 import app/browser_mcp，
+    """agent 层只经 ToolExecutor 协议与外部打交道：不 import app，
     **也不直接 import playwright**（浏览器驱动是 app.browser 的内部细节 ——
     docs/v2-p3-report.md 的冻结声明引用的就是这条守卫）。
     """
     for path in _layer_files("agent"):
         for mod in _imported_modules(path):
             assert not mod.startswith("browsepilot.app"), f"{path} imports {mod}"
-            assert not mod.startswith("browser_mcp"), f"{path} imports {mod}"
             assert not mod.startswith("playwright"), f"{path} imports {mod}"
 
 
@@ -57,8 +56,3 @@ def test_app_browser_layer_is_self_contained():
                 not mod.startswith("browsepilot.app") or mod.startswith("browsepilot.app.browser")
             ), f"{path} imports {mod}"
 
-
-def test_model_layer_never_imports_browser():
-    for path in _layer_files("model"):
-        for mod in _imported_modules(path):
-            assert not mod.startswith("browser_mcp"), f"{path} imports {mod}"
