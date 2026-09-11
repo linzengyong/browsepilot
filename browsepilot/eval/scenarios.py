@@ -91,7 +91,8 @@ class Scenario(BaseModel):
     tags: list[str] = Field(default_factory=lambda: ["acceptance"])
     mode: ScenarioMode = "both"
     checks: list[Check] = Field(default_factory=list)
-    timeout_seconds: float = 120.0  # 由 harness 按**轮**强制（P4-T3）；schema 只声明
+    timeout_seconds: float = Field(default=120.0, gt=0)
+    """每轮的超时预算（harness 按**轮**强制）；必须是正数（0/负数 = 必然超时/语义未定义）。"""
     fragile: bool = False  # 依赖外部动态内容的断言：失败不计入门禁 exit code
     enabled: bool = True  # False = 列出为 [DISABLED]、不跑
     follow_up: list[str] = Field(default_factory=list)  # 多轮场景第 2..n 轮 prompt

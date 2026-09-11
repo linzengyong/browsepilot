@@ -98,6 +98,23 @@ def test_scenario_without_checks_is_rejected():
         es.Scenario(**_minimal(checks=[]))
 
 
+@pytest.mark.parametrize("value", [0, 0.0, -1, -0.5, -120])
+def test_non_positive_timeout_is_rejected(value):
+    """P4-T3 审查 Minor：``timeout_seconds`` 是**正数预算** —— 0/负数是必然超时/语义未定义，
+    必须在加载时报错，而不是把每条场景都跑成超时后才让人去猜。"""
+    with pytest.raises(ValidationError):
+        es.Scenario(**_minimal(timeout_seconds=value))
+
+
+def test_load_rejects_non_positive_timeout(tmp_path):
+    """同一约束在文件加载路径上也成立（带文件名定位）。"""
+    _write(tmp_path, "s-zero.yaml", _minimal(timeout_seconds=0))
+    with pytest.raises(es.ScenarioLoadError) as excinfo:
+        es.load_scenarios(tmp_path)
+    assert "s-zero.yaml" in str(excinfo.value)
+    assert "timeout_seconds" in str(excinfo.value)
+
+
 def test_blank_prompt_is_rejected():
     with pytest.raises(ValidationError):
         es.Scenario(**_minimal(prompt="   "))
@@ -267,8 +284,32 @@ def test_run_all_releases_the_page_after_every_scenario(tmp_path):
     assert len(events) == len(_mock_runnable())
 
 
+class _HookProvider(FakeProvider):
+    """按关键字注入故障的 FakeProvider：只在任务文本含 ``keyword`` 的轮次上抛出/卡住。
+
+    逐场景隔离测试的故障源 —— "一条场景炸了"必须能精确定位到那一条，而不是整批一起炸；
+    其余场景照常走 fake 的确定性路径（b-pass 的 PASS 才有意义）。
+    """
+
+    def __init__(
+        self, keyword: str, *, error: Exception | None = None, delay: float | None = None
+    ) -> None:
+        self.keyword = keyword
+        self.error = error
+        self.delay = delay
+
+    async def chat(self, messages, *, model=None):
+        if any(self.keyword in message.content for message in messages):
+            if self.delay is not None:
+                await asyncio.sleep(self.delay)
+            if self.error is not None:
+                raise self.error
+        return await super().chat(messages, model=model)
+
+
 def test_run_all_teardown_runs_even_when_a_scenario_raises(tmp_path, monkeypatch):
-    """逐场景隔离必须异常安全：场景炸了也要归还页面（否则下一个场景续在脏页上）。"""
+    """逐场景隔离必须异常安全：场景炸了也要归还页面（否则脏页留给下一个场景），
+    而且下一个场景**照跑**（C1：单条异常不再中断整轮）。"""
     from eval import run_eval
 
     events: list[str] = []
@@ -276,28 +317,119 @@ def test_run_all_teardown_runs_even_when_a_scenario_raises(tmp_path, monkeypatch
     async def teardown() -> None:
         events.append("teardown")
 
-    class BoomProvider(FakeProvider):
-        async def chat(self, messages, *, model=None):
-            raise RuntimeError("model exploded")
-
-    # 第一条场景走 all_strategies_failed（不调 chat，不炸）→ 证明炸的是第二条、且两条都归还了
     _write_dir(
         tmp_path / "scenarios",
-        _minimal(id="a-quiet", prompt="亚特兰蒂斯今天天气怎么样？"),
-        _minimal(id="b-boom"),
+        _minimal(id="a-quiet"),
+        _minimal(id="b-boom", prompt="BOOM 北京今天天气怎么样？"),
     )
     monkeypatch.setattr(run_eval, "SCENARIOS_DIR", tmp_path / "scenarios")
     tracer = JsonlTracer(trace_id="eval", out_dir=tmp_path)
-    with pytest.raises(RuntimeError):
+    assert (
         asyncio.run(
             run_all(
-                provider=BoomProvider(),
+                provider=_HookProvider("BOOM", error=RuntimeError("model exploded")),
                 executor=FakeExecutor(),
                 tracer=tracer,
                 teardown=teardown,
             )
         )
+        == 1
+    )
     assert events == ["teardown", "teardown"]
+
+
+async def test_run_all_continues_after_a_failed_scenario(tmp_path, monkeypatch, capsys):
+    """P4-D5：失败场景不中断后续 —— a-fail（断言失败）之后 b-pass 照跑，两条结果行都在。"""
+    from eval import run_eval
+
+    _write_dir(
+        tmp_path / "scenarios",
+        _minimal(id="a-fail", checks=[{"type": "contains_keyword", "keywords": ["NOPE"]}]),
+        _minimal(id="b-pass"),
+    )
+    monkeypatch.setattr(run_eval, "SCENARIOS_DIR", tmp_path / "scenarios")
+    tracer = JsonlTracer(trace_id="eval-iso-fail", out_dir=tmp_path)
+    code = await run_all(provider=FakeProvider(), executor=FakeExecutor(), tracer=tracer)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[FAIL] a-fail" in out
+    assert "[PASS] b-pass" in out
+    assert "passed=1 failed=1" in out
+
+
+async def test_run_all_continues_after_a_raising_scenario(tmp_path, monkeypatch, capsys):
+    """C1（P4-T3 审查）：场景**异常**（模型/服务炸了）不得中止整轮 ——
+    ``[FAIL] <id>: EXCEPTION <type>: <msg>``、计为 failed、继续下一条（P4-D5）。"""
+    from eval import run_eval
+
+    _write_dir(
+        tmp_path / "scenarios",
+        _minimal(id="a-raise", prompt="BOOM 北京今天天气怎么样？"),
+        _minimal(id="b-pass"),
+    )
+    monkeypatch.setattr(run_eval, "SCENARIOS_DIR", tmp_path / "scenarios")
+    tracer = JsonlTracer(trace_id="eval-iso-raise", out_dir=tmp_path)
+    code = await run_all(
+        provider=_HookProvider("BOOM", error=RuntimeError("model exploded")),
+        executor=FakeExecutor(),
+        tracer=tracer,
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[FAIL] a-raise: EXCEPTION RuntimeError: model exploded" in out
+    assert "[PASS] b-pass" in out
+    assert "passed=1 failed=1" in out
+
+
+async def test_run_all_continues_after_a_scenario_times_out(tmp_path, monkeypatch, capsys):
+    """C1（T7 的痛）：场景超时（harness 的 TimeoutError 冒泡）只废自己那一条 ——
+    一次 120s 卡顿不得让整轮 acceptance 的剩余场景全部消失。"""
+    from eval import run_eval
+
+    _write_dir(
+        tmp_path / "scenarios",
+        _minimal(id="a-stall", prompt="SLOW 北京今天天气怎么样？", timeout_seconds=0.02),
+        _minimal(id="b-pass"),
+    )
+    monkeypatch.setattr(run_eval, "SCENARIOS_DIR", tmp_path / "scenarios")
+    tracer = JsonlTracer(trace_id="eval-iso-timeout", out_dir=tmp_path)
+    code = await run_all(
+        provider=_HookProvider("SLOW", delay=0.2),
+        executor=FakeExecutor(),
+        tracer=tracer,
+    )
+    out = capsys.readouterr().out
+    assert code == 1
+    assert (
+        "[FAIL] a-stall: EXCEPTION TimeoutError: scenario 'a-stall' 第 1/1 轮超过 "
+        "timeout_seconds=0.02s" in out
+    )
+    assert "[PASS] b-pass" in out
+    assert "passed=1 failed=1" in out
+
+
+async def test_raising_fragile_scenario_does_not_gate_but_is_reported(
+    tmp_path, monkeypatch, capsys
+):
+    """D6 与 C1 的交点：fragile 场景**异常**（例如 ddgs 网络抖动）同样不计入门禁 ——
+    但照实打 ``[FAIL] … EXCEPTION …``（失败可见，不伪装成通过）。"""
+    from eval import run_eval
+
+    _write_dir(
+        tmp_path / "scenarios",
+        _minimal(id="a-fragile-boom", prompt="BOOM 北京今天天气怎么样？", fragile=True),
+    )
+    monkeypatch.setattr(run_eval, "SCENARIOS_DIR", tmp_path / "scenarios")
+    tracer = JsonlTracer(trace_id="eval-fragile-raise", out_dir=tmp_path)
+    code = await run_all(
+        provider=_HookProvider("BOOM", error=RuntimeError("model exploded")),
+        executor=FakeExecutor(),
+        tracer=tracer,
+    )
+    out = capsys.readouterr().out
+    assert code == 0  # fragile 不 gate（D6）
+    assert "[FAIL] a-fragile-boom: EXCEPTION RuntimeError: model exploded" in out
+    assert "fragile=true" in out and "fragile_failed=1" in out
 
 
 def test_real_mode_wires_browser_pool_and_isolates_each_scenario(tmp_path, monkeypatch):

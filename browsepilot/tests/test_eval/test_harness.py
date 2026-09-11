@@ -83,6 +83,14 @@ class _SpyExecutor(FakeExecutor):
         self.events.append(f"attach:{'pool' if browser is not None else 'none'}")
 
 
+class _CloseBoomPool(_SpyPool):
+    """``close()`` 炸掉的池替身（异常安全：关池失败不得掩盖 body 的异常）。"""
+
+    async def close(self) -> None:
+        self.events.append("close")
+        raise RuntimeError("close exploded")
+
+
 class _UsageProvider(FakeProvider):
     """FakeProvider + 每次 ``chat`` 回报**已知**用量（采集测试的输入面）。
 
@@ -212,6 +220,15 @@ async def test_pool_lifecycle_closes_the_pool_when_the_body_raises():
     assert events == ["start", "close"]
 
 
+async def test_pool_lifecycle_closes_the_pool_on_cancellation():
+    """取消（``BaseException``）同样要归还池 —— 池的生命周期不看场景为什么结束。"""
+    events: list[str] = []
+    with pytest.raises(asyncio.CancelledError):
+        async with harness.pool_lifecycle(_SpyPool(events), _SpyExecutor(events)):
+            raise asyncio.CancelledError
+    assert events == ["start", "close"]
+
+
 async def test_pool_lifecycle_degrades_when_the_pool_cannot_start(capsys):
     """池起不来：打 WARNING + ``attach_browser(None)``，且**不假装关闭**没启动的池。
 
@@ -227,6 +244,26 @@ async def test_pool_lifecycle_degrades_when_the_pool_cannot_start(capsys):
     assert "browser_unavailable" in out
     assert "chromium rev 1217 not found" in out  # 原始异常文本要留在日志里
     assert events == ["start", "attach:none"]
+
+
+async def test_pool_lifecycle_close_failure_does_not_mask_the_body_exception(capsys):
+    """Minor（P4-T3 审查）：关池失败不得掩盖 body 的异常 —— 诊断优先级是"场景为什么炸"，
+    close 自己的问题打 WARNING（静默会把真正的原因丢掉）。"""
+    events: list[str] = []
+    with pytest.raises(RuntimeError, match="场景炸了"):
+        async with harness.pool_lifecycle(_CloseBoomPool(events), _SpyExecutor(events)):
+            raise RuntimeError("场景炸了")
+    assert events == ["start", "close"]
+    assert "close exploded" in capsys.readouterr().out
+
+
+async def test_pool_lifecycle_propagates_close_failure_when_the_body_was_clean():
+    """body 没炸时 close 的失败照常上抛：没有要保留的原异常，清理失败不该被静默吞掉。"""
+    events: list[str] = []
+    with pytest.raises(RuntimeError, match="close exploded"):
+        async with harness.pool_lifecycle(_CloseBoomPool(events), _SpyExecutor(events)):
+            pass
+    assert events == ["start", "close"]
 
 
 # ── B. 用量 / 耗时采集 ──
@@ -247,11 +284,15 @@ async def test_usage_tracking_accumulates_chat_usage_and_cost():
         assert result.text  # 返回值原样透传
     assert usage.total_tokens == 200
     assert (usage.input_tokens, usage.output_tokens) == (160, 40)
-    assert (usage.calls, usage.estimated_calls) == (2, 0)
+    assert (usage.chat_calls, usage.estimated_calls) == (2, 0)
+    assert usage.model_calls == 2  # 只有 chat：分母 = chat 调用数
     snapshot = usage.snapshot()
     assert snapshot is not None
     assert snapshot["total_tokens"] == 200
     assert snapshot["cost_usd"] == pytest.approx(0.004)
+    assert (snapshot["input_tokens"], snapshot["output_tokens"]) == (160, 40)
+    assert snapshot["usage_source"] == "chat_only"  # I2：数据来源自描述
+    assert (snapshot["chat_calls"], snapshot["model_calls"]) == (2, 2)
 
 
 async def test_usage_tracking_passes_structured_and_stream_through():
@@ -279,7 +320,11 @@ async def test_usage_tracking_passes_structured_and_stream_through():
         )
     ]
     assert chunked == ["甲", "乙"]
-    assert usage.snapshot() is None  # structured/stream 没有用量数字 → 不累加、不填 0
+    # I2：structured/stream 没有 usage 面，但调用本身进**诚实分母**（model_calls）；
+    # 没有 chat 调用 = 没有可报 token → 快照缺席（不填 0）。
+    assert (usage.chat_calls, usage.structured_calls, usage.stream_calls) == (0, 1, 1)
+    assert usage.model_calls == 2
+    assert usage.snapshot() is None
 
 
 async def test_usage_snapshot_is_none_when_the_provider_reports_no_usage():
@@ -288,15 +333,31 @@ async def test_usage_snapshot_is_none_when_the_provider_reports_no_usage():
     await harness.UsageTrackingProvider(_UsageProvider(estimated=True), estimated).chat(
         [Message(role="user", content="hi")]
     )
-    assert (estimated.calls, estimated.estimated_calls) == (1, 1)
+    assert (estimated.chat_calls, estimated.estimated_calls) == (1, 1)
     assert estimated.snapshot() is None
 
-    # FakeProvider 的 ChatResult 用默认 UsageInfo（全 0、estimated=False）—— 同样是"没有数字"
+    # FakeProvider 的 ChatResult 用默认 UsageInfo（全 0、estimated=False）—— 调用进了分母，
+    # 但没有可用 token 数：同样是"没有数字"，快照缺席（0 不是"未知"）。
     silent = harness.UsageAccumulator()
     await harness.UsageTrackingProvider(FakeProvider(), silent).chat(
         [Message(role="user", content="hi")]
     )
+    assert silent.chat_calls == 1
     assert silent.snapshot() is None
+
+
+async def test_usage_snapshot_omits_split_tokens_the_provider_never_reported():
+    """I2：provider 只报 ``total_tokens`` 时，input/output 是**未知**而不是 0 ——
+    填 0 会把"不知道"伪装成"没有输入 token"（违反模块的 fail-loud 规则）。"""
+    usage = harness.UsageAccumulator()
+    await harness.UsageTrackingProvider(
+        _UsageProvider(total_tokens=100, input_tokens=0, output_tokens=0), usage
+    ).chat([Message(role="user", content="hi")])
+    snapshot = usage.snapshot()
+    assert snapshot is not None
+    assert snapshot["total_tokens"] == 100
+    assert "input_tokens" not in snapshot and "output_tokens" not in snapshot
+    assert snapshot["usage_source"] == "chat_only"
 
 
 async def test_run_scenario_injects_duration_and_token_usage(tmp_path):
@@ -318,6 +379,11 @@ async def test_run_scenario_injects_duration_and_token_usage(tmp_path):
     assert outcome["duration_ms"] > 0
     assert outcome["tool_calls"] == ["weather"]
     assert provider.chats == 1  # 用量来自这一次 answer 合成调用
+    usage = outcome["token_usage"]
+    assert usage["usage_source"] == "chat_only"  # I2：只覆盖 chat 是要说清楚的
+    assert usage["chat_calls"] == 1
+    # 参数提取走 structured（无 usage 面）：chat 之外还有 1 次模型调用进诚实分母
+    assert usage["model_calls"] == 2
     assert all(passed for passed, _ in checks), checks
 
 
@@ -346,6 +412,63 @@ async def test_usage_does_not_leak_across_scenarios(tmp_path):
     assert first["token_usage"]["total_tokens"] == 100
     assert second["token_usage"]["total_tokens"] == 100
     assert first is not second
+
+
+async def test_duration_ms_covers_every_turn(tmp_path):
+    """duration_ms 是**整场景**（含全部轮次）的墙钟：多轮场景不能只量最后一轮
+    （否则延迟/成本都被低报）。用每轮一次 chat 的睡眠累加钉住 —— 单轮口径只有一次睡眠。"""
+    per_chat_s = 0.05
+
+    class _SleepyProvider(FakeProvider):
+        async def chat(self, messages, *, model=None):
+            await asyncio.sleep(per_chat_s)
+            return await super().chat(messages, model=model)
+
+    scenario = _scenario(
+        id="mt-duration",
+        prompt="北京今天天气怎么样？",
+        follow_up=["上海今天天气怎么样？"],
+    )
+    outcome = await harness.run_scenario(
+        scenario,
+        provider=_SleepyProvider(),
+        executor=FakeExecutor(),
+        tracer=_tracer(tmp_path, "eval-duration-multiturn"),
+    )
+    # 两轮各至少一次 chat → 两段睡眠；只量最后一轮时上限是一次睡眠（~50ms）
+    assert outcome["duration_ms"] >= 1000 * 2 * per_chat_s * 0.9
+
+
+async def test_run_scenario_teardown_wiring_runs_on_success_and_failure(tmp_path):
+    """teardown（real 模式 = ``executor.aclose``）在**成功与异常**两条路径都跑：
+    页面逐场景归还，场景炸了更不能把脏页留给下一个。"""
+    events: list[str] = []
+
+    async def teardown() -> None:
+        events.append("teardown")
+
+    class _ExplodingProvider(FakeProvider):
+        async def chat(self, messages, *, model=None):
+            raise RuntimeError("model exploded")
+
+    await _run_scenario(
+        _scenario(id="ok"),
+        provider=FakeProvider(),
+        executor=FakeExecutor(),
+        tracer=_tracer(tmp_path, "eval-teardown-ok"),
+        teardown=teardown,
+    )
+    assert events == ["teardown"]
+
+    with pytest.raises(RuntimeError, match="model exploded"):
+        await _run_scenario(
+            _scenario(id="boom"),
+            provider=_ExplodingProvider(),
+            executor=FakeExecutor(),
+            tracer=_tracer(tmp_path, "eval-teardown-boom"),
+            teardown=teardown,
+        )
+    assert events == ["teardown", "teardown"]
 
 
 async def test_run_all_executes_scenarios_through_the_harness(tmp_path, monkeypatch):
@@ -477,6 +600,27 @@ async def test_scenario_timeout_is_enforced_per_turn(tmp_path):
         )
     assert "timeout_seconds=0.01" in str(excinfo.value)
     assert "slow" in str(excinfo.value)
+
+
+async def test_inner_timeout_is_not_mislabelled_as_a_scenario_timeout(tmp_path):
+    """Minor（P4-T3 审查）：内层自己的 ``TimeoutError``（socket/HTTP 超时）必须原样上抛 ——
+    包装成"场景超时"会把诊断指向错误的预算（调 ``timeout_seconds`` 治不好 DNS 超时）。"""
+
+    class _InnerTimeoutProvider(FakeProvider):
+        async def chat(self, messages, *, model=None):
+            raise TimeoutError("socket timed out")
+
+    scenario = _scenario(id="inner-timeout", timeout_seconds=5)
+    with pytest.raises(TimeoutError) as excinfo:
+        await harness.run_scenario(
+            scenario,
+            provider=_InnerTimeoutProvider(),
+            executor=FakeExecutor(),
+            tracer=_tracer(tmp_path),
+        )
+    assert str(excinfo.value) == "socket timed out"  # 原样：不是场景超时文案
+    assert excinfo.value.__cause__ is None
+    assert "超过 timeout_seconds" not in str(excinfo.value)
 
 
 def test_multi_turn_context_scenario_is_enabled_and_real_only():

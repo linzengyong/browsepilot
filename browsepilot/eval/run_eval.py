@@ -9,7 +9,8 @@ Modes:
 - ``mode`` 不匹配 → ``[SKIP]``，**不计入** pass/fail 计数、不影响 exit code。理由：mock 的
   FakeProvider/FakeExecutor 只伪造天气/搜索/抓页（**没有浏览器**），tier3/HITL/多轮场景在 mock 下
   是"跑不了"而不是"跑失败了"——把环境不匹配读成失败会污染成功率，而成功率是报告的核心数据。
-- ``enabled=False`` → ``[DISABLED]``（列出但不跑）：P3 遗留的交互链、未接线的多轮 harness。
+- ``enabled=False`` → ``[DISABLED]``（列出但不跑）：P3 遗留的交互链
+  （``t3_browser_interaction``：交互步尚未入图）。
 - ``fragile=True`` 的场景失败照实打 FAIL，但**不计入** exit code（P4-D6：ddgs 内容漂移不是回归），
   汇总里单独计数，供报告引用。
 - ``--tag`` 按 tag 过滤（T7 的 ``--tag acceptance``）；未知 tag 由 argparse 直接拒绝；
@@ -38,7 +39,8 @@ Modes:
 - 池的生命周期跨场景（``harness.pool_lifecycle`` 的 start/close），**页面**的生命周期逐场景；
   因此 ``run_all`` 本身是 async（一个事件循环跑完全部场景）。
 
-``finally`` 里跑 teardown：场景自己炸了（模型/服务异常）也要归还页面，否则脏页留给下一个场景。
+``finally`` 里跑 teardown：场景自己炸了（模型/服务异常）也要归还页面，否则脏页留给下一个场景；
+而**下一个场景照跑** —— 单条异常只废自己（见 ``run_all`` 的逐场景 ``try/except``）。
 
 报告（P4-D3/D4，实现在 :mod:`eval.report`）：
 
@@ -149,6 +151,12 @@ async def run_all(
     跳过/停用的场景不跑也不 teardown（没取过页面就没有页面要还）。exit code 只由
     **非 fragile 的失败**决定（D6/D8：环境不匹配与内容漂移不该让门禁变红）。
 
+    **逐场景隔离（C1，P4-D5）**：一条场景炸了（模型/服务异常、超时）不得中断整轮 ——
+    捕获 ``Exception`` → 打 ``[FAIL] <id>: EXCEPTION <type>: <msg>`` → 计为失败 → 继续下一条。
+    否则 T7 的三轮 acceptance 里一次 120s 卡顿就会把剩余场景全部作废（日志里既没有
+    ``[FAIL]`` 行也没有汇总，看起来像"没跑过"而不是"跑挂了一条"）。异常折成一条失败断言，
+    与 check 失败走**同一条**计数/报告路径（fragile 场景的异常同样不计入门禁）。
+
     ``results`` 是给报告层用的**收集器**：传了列表就按加载顺序追加每条场景的结果行
     （PASS/FAIL/SKIP/DISABLED 四种都记 —— 报告要能解释"为什么这条没跑"），返回码形状不变
     （既有调用方与测试都读 int）。
@@ -188,9 +196,16 @@ async def run_all(
             if results is not None:
                 results.append(ScenarioResult(**common, skipped=True, skip_reason=reason))
             continue
-        outcome, checks = await _run_scenario(
-            scenario, provider=provider, executor=executor, tracer=tracer, teardown=teardown
-        )
+        try:
+            outcome, checks = await _run_scenario(
+                scenario, provider=provider, executor=executor, tracer=tracer, teardown=teardown
+            )
+        except Exception as exc:
+            # C1（P4-T3 审查，P4-D5）：单条场景炸了**不得**中断整轮 —— 记一条失败断言继续跑。
+            # ``Exception`` 不含 ``CancelledError``（BaseException）：外部取消照常中止。
+            # 没有可报的数据面（outcome = {}）——失败行本身就是证据；teardown 已在
+            # _run_scenario 的 finally 里跑过（脏页不留给下一个场景）。
+            outcome, checks = {}, [(False, f"EXCEPTION {type(exc).__name__}: {exc}")]
         ok = all(result for result, _ in checks)
         detail = "; ".join(text for _, text in checks)
         # 报告侧的失败明细只留**失败**的那几条（通过项不是"根因"）；采集不到的数字保持缺席（不填 0）。
