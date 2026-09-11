@@ -1,13 +1,14 @@
 # BrowsePilot V2 评测体系
 
-> 本文档在 P4 阶段完成（T8）。当前为 T0 骨架：环境与基线记录。
+> 本文档在 P4 阶段完成（T8）：评测哲学（§3）· 场景规范（§4）· 检查类型（§5）· 运行指南（§6）· 3 轮真实数据与量化结果（§7）· 已知限制（§8）。
 
 ## 1. 环境与运行前提
 
 | 项 | 值 | 说明 |
 |----|----|------|
 | Python | 3.14（`uv run`） | `uv run python -m eval.run_eval` |
-| 模型 key | `BP_MODEL_API_KEY`（或 `OPENAI_API_KEY` 回退） | 真实模式必需；仅进程内，不入库 |
+| 模型 key | `BP_MODEL_API_KEY`（`Settings` 只读 `BP_` 前缀；v1 的 `OPENAI_API_KEY` 不会被自动读取，须显式映射，见 §8.6） | 真实模式必需；仅进程内，不入库 |
+| 模型 id | `BP_DEFAULT_MODEL=deepseek/deepseek-chat` | 真实运行必钉：思考模型拒绝 forced tool_choice → structured 调用报错（§6.3）；`src/browsepilot/app/config.py` 的缺省值即此模型 |
 | 浏览器 channel | `BP_BROWSER_CHANNEL=msedge` | 本机 Playwright 1.59 需 chromium rev 1217，缓存为 1208 → 默认启动失败；msedge channel 可用（或 `uv run playwright install chromium`） |
 | HITL 场景 | `BP_BROWSER_HEADLESS=false` | 人工介入需可见浏览器窗口 |
 | 导航策略 | `BP_NAVIGATION_POLICY=allow_https`（默认） | allowlist 模式见 `allowed_domains` |
@@ -23,6 +24,8 @@
 | 场景数 | 3（p0-weather / p0-search / p0-read-page） | `eval/scenarios/` |
 | 检查类型 | 3（field / contains_keyword / 未知→失败） | `eval/run_eval.py:check_outcome` |
 
+> 本节是 P4 **启动时**的快照（对照用）。P4 收口后的场景集（16 个文件）与检查类型（10 种）见 §4/§5，运行口径见 §6。
+
 **P3 → P4 交接要点**（来自 P3 final review + 收口修复）：
 - tier3 策略链 = `[browser_open, browser_snapshot]`；type/click 未入链（场景需标 `enabled: false`）
 - 无导航的观察 / 只导航未观察 → `stop_reason="partial"`；全策略失败仍报 `completed`（既有行为）
@@ -31,15 +34,247 @@
 
 ## 3. 评测哲学（T8 完成）
 
-_待写_
+> 计划尾部原则：**评测的价值在于"断言的可信度"** —— 宁可 fragile 标记也不写虚假通过的断言，宁可 mock 门禁也不让 flaky 的真实模式阻塞交付。以下是这条原则在代码里的四个落点。
+
+### 3.1 断言与动态内容解耦（P4-D6）
+
+场景断言只允许依赖两类东西：**产品结构**（工具链、路由层级、终止原因、降级记录、数据字段、用量/耗时预算）与**数据断言**（如天气的 `field city` / `temperature_c`）；不允许依赖外部动态内容的**具体值**（搜索结果条目、页面正文、模型措辞）。断言一旦依赖 ddgs 返回内容，"外部数据漂移"就会被读成"代码回归"。
+
+同一个 p0-search 场景的三次形态演进（第一手记录在 `eval/scenarios/p0_search.yaml`、`t2_search_content.yaml` 的顶部注释）：
+
+| 阶段 | 形态 | 结果 | 证据 |
+|------|------|------|------|
+| P1 | `p0-search` 内容断言 `contains_keyword: ["2024"]` | PASS：当时的 ddgs 结果含 "2024" | `docs/v2-p1-report.md` §二 |
+| P2 | 同一条断言 | 真实模式 FAIL：ddgs 本次返回与问题无关（Python 3.8/3.10 页面）→ 模型如实拒答（`keywords hit=[]`），**非代码回归** | `docs/v2-p2-report.md` 偏差 D1 |
+| P4-T5 | 拆成两条：`t2_search_structural`（结构断言 `tools_called: [search]` + `degradation_absent` + `stop_reason_is: completed`）与 `t2_search_content`（内容断言，`fragile: true`） | 结构版 3/3 PASS（§7.2）；内容版如实 FAIL，但**不计入门禁 exit code** | `eval/scenarios/t2_search_*.yaml`；§7.2 / §7.5 A1 |
+
+`fragile` 的语义（`eval/run_eval.py`）：失败照实打 `[FAIL] … (fragile=true — 不计入门禁 exit code)`，进 `fragile_failed` 单列计数，报告里单独统计 —— 它是**"断言对环境的依赖被显式承认"**，不是"放宽通过标准"。解耦的底线是**删断言前先移交**：结构版删掉的原断言 `contains_keyword ["http"]`（"答案里出现结果链接"，真实模式稳定 FAIL 的措辞依赖）被移交给内容版（fragile），且由 `test_structural_search_scenario_does_not_assert_on_answer_wording` 钉住"结构版不得写措辞断言"。
+
+### 3.2 禁止虚假通过（T2-fix 红线）
+
+失败模板会回显用户输入，而 `tools_called` 记录的是**尝试**（含失败调用）——两条叠加，会让"只断言工具名 + 关键词"的正例场景在**全策略失败**的运行上全绿。真实案例（T1+T2 审查 C1 发现；修复记录在各 YAML 顶部注释）：
+
+| 场景 | 曾经的断言 | 失败运行为什么也能满足 |
+|------|------------|------------------------|
+| `t3_browser_open` | `contains_keyword: ["Example", "example.com"]` | 失败模板 `打开页面失败：https://example.com（…）` 原样回显小写域名 |
+| `t3_browser_snapshot` | `contains_keyword: ["页面", "快照", "标题", "链接"]` | 失败模板 `还没有打开的页面：请先调用 browser_open(url)…` 含"页面" |
+| `t1_weather_beijing` / `shanghai` | 只断言答案含城市名 | search 兜底的 `no results for query: '<任务原文>'` 回显任务原文（含城市名） |
+
+修复手法（三件套）：① **证据型关键词** —— 只用真实产物里才有的词（`t3_browser_*` 改用页面标题 `Example Domain`，失败文案里不出现）；② **`degradation_absent`** —— 全策略失败时 `degradation_log` 非空必挂（graph 全败时 `stop_reason` 仍是 `completed`，单靠终止原因抓不住）；③ **`stop_reason_is: completed`** —— partial（只导航未观察）时挂。
+
+**回归网是可执行、进 CI 的**（`tests/test_eval/test_scenarios.py`）：对每条正例场景合成两种"对断言最不利"的 outcome —— `_synthetic_all_failed`（忠实复刻失败模板：错误消息回显任务原文、`tool_calls` = 尝试过的工具、全败时 `stop_reason="completed"`）与 `_synthetic_partial`（`partial` / `partial_reason` 与 graph 同形）—— 要求**至少一项断言失败**：
+
+- `test_synthetic_all_failed_outcome_fails_at_least_one_check[<正例场景>]`
+- `test_synthetic_partial_outcome_fails_at_least_one_check[<正例场景>]`
+
+失败路径场景显式豁免（它们断言的**就是**"失败必须诚实"）：`t1_weather_not_found` / `t2_read_page_failure` / `degrade_browser_unavailable`；豁免清单由 `test_synthetic_outcome_guard_covers_scenarios_and_exclusions_exist` 钉住（写错 id = 场景悄悄逃出回归网）。同一条红线也落在 schema 层（§4/§5）：空 prompt / 空 checks / 空 keywords / 空 tools / 缺 `limit` 是**加载错误或 FAIL**，不是静默通过。
+
+### 3.3 分层门禁（P4-D2 / P4-D8）
+
+tag（§4.3）决定场景在哪个面里是"必过"，`--tag` 取任一匹配；门禁实现 = `eval/gate.sh` 与 `.github/workflows/ci.yml`：
+
+| 运行面 | 内容 | 谁跑 |
+|--------|------|------|
+| mock（CI 必过） | `uv run pytest tests/ -q` → `ruff` → `mypy` → `uv run python -m eval.run_eval --mock` | `eval/gate.sh`（本地一键）＝ CI 同口径，**无网络 / 无 key / 无浏览器** |
+| real（手动 / 验收） | `--tag acceptance --repeat N`（需 `BP_MODEL_API_KEY` + 浏览器 channel） | 人工；**绝不进 CI**（CI 无网络无 key，且真实结果受 ddgs 漂移影响会 flaky） |
+| fragile 场景 | 失败照实 FAIL、单列 `fragile_failed` | 任何面都**不改变 exit code** |
+
+判定规则（`eval/run_eval.py`）：
+
+- `mode` 不匹配本次运行 → `[SKIP]`，不计 pass/fail、不进 exit code —— "跑不了"（mock 没有浏览器）不是"跑失败了"，环境不匹配不能污染成功率；
+- `enabled: false` → `[DISABLED]`（列出但不跑）：P3 遗留的交互链用这个口子声明；
+- `--tag` 选不中任何可运行场景 → **exit 1**（空跑全绿与"跑过且全绿"在日志上无法区分）；
+- exit code = **任一非 fragile 失败 → 1，否则 0**；场景抛异常计为失败且**不中断**后续场景（`run_all` 逐场景捕获，打 `[FAIL] … EXCEPTION …` 继续跑）。
+
+### 3.4 fail-loud：缺数据 → FAIL，不是 0
+
+"不知道"与"是 0"必须区分开 —— 报告里的每个数字都要能回答"它从哪来"：
+
+- **断言层**：`tokens_below` / `latency_below` / `tools_called` 拿不到数据时给可诊断的 FAIL（detail 指明缺哪个注入字段），绝不按空值通过；`field` / `contains_keyword` 缺声明同样是 FAIL；
+- **采集层**：harness 采不到用量时 `token_usage` 字段**缺席**（`UsageAccumulator.snapshot()` 返回 `None`），不填 0；provider 只报 total 时 `input_tokens` / `output_tokens` 缺席（未知不是 0）；`cost_usd` 只在 > 0 时出现（0 多半是"算不出价"）；
+- **聚合层**：`report.py` 里 `None` 不进样本、不填 0；样本数为 0 时 JSON 写 `null`、MD 写"—（未提供）"；每场景带 `measured_calls` / `model_calls`（token 覆盖度的诚实分母，§5.3）；
+- **加载层**：未知 tag / 未知字段 / 未知 mode、空 checks、非正 `timeout_seconds`、重复 id、空目录 → `ScenarioLoadError`（报文件名）：一次笔误不得静默变成"少跑一条场景"或"少断言一条"。
+
+### 3.5 交叉引用：P1 "天气 100% 可靠" 的证据链在此闭环（T8 Step 2）
+
+P1 的结论是**单轮**读数（"p0-weather 评测 PASS（查天气 100% 可靠，不碰浏览器）"，`docs/v2-p1-report.md` §二/§六）；P4 把它换成"可复现的通过集合 + 方差证据"：
+
+| 环节 | 内容 | 出处 |
+|------|------|------|
+| 承接场景 | `t1_weather_beijing`（`field city` + `field temperature_c (number)` + `tier_is` / `tools_called` / `degradation_absent` / `stop_reason_is` / `contains_keyword`）；`t1_weather_shanghai`（换城市，证明确实在解析任务）；`t1_weather_not_found`（负例：不存在的城市必须明确失败、不得编造温度） | `eval/scenarios/t1_weather_*.yaml` |
+| 断言迁移 | 原 `p0-weather` 的 `field city` / `field temperature_c (kind: number)` 逐条迁入 `t1_weather_beijing`；`p0-weather` 文件保留（`enabled: false`）供回归对比 | `test_p0_assertion_semantics_have_enabled_successors`（缺承接者 = 存档变成丢断言） |
+| 3 轮数据 | 三城场景各 3/3 PASS；逐场景耗时/token 记录在案 | §7.2 |
+| 方差证据 | 成功率跨轮 stdev = 0（每轮都是同一组 9 PASS + 1 fragile FAIL）；P50 stdev 328.77 ms、token stdev 24.91（<1%）；flaky = **0 条** | §7.3 / §7.4 |
+
+结论：P1 的"100% 可靠"在 P4 有了**可复现的通过集合**（3 轮同因同果）与**波动读数**（P95 的抖动来自依赖网络，不是天气链路）；"单轮结论缺方差证据"这个缺口由 §7 的 3 轮数据补齐。
 
 ## 4. 场景规范（YAML schema）（T8 完成）
 
-_待写_
+> 实现：`eval/scenarios.py`（Pydantic v2，`extra="forbid"`）。一个场景 = 一次 `run_task`（有 `follow_up` 时多轮）+ 一组断言 + 运行选择元数据。字段/类型/默认值逐字取自 `Scenario.model_fields` / `Check.model_fields`；场景文件位于 `eval/scenarios/*.yaml`（按文件名字典序加载）。
+
+### 4.1 场景字段（`Scenario`）
+
+| 字段 | 类型 | 默认 | 语义与校验 |
+|------|------|------|------------|
+| `id` | `str` | 必填 | 场景唯一标识；strip 后非空；全目录唯一（重复 → 加载报错并指出两个文件） |
+| `name` | `str` | 必填 | 人读名称（日志的 `[PASS]` / `[FAIL]` / `[DISABLED]` 行使用） |
+| `prompt` | `str` | 必填 | 第一轮任务原文；strip 后非空 |
+| `tier` | `Literal["tier1", "tier2", "tier3"]` | `"tier1"` | **路由的实际层级**（search 规则命中 → `tier1`，即便文件名叫 `t2_*`）；拼错（`tier4`）在加载期报错 |
+| `tags` | `list[str]` | `["acceptance"]` | 只能取 `KNOWN_TAGS`（§4.3）；未知 tag 报错并列出合法集；空列表等价缺省 |
+| `mode` | `Literal["mock", "real", "both"]` | `"both"` | 这条场景在哪个模式下有意义；与本次运行不匹配 → `[SKIP]`（不计 pass/fail） |
+| `checks` | `list[Check]` | `[]`，但**必须非空** | 断言列表（§4.2 / §5）；空 checks = 必然通过 → 加载错误 |
+| `timeout_seconds` | `float`（`gt=0`） | `120.0` | 每轮的墙钟预算（多轮场景每轮一次）；超时抛 `TimeoutError`（消息带 id / 轮次 / 预算）；0 或负数报错 |
+| `fragile` | `bool` | `False` | 断言依赖外部动态内容：失败照 FAIL、单列 `fragile_failed`，**不改变 exit code**（§3.1） |
+| `enabled` | `bool` | `True` | `False` → `[DISABLED]`：列出、不跑、不进统计（P3 遗留场景用） |
+| `follow_up` | `list[str]` | `[]` | 第 2..n 轮 prompt；`checks` 评估**最后一轮**的 outcome；`token_usage` / `duration_ms` / `tool_calls` 是**整场景**（各轮累加）口径 |
+
+### 4.2 Check 字段（`Check`）
+
+| 字段 | 类型 | 默认 | 用于 / 语义 |
+|------|------|------|-------------|
+| `type` | `str` | 必填 | 10 种检查类型之一（§5）；未知类型运行时 FAIL（`unknown check type …`，不抛异常） |
+| `field` | `str`（可空） | `None` | `field`：要断言的数据键（`result_data[field]`） |
+| `expected` | `str`（可空） | `None` | `field` / `tier_is` / `stop_reason_is` 的期望值 |
+| `kind` | `str`（可空） | `None` | `field` 的 `number`：只断言"是数值"（`bool` 不算数值） |
+| `keywords` | `list[str]`（可空） | `None` | `contains_keyword` / `not_contains` 的关键词；同时是 `tools_called` 的 `tools` 别名 |
+| `tools` | `list[str]`（可空） | `None` | `tools_called` 的期望工具名 |
+| `mode` | `str`（可空） | `None`（=`contains`） | `tools_called` 的匹配模式：`contains` / `not_contains` / `exact_sequence`（有序子序列） |
+| `limit` | `int`（可空） | `None` | `tokens_below` 的 token 预算 |
+| `limit_ms` | `float`（可空） | `None` | `latency_below` 的毫秒预算 |
+
+### 4.3 合法 tag 集（`KNOWN_TAGS`）
+
+| tag | 语义（`eval/scenarios.py`） | 当前场景（16 文件口径） |
+|-----|------------------------------|--------------------------|
+| `smoke` | CI 必跑的确定性核心（mock 下可复现、不依赖外部内容漂移） | `t1_weather_beijing` / `t1_weather_shanghai` / `t1_weather_not_found` / `t2_read_page` / `t2_read_page_failure` / `t2_search_structural`（+ 归档的 `p0-weather`）—— 与 §7.6 冒烟运行 `passed=6` 一致 |
+| `acceptance` | 阶段验收全量（**缺省值**：不写 tags 就是这条） | 除 `degrade_browser_unavailable` 外的全部运行中场景 |
+| `browser` | 需要真浏览器 | `t3_browser_open` / `t3_browser_snapshot` / `t3_browser_interaction` / `hitl_login_detect` |
+| `hitl` | 需要真浏览器 + 人工介入（headful，`BP_BROWSER_HEADLESS=false`） | `hitl_login_detect` |
+| `degrade` | 降级行为（工具不可用时的诚实失败） | `degrade_browser_unavailable`（`mode: mock`："没有浏览器"只能在 mock 里稳定构造） |
+
+### 4.4 校验与编写规则（fail-loud）
+
+- **`extra="forbid"`（`Scenario` 与 `Check` 同）**：未知字段 —— YAML 里 `mdoe: real` 这类笔误、或 Check 里 `keyword:` 漏 s —— 一律报错。静默忽略 = 以错误的 mode/enabled 跑、或少断言一条，而日志上看不出来。
+- **`tier` / `mode` 是 Literal**：拼错在加载期报错，不带进运行期。
+- **`tags` 逐项校验**：未知 tag 报错并列出合法集合（`KNOWN_TAGS`）。
+- **非空**：`id` / `prompt`（strip 后）、`checks`（否则"空场景 = 必然通过"）；`timeout_seconds` 必须 `> 0`。
+- **唯一性与目录**：重复 `id` 报错并指出两个文件（同一场景跑两遍会悄悄污染成功率）；目录里一条 YAML 都没有 → 报错（空跑全绿没有意义）。所有加载错误都带文件名。
+- **prompt 必须命中声明 tier 的规则**：`classify_by_rules(prompt).tier == tier`（回归网 `test_every_scenario_prompt_routes_to_its_declared_tier`，离线可跑）。tier3 提示词**不得**含 `http(s)://` 或 打开/访问/读/阅读/摘要（`read_page` 规则优先命中），要靠"浏览器 / 搜索框"等强触发词落 tier3。
+- **断言的可信度**：正例场景必须能在"全策略失败"与"partial"合成 outcome 上挂至少一项（§3.2 回归网）；依赖外部内容的断言必须标 `fragile: true`，且结构场景不得写措辞断言（`t2_search_structural` 由测试钉住）。
+
+### 4.5 完整示例（逐字取自 `eval/scenarios/t1_weather_beijing.yaml`）
+
+```yaml
+# Tier1 正例（P4-T2 审查 I2/I3 加固）：happy path 必须与失败/partial 可区分。
+#
+# 为什么光有 contains_keyword 不够：weather 失败后回退 search，search 也失败时的错误消息是
+# `no results for query: '<任务原文>'` —— 城市名被原样回显，于是"答案含北京"在最彻底的
+# 失败运行上也成立（T1+T2 审查 I2 的假通过）。
+#
+# 断言分工：
+# - field city：数据断言（p0-weather 的先例）—— 只有 weather 工具真的成功才有这个字段；
+#   代价：search 兜底"救回"任务时本条会失败 —— 对**正例**场景这是可接受的（兜底 = 主路径没走通）。
+# - field temperature_c（kind: number）：P4-T5 从 p0-weather 存档时**迁移**过来的断言（"温度必须是
+#   数值"，不是文本匹配）—— 存档 p0-* 不得等于丢断言：两句数据断言现在都归这条场景。
+# - degradation_absent / stop_reason_is：策略链一次失败都不许有；partial 不得报 completed。
+id: t1_weather_beijing
+name: 北京天气（Tier1 正例：路由 + 工具 + 城市名）
+prompt: "北京今天天气怎么样？"
+tier: tier1
+tags: [smoke, acceptance]
+mode: both
+checks:
+  - type: tier_is
+    expected: tier1
+  - type: field
+    field: city
+    expected: 北京
+  - type: field
+    field: temperature_c
+    kind: number  # P4-T5：随 p0-weather 存档迁入（温度必须是数值，不是文本匹配）
+  - type: tools_called
+    tools: [weather]
+  - type: degradation_absent
+  - type: stop_reason_is
+    expected: completed
+  # 保留：可读性断言（城市名出现在答案里）。失败运行上的假通过由上面 field /
+  # degradation_absent 两条挡住 —— 回归网见 tests/test_eval/test_scenarios.py 的
+  # "合成失败 outcome 不得让正例场景全绿"。
+  - type: contains_keyword
+    keywords: ["北京"]
+```
+
+### 4.6 当前场景集（16 个文件，`eval/scenarios/`）
+
+> 文件名 = `<id>.yaml`（三个归档场景例外：文件用下划线 `p0_weather.yaml` / `p0_search.yaml` / `p0_read_page.yaml`，id 用连字符）。下表逐字由 `load_scenarios()` 读出（按文件名字典序 = 加载顺序）。
+
+| id | tier | mode | tags | 状态 | fragile | 断言类型 |
+|----|------|------|------|------|---------|----------|
+| `degrade_browser_unavailable` | tier3 | mock | degrade | 运行中 | — | `tier_is` / `tools_called` / `contains_keyword` / `not_contains` |
+| `hitl_login_detect` | tier3 | real | hitl, browser | 运行中 | — | `needs_human` / `tools_called` |
+| `multi_turn_context` | tier1 | real | acceptance | 运行中 | — | `contains_keyword` |
+| `p0-read-page` | tier2 | both | acceptance | 归档 | — | `contains_keyword` |
+| `p0-search` | tier1 | both | acceptance | 归档 | ✓ | `contains_keyword` |
+| `p0-weather` | tier1 | both | smoke, acceptance | 归档 | — | `field` / `field` |
+| `t1_weather_beijing` | tier1 | both | smoke, acceptance | 运行中 | — | `tier_is` / `field` / `field` / `tools_called` / `degradation_absent` / `stop_reason_is` / `contains_keyword` |
+| `t1_weather_not_found` | tier1 | both | smoke, acceptance | 运行中 | — | `not_contains` / `contains_keyword` |
+| `t1_weather_shanghai` | tier1 | both | smoke, acceptance | 运行中 | — | `tier_is` / `field` / `tools_called` / `degradation_absent` / `stop_reason_is` / `contains_keyword` |
+| `t2_read_page` | tier2 | both | smoke, acceptance | 运行中 | — | `tools_called` / `contains_keyword` / `degradation_absent` / `stop_reason_is` |
+| `t2_read_page_failure` | tier2 | both | smoke, acceptance | 运行中 | — | `not_contains` / `contains_keyword` |
+| `t2_search_content` | tier1 | both | acceptance | 运行中 | ✓ | `contains_keyword` |
+| `t2_search_structural` | tier1 | both | smoke, acceptance | 运行中 | — | `tools_called` / `degradation_absent` / `stop_reason_is` |
+| `t3_browser_interaction` | tier3 | real | browser, acceptance | 待启用 | — | `tools_called` / `contains_keyword` / `degradation_absent` |
+| `t3_browser_open` | tier3 | real | browser, acceptance | 运行中 | — | `tier_is` / `tools_called` / `contains_keyword` / `degradation_absent` / `stop_reason_is` |
+| `t3_browser_snapshot` | tier3 | real | browser, acceptance | 运行中 | — | `tools_called` / `contains_keyword` / `stop_reason_is` / `degradation_absent` / `not_contains` |
+
+计数口径：16 = **8 可 mock 执行** + 4 mock 下 SKIP（real-only：tier3 两条 + HITL + 多轮）+ 4 停用（3 归档 + 1 待启用）。`--mock` 的日志形状与 §6.1 一致（`passed=8 skipped=4 disabled=4`）。
 
 ## 5. 检查类型表（T8 完成）
 
-_待写_
+> 实现：`eval/checks.py` 的 `run_check(outcome, check) -> CheckResult(passed, detail, kind)` —— **纯函数、无 I/O**（不看时钟、不读文件、不发网络），数据全部来自传进来的 outcome；未知类型 / 未知 mode → `passed=False` + 明确 detail，不抛异常（一个笔误不该炸掉整轮评测）。`eval/run_eval.py:check_outcome` 是保留 tuple 形状的兼容薄适配层（既有调用方式不变）。
+
+### 5.1 10 种类型
+
+| `type` | 语义 | 字段 | 数据来源 | 缺数据 / 空声明（fail-loud） |
+|--------|------|------|----------|-------------------------------|
+| `field` | `result_data[field] == expected`；`kind: number` 只断言"是数值"（`bool` 不算数值） | `field` / `expected` / `kind` | `outcome["result_data"]` | 缺 `field` → FAIL；非 number 时缺 `expected` → FAIL；值不等（含字段缺席 = `None`）→ FAIL |
+| `contains_keyword` | `final_answer` 含**任一** keyword | `keywords` | `outcome["final_answer"]` | 缺 `keywords` → FAIL；answer 缺席/非字符串按空串 → FAIL |
+| `not_contains` | `final_answer` 不含**任何** keyword | `keywords` | `outcome["final_answer"]` | 缺 `keywords` → FAIL；answer 缺席按空串 → 通过（边界见 §5.4） |
+| `tools_called` | 工具名断言：`contains`（默认，全出现）/ `not_contains` / `exact_sequence`（有序子序列） | `tools`（`keywords` 是别名）/ `mode` | `execution_log[*]["tool"]`（v2 graph 不写）→ harness 注入 `outcome["tool_calls"]`（`call()` 的全部工具名，含失败；多轮累加） | 缺期望工具 → FAIL；未知 `mode` → FAIL；无调用记录且期望非空 → FAIL |
+| `tier_is` | `outcome["tier"] == expected` | `expected` | run_task state（路由**实际**层级） | 不等 → FAIL；`expected` 未强制的边界见 §5.4 |
+| `stop_reason_is` | `outcome["stop_reason"] == expected` | `expected` | run_task state | 不等 → FAIL；同上 |
+| `tokens_below` | 总 token ≤ `limit` | `limit` | `token_usage.total_tokens` → `usage.total_tokens` → 扁平 `total_tokens`（当前只有 harness 注入） | 缺 `limit` → FAIL；无用量数据 → FAIL（"没数据不算通过"） |
+| `latency_below` | 总耗时 ≤ `limit_ms` | `limit_ms` | `outcome["duration_ms"]`（整场景墙钟）→ 否则 `execution_log[*]["duration_ms"]` 之和（**工具耗时之和**，不含模型调用） | 缺 `limit_ms` → FAIL；无耗时数据 → FAIL |
+| `degradation_absent` | `degradation_log` 为空 | 无 | run_task state（策略链每次失败的降级记录） | 有记录 → FAIL（detail 带条数 + 策略名）；字段缺席与空列表同判通过（正向断言"没有降级"） |
+| `needs_human` | `pending_human_action` 为真（`bool()` 真值） | 无 | run_task state（HITL interrupt 置位） | `False` / 缺席 → FAIL（HITL 的稳定信号；interrupt 发生在 answer 之前，`final_answer` / `stop_reason` 尚空，不要断言它们） |
+
+当前场景集实际用到上表中 **8 种**；`tokens_below` / `latency_below` 有实现与单测（`tests/test_eval/test_checks.py`）但**尚无场景声明**（预算门禁还没进场景集；token 是 chat-only 下限，直接当硬预算会误判，见 §8.1/§8.8）。
+
+### 5.2 数据来源：run_task state vs harness 注入（`eval/harness.py`）
+
+| outcome 键 | 来源 | 形状 / 说明 |
+|-------------|------|-------------|
+| `tier` / `stop_reason` / `final_answer` / `result_data` / `degradation_log` / `pending_human_action` | `run_task` 返回的 `AgentState` dict | 产品的真实状态；`AgentState.execution_log` 有字段但 v2 graph **从不写** → `tools_called` 不能依赖它 |
+| `tool_calls` | harness `ToolCallRecorder.call` | 本次场景**尝试过**的全部工具名（含失败调用）；多轮 = 各轮累加；无调用 → `[]` |
+| `duration_ms` | harness `time.perf_counter()` | 整场景（含全部轮次）墙钟毫秒 |
+| `token_usage` | harness `UsageAccumulator.snapshot()` | 见 §5.3；**一个可用数字都没有时字段缺席**（不填 0） |
+
+### 5.3 chat-only 用量口径（token / cost 的下界）
+
+- 快照键（自描述，P4-T3 审查 I2）：`total_tokens`；`usage_source="chat_only"`；`chat_calls`（有 usage 面的调用数）；`model_calls`（实际发生的全部模型调用 = chat + structured + stream，**诚实分母**）；可选 `input_tokens` / `output_tokens`（仅当两者之和 > 0）；可选 `estimated_calls`（chat 里没报上量的次数）；可选 `cost_usd`（仅当 > 0）。
+- **为什么只有 chat**：`structured` 返回 schema 实例（litellm 的 usage 在重试循环里被丢）、`stream` 按 port 只 yield 字符串 —— 两个口都没有 usage 面。`UsageTrackingProvider` 只加一层"记账"（返回值原样透传），不改任何语义。
+- 因此 token / 成本是**下限**：T7 三轮样本池 `measured_calls=30 / model_calls=63`（47.6%），`total_tokens=10191` 是下限而不是"总消耗"（§7.7）；报告每条结果行带 `measured_calls` / `model_calls`，MD 汇总读作"N/M 调用有计量"。
+- 采集不到 → 字段缺席 → `tokens_below` FAIL；报告写 `null` / "—（未提供）"（§3.4）。
+
+### 5.4 一致性边界（逐条核对 `checks.py` 得到的精确行为）
+
+- `tier_is` / `stop_reason_is` 未强制 `expected`：`expected` 缺席且 outcome 无该键时 `None == None` 判定**通过** —— 当前 16 个文件全部显式声明（已核对）；新增场景必须写 `expected`。
+- `not_contains` 在 `final_answer` 缺席/非字符串时按空串处理 → **通过**（没有可匹配的文本）；所以"不得编造 / 不得抛栈"类断言应与"必须有数据"的断言成对出现（当前配 `contains_keyword`）。
+- `degradation_absent` 在 `degradation_log` 缺席时与空列表同判 → 通过（它是正向断言"没有降级"，不是"有数据才能判"）。
+- `needs_human` 用 `bool()` 真值判定（`pending_human_action` 非假即通过）。
+- `tools_called` 的 `exact_sequence` = **有序子序列**（期望工具按相对顺序出现即可，中间允许夹其他工具），不是全等序列。
+- `latency_below` 拿不到 `outcome["duration_ms"]` 时退化为 `execution_log` 步骤耗时之和 —— 语义变成"**工具耗时之和**"（不含模型调用），阈值要按这个语义设（v2 graph 不写 `execution_log`，真实模式实际总是拿到端到端墙钟）。
+- `field` 的 `kind` 只有 `number` 有特殊语义：其他值（含拼错）会走 `expected` 相等比较，且缺 `expected` 时直接 FAIL —— 不会静默通过，但新场景应写 `kind: number` 或省略 `kind`。
 
 ## 6. 运行指南（T8 完成）
 
@@ -208,4 +443,59 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 
 ## 8. 已知限制（T8 完成）
 
-_待写_
+> 每条写"缺失面 → 当前读数 → 影响"；数字与证据指向 §7 的产物，未采集/未验证的如实标注（不估算）。
+
+### 8.1 token 是 chat-only 下限；cost 本次未采集
+
+- **token 口径**：`structured` / `stream` 没有 usage 面（§5.3）→ 只有 `chat` 调用计入，`model_calls` 是诚实分母。T7 三轮样本池 **30/63 次模型调用有计量（47.6%）**，`total_tokens=10191` 是**下限**而不是"总消耗"；每轮的 `token_samples`（3 轮均为 9/10）暴露覆盖面。引用这些数字时必须带上"下限"口径。
+- **cost 未采集**：3 轮 `cost_samples=0`、`total_cost_usd=null`。原因：每次运行启动时 LiteLLM 取远端价格表失败（`Failed to fetch remote model cost map from https://raw.githubusercontent.com/… : timed out. Falling back to local backup`），本地备份也没有该模型的价格 → 写"未采集"，不估算。
+- **"缺席"不是 0**：`t2_read_page_failure` 3 轮 token 均缺席（模板答案路径，0 次模型调用）；报告按"未知"处理（`null` / 样本数），不是采集故障。
+
+### 8.2 HITL 链路未端到端验证（环境阻塞）
+
+- HITL 不在 `--tag acceptance` 的 3 轮里；补充运行（全量 1 轮 headless + `--tag hitl` headful 专跑）**都是 FAIL**，明细同为 `pending_human_action=False`。
+- 直接原因：本机到 `github.com/login` 的 `Page.goto` **30s 超时**（headless/headful 同因）→ 页面从未加载 → 登录墙检测（需采样可见文本/密码框）不可能触发；场景注释假设的"国内可达"在本机不成立（§7.5 A2 的探针原文）。
+- 结论：`needs_human` 链路 = **未验证**（既不是通过，也不是已确认缺陷）。要闭环需要**可达的登录墙站点**（P5 建议：换站点或本地 fixture 登录页）。
+- 读数影响：全量 1 轮的 exit=1 就是由这一条非 fragile 失败构成的（§7.6）；它的计数在"产品失败"里，但归因是**环境**，报告环境行/探针原文已把这条链路分开列。
+
+### 8.3 fragile 只解决"不误报回归"，不解决"可复现"
+
+- `t2_search_content`（fragile）依赖 ddgs 返回里含 "2024"；本环境返回无关内容 + 模型诚实拒编是设计行为（§7.5 A1）→ **3/3 FAIL 是环境读数，不是回归**，不计 exit code。
+- 它的通过依赖外部数据的可得性：换网络出口 / 换时点结论可能不同。结构面由 `t2_search_structural` 守（工具链 + 无降级 + completed）；**内容面的"可复现"无法用断言保证**，只能靠 fragile 如实记录。同理，任何新写的"依赖外部内容"断言都必须走 fragile 口径，不得混进结构场景（§3.1）。
+
+### 8.4 tier3 交互链未接入（`enabled: false`）
+
+- `browser_type` / `browser_click` 已在 executor 实现（含 `BrowserParams` 参数模型），但 `graph._STRATEGY_CHAIN["browser_task"] = [browser_open, browser_snapshot]` **没有把交互步编排进链**。现在启用 `t3_browser_interaction` 只会稳定得到 `all_strategies_failed`。
+- 该场景保留 `enabled: false`（P4 明确不做交互链扩展），断言写的是"启用后的预期语义"；`degradation_absent` 已补上（否则失败文案回显"输入 Python"会让它假通过，§3.2）。
+- 连带缺口：type/click 后的页面采样与重定向复查（executor 的四处复查点）**无场景覆盖**。
+
+### 8.5 多轮的架构缺口（已声明、未触发）
+
+- **全败路径不注入 history**：`answer` 节点三条路径中，`result_data` 带 `error` 时走"抱歉，这个任务暂时无法完成"模板，**不注入 history**（chitchat/knowledge_qa 直答路径与数据路径都注入）。3 轮 acceptance 里 `multi_turn_context` 都走正常路径，**该缺口未被触发** → 仍是未验证风险（场景 YAML 已如实记录，触发时会 FAIL 而不是被放宽）。
+- **classify / 参数提取只看任务原文**（不看 history）：第二轮流到哪个工具、能否提取城市不确定 → 场景**不**断言 `tools_called`（避免写一条必然抖动的断言）；这是有意的口径，不是遗漏。
+
+### 8.6 运行环境前提与 `BP_` 前缀边界
+
+- **浏览器 channel/rev**：本机 Playwright 1.59.0 需要的 chromium rev 不存在于本机缓存（§1）→ 真实 tier3 运行需 `BP_BROWSER_CHANNEL=msedge`（或 `uv run playwright install chromium`）。池起不来时 harness 打 WARNING + `attach_browser(None)`，报告环境行写 `unavailable (start failed)` —— tier3 的失败**在报告里**归因环境而不是任务（§6.3）。
+- **`Settings` 只读 `BP_` 前缀**（`env_prefix="BP_"`，`extra="ignore"`）：v1 的 `OPENAI_API_KEY` / `OPENAI_BASE_URL` 不会被自动读取；必须显式映射成 `BP_MODEL_API_KEY` / `BP_MODEL_BASE_URL`（T7 的做法是 shell 内导出，值来自 `.env`，未落盘，§7.1）。
+- **模型必须钉非思考模型**：structured 走 forced tool_choice（`src/browsepilot/model/litellm_provider.py` 的 `tool_choice={"type": "function", …}`），思考模型（deepseek-flash / v4-pro）拒绝它 → `StructuredOutputError`（structured 全场景报错）。所以真实运行必须 `BP_DEFAULT_MODEL=deepseek/deepseek-chat`（§6.3/§7.1；也是 `src/browsepilot/app/config.py` 的缺省值）。
+- HITL 还需 `BP_BROWSER_HEADLESS=false`（可见窗口），且如上所述仍被站点可达性阻塞。
+
+### 8.7 小样本统计的读数边界
+
+- P50/P95 是**线性插值**（numpy 默认口径）：空集 → `None`，n=1 → 该样本本身；样本数由 `latency_samples` 暴露（T7：样本池 30；per-tier 18/6/6）。样本少时别把 P95 当结论。
+- 延迟读数含**依赖网络时间**：P95 跨轮 20053.17 → 33314.83 ms（stdev 5514.86），由 `t2_search_structural`（18.0s → 42.9s → 45.5s）与 `t1_weather_not_found`（12.1s → 11.8s → 17.4s）贡献 —— 引用时别只贴 P95，P50 才是相对稳定的产品侧读数（§7.3）。
+- 3 轮是**同一场景集重复跑**（量波动，不是抽样）：不是跨模型 / 跨日 / 跨网络的抽样，换模型或换网络出口结论不保证迁移（§7.7）。
+- **mock 数据不代表模型质量**：CI 门禁跑 FakeProvider/FakeExecutor，只能证明断言与管线可复现；§7 的数字全部来自真实模式，二者不可混用（报告里有 mock banner）。
+
+### 8.8 未验证 / 未采集清单（P5 输入）
+
+| 项 | 状态 | 证据 |
+|----|------|------|
+| HITL `needs_human` 链路 | **未验证**（站点不可达） | §7.5 A2；§8.2 |
+| `cost_usd` / 成本统计 | **未采集**（价格表超时） | §7.7；§8.1 |
+| 多轮"全败路径不注入 history" | **未验证**（未触发） | §7.5 B；§8.5 |
+| tier3 交互链（type/click） | **未接入**（`enabled: false`） | §8.4；`graph.py` 的 `_STRATEGY_CHAIN` |
+| 跨模型 / 跨网络稳定性 | **未采集**（3 轮同环境） | §7.3；§8.7 |
+| `tokens_below` / `latency_below` 进场景集 | **未使用**（引擎与单测就绪，无场景声明） | §5.1；16 文件的 check 类型统计 |
+
