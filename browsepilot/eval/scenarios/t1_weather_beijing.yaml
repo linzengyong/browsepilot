@@ -7,6 +7,8 @@
 # 断言分工：
 # - field city：数据断言（p0-weather 的先例）—— 只有 weather 工具真的成功才有这个字段；
 #   代价：search 兜底"救回"任务时本条会失败 —— 对**正例**场景这是可接受的（兜底 = 主路径没走通）。
+# - field temperature_c（kind: number）：P4-T5 从 p0-weather 存档时**迁移**过来的断言（"温度必须是
+#   数值"，不是文本匹配）—— 存档 p0-* 不得等于丢断言：两句数据断言现在都归这条场景。
 # - degradation_absent / stop_reason_is：策略链一次失败都不许有；partial 不得报 completed。
 id: t1_weather_beijing
 name: 北京天气（Tier1 正例：路由 + 工具 + 城市名）
@@ -20,6 +22,9 @@ checks:
   - type: field
     field: city
     expected: 北京
+  - type: field
+    field: temperature_c
+    kind: number  # P4-T5：随 p0-weather 存档迁入（温度必须是数值，不是文本匹配）
   - type: tools_called
     tools: [weather]
   - type: degradation_absent

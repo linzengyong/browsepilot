@@ -6,9 +6,10 @@ from pydantic import ValidationError
 
 import eval.scenarios as es
 from browsepilot.agent.tracer import JsonlTracer
-from browsepilot.model.messages import Message
+from browsepilot.model.messages import ChatResult, Message
 from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
+from eval.report import ScenarioResult, aggregate
 from eval.run_eval import check_outcome, main, run_all
 from eval.scenarios import Check
 
@@ -178,7 +179,10 @@ def test_run_eval_smoke(capsys, monkeypatch):
     assert main() == 0
     out = capsys.readouterr().out
     assert "scenarios loaded" in out
-    assert "p0-weather" in out
+    # P4-T5：P0 基线已存档 —— 仍在输出里（列出为 [DISABLED]，报告要能解释"为什么没跑"），
+    # 但不再执行、不再进统计
+    assert "[DISABLED] p0-weather" in out
+    assert "[PASS] t1_weather_beijing" in out
 
 
 # FakeProvider/FakeExecutor 定义在 eval/fake_deps.py（run_eval --mock 与测试共用）。
@@ -478,7 +482,8 @@ def test_real_mode_warns_when_the_browser_cannot_start(tmp_path, monkeypatch, ca
     assert "chromium rev 1217 not found" in out
     assert "attach:none" in events  # executor 不留下未启动的池
     assert "close" not in events  # 没启动成功就不假装关闭
-    assert events.count("aclose") == 7  # smoke 集（degrade 是 mock-only，real 运行跳过它）
+    # smoke 集（degrade 是 mock-only、real 运行跳过它）：p0-weather 存档前是 7，现为 6
+    assert events.count("aclose") == 6
 
 
 # ── P4-T2：mode / tag / enabled 选择语义 + fragile 与 exit code 分离 ──
@@ -695,6 +700,7 @@ def test_scenario_set_declares_modes_tags_and_flags():
     for scenario_id in real_only:  # 真浏览器 / 人工 / 多轮 harness：mock 下跑不了
         assert by_id[scenario_id].mode == "real", scenario_id
     assert by_id["degrade_browser_unavailable"].mode == "mock"  # 只能在无浏览器环境下为真
+    # p0-weather 已存档（enabled: false，见下节）：存档**不**改运行口径（mode/tags 原样保留）
     for scenario_id in ("p0-weather", "t1_weather_beijing", "t2_search_structural"):
         assert by_id[scenario_id].mode == "both", scenario_id
     assert {"hitl", "browser"} <= set(by_id["hitl_login_detect"].tags)
@@ -705,14 +711,112 @@ def test_scenario_set_declares_modes_tags_and_flags():
     assert by_id["t1_weather_not_found"].tags == ["smoke", "acceptance"]
 
 
-def test_p0_scenarios_are_still_runnable_and_p0_search_is_fragile():
-    """向后兼容：P0 三场景仍在，只补了 tags/mode；内容断言的 p0-search 标 fragile。"""
+# ── p0-* 存档（P4-T5）：历史基线落 enabled: false，语义逐条迁移到新版场景 ──
+#
+# p0-weather / p0-search / p0-read-page 是 P1 验收"P0 场景 100% 可靠"的证据（文章引用，见
+# docs/v2-p1-report.md），不能删文件；P4-T5 的做法是**存档**：enabled: false（列出为
+# [DISABLED]、不进统计），断言逐条迁移到 t1_/t2_ 新版场景。
+#
+# 下面两张表就是迁移的**可执行**记录（不是注释里的承诺）：每条 p0 断言必须在**启用中**的
+# 新版场景里找到承接者，否则"存档"就变成了"悄悄少断言"。
+
+_P0_ARCHIVED = ("p0-weather", "p0-search", "p0-read-page")
+
+#: p0 场景 id → 承接它的新版场景 id（逐个断言比对，见 ``_covers``）
+_P0_SUCCEEDED_BY: dict[str, list[str]] = {
+    # field city=北京 + field temperature_c(number)：两条都迁进 t1_weather_beijing
+    "p0-weather": ["t1_weather_beijing"],
+    # 拆成两版：结构断言（tools_called/degradation/stop_reason，不依赖 ddgs 内容）+
+    # 内容断言（contains "2024"，fragile，P4-D6）
+    "p0-search": ["t2_search_structural", "t2_search_content"],
+    # contains "Python" + URL → tier2 read_page（新版另断言确实调了 fetch_page）
+    "p0-read-page": ["t2_read_page"],
+}
+
+
+def _covers(successor: Check, archived: Check) -> bool:
+    """承接断言是否覆盖被存档断言的**语义**（按 check 类型逐条比对，不靠注释）。
+
+    只处理 p0-* 用到的两种类型；将来有别的类型进 p0 档案时，这里显式加分支（不得默认 True）。
+    """
+    if successor.type != archived.type:
+        return False
+    if archived.type == "field":
+        if successor.field != archived.field:
+            return False
+        if archived.kind is not None:  # kind: number → 承接者也得是数值断言
+            return successor.kind == archived.kind
+        return successor.expected == archived.expected
+    if archived.type in ("contains_keyword", "not_contains"):
+        return set(archived.keywords or []) <= set(successor.keywords or [])
+    return False
+
+
+def test_p0_baselines_are_archived_not_deleted():
+    """P1 的历史基线：文件保留（可手动启用做回归对比），但不再参与统计（enabled: false）。"""
     by_id = {s.id: s for s in _all_scenarios()}
-    for scenario_id in ("p0-weather", "p0-search", "p0-read-page"):
-        assert by_id[scenario_id].enabled and by_id[scenario_id].mode == "both"
-    assert by_id["p0-search"].fragile is True
-    assert by_id["t2_search_content"].fragile is True  # 内容断言版
-    assert by_id["t2_search_structural"].fragile is False  # 结构断言版（D6）
+    for scenario_id in _P0_ARCHIVED:
+        assert scenario_id in by_id, scenario_id
+        assert by_id[scenario_id].enabled is False, scenario_id
+        assert by_id[scenario_id].mode == "both", scenario_id  # 存档不动运行口径
+    assert by_id["p0-search"].fragile is True  # 内容断言（D6）—— 存档前就标了
+    assert set(_P0_SUCCEEDED_BY) == set(_P0_ARCHIVED)  # 每条基线都要有承接关系
+
+
+def test_p0_assertion_semantics_have_enabled_successors():
+    """覆盖无缺口：p0-* 的**每一条**断言都能在启用中的新版场景里找到承接者。
+
+    缺口实例（T5 之前真实存在）：p0-weather 的 ``field temperature_c kind: number`` 没有承接者 ——
+    直接存档就丢了"温度必须是数值"这条数据断言。
+    """
+    by_id = {s.id: s for s in _all_scenarios()}
+    for archived_id, successor_ids in _P0_SUCCEEDED_BY.items():
+        successors = [by_id[sid] for sid in successor_ids]
+        for successor in successors:
+            assert successor.enabled, f"{archived_id} 的承接者 {successor.id} 必须启用"
+        for check in by_id[archived_id].checks:
+            covering = [s.id for s in successors if any(_covers(c, check) for c in s.checks)]
+            assert covering, (
+                f"{archived_id} 的断言 {check.type}"
+                f"({check.field or check.kind or check.keywords}) 在 {successor_ids} 里没有承接者"
+                " —— 存档 = 丢断言"
+            )
+
+
+def test_archived_baselines_leave_the_count_to_the_new_set():
+    """存档后的计数口径（P4-T5）：mock 可执行 8 条（原 11）、停用 4 条（3 条 p0 + 交互链）。"""
+    scenarios = _all_scenarios()
+    runnable = [s for s in scenarios if s.enabled and s.mode in ("both", "mock")]
+    assert len(scenarios) == 16  # 文件都还在（存档 ≠ 删除）
+    assert not [s for s in runnable if s.id.startswith("p0-")]
+    assert len(runnable) == 8
+    assert {s.id for s in scenarios if not s.enabled} == {
+        *_P0_ARCHIVED,
+        "t3_browser_interaction",
+    }
+
+
+def test_search_content_version_is_fragile_and_structural_one_is_not():
+    """D6 的拆分口径：内容断言（依赖 ddgs 返回）fragile，结构断言不 fragile。"""
+    by_id = {s.id: s for s in _all_scenarios()}
+    assert by_id["t2_search_content"].fragile is True
+    assert by_id["t2_search_structural"].fragile is False
+
+
+def test_structural_search_scenario_does_not_assert_on_answer_wording():
+    """P4-T5 实测加固：真实模式里模型会"简洁回答/如实拒答"而不回显链接
+    （1 次 eval smoke + 2 次探针，答案都不含 "http"）—— 结构版场景只允许断言
+    **结构**（工具调用 / 无降级 / 终止原因），答案措辞类断言必须留在内容版（fragile）。
+
+    没有这条回归网，"答案里要出现链接"这种措辞断言会被当成结构断言重新加回来，
+    而这个场景存在的全部意义就是"不依赖措辞、真实模式稳定"（P4-D6）。
+    """
+    by_id = {s.id: s for s in _all_scenarios()}
+    structural = by_id["t2_search_structural"]
+    types = [check.type for check in structural.checks]
+    assert "contains_keyword" not in types and "not_contains" not in types
+    assert {"tools_called", "degradation_absent", "stop_reason_is"} <= set(types)
+    assert by_id["t2_search_content"].fragile is True  # 措辞/内容断言归它（不 gate）
 
 
 def test_scenario_assertions_only_use_check_types_the_engine_knows():
@@ -765,6 +869,39 @@ def test_mock_run_is_green_over_the_real_scenario_set(capsys, monkeypatch):
         if not scenario.enabled:
             assert f"[DISABLED] {scenario.id}" in out
     assert "fragile_failed=0" in out
+
+
+async def test_fragile_content_drift_is_counted_but_does_not_gate(tmp_path, capsys):
+    """P4-T5 核对（任务书 Step 3）：真实场景集上的内容漂移只计 fragile_failed、不 gate exit code，
+    且报告层单独计数（T4）——结构版场景（t2_search_structural）不受内容漂移影响。
+
+    漂移构造：FakeProvider 的答案里把 "2024" 换成 "20XX" —— 复刻 P2 D1 / P4-D6 的现场
+    （ddgs 返回里没有发布日期，模型诚实不捏造）。这是**最接近真实事故的合成形状**：
+    工具链本身完全正常（search 被调用、无降级），只有内容断言落空。
+    """
+
+    class _DriftedAnswerProvider(FakeProvider):
+        async def chat(self, messages, *, model=None):
+            result = await super().chat(messages, model=model)
+            return ChatResult(text=result.text.replace("2024", "20XX"))
+
+    results: list[ScenarioResult] = []
+    tracer = JsonlTracer(trace_id="eval-fragile-drift", out_dir=tmp_path)
+    code = await run_all(
+        provider=_DriftedAnswerProvider(),
+        executor=FakeExecutor(),
+        tracer=tracer,
+        results=results,
+    )
+    out = capsys.readouterr().out
+    assert code == 0  # 内容漂移不是回归（D6）
+    assert "[FAIL] t2_search_content" in out and "fragile=true" in out
+    assert "[PASS] t2_search_structural" in out  # 结构断言不依赖 ddgs 内容 → 不受影响
+    assert "fragile_failed=1" in out and "failed=0" in out
+    stats = aggregate(results)  # 报告层（T4）：fragile 失败不混进门禁 failed
+    assert (stats.executed, stats.passed, stats.failed, stats.fragile_failed) == (8, 7, 0, 1)
+    drifted = next(result for result in results if result.id == "t2_search_content")
+    assert drifted.fragile and not drifted.passed and drifted.failure_detail
 
 
 # ── C1 回归网：合成失败/partial outcome 不得让正例场景全绿 ──

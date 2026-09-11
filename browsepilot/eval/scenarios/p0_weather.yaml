@@ -1,11 +1,25 @@
-# P0 场景（保留）：P1 "天气 100% 可靠"的证据场景 —— 断言直接落在 result_data 上
-# （city/temperature_c），不依赖答案文本措辞。
+# ⚠️ enabled: false —— **历史基线存档**（P4-T5 去重）。
+#
+# 这是 P1 验收证据（"P0 场景 100% 可靠"；文章引用 docs/v2-p1-report.md 的那张表），
+# 所以**保留文件**而不是删除。P4-T5 起因重复（同 prompt 的 t1_weather_beijing 已覆盖）不再参与
+# 统计：断言已逐条迁移到新版场景 ——
+#   - field city == 北京            → t1_weather_beijing（同名数据断言）
+#   - field temperature_c (number)  → t1_weather_beijing（T5 迁移：这条原来是缺口，见下）
+#   - prompt "北京今天天气怎么样？"   → t1_weather_beijing（同 prompt）
+# t1_weather_beijing 另加 tier_is / tools_called / degradation_absent / stop_reason_is：
+# 旧基线的"失败链上 search 兜底把任务救回也算 PASS"漏洞由 T2 加固补齐。
+# 覆盖关系的**可执行**回归网见 tests/test_eval/test_scenarios.py 的
+# `_P0_SUCCEEDED_BY`（每条 p0 断言都必须在启用中的新版场景里找到承接者）。
+#
+# 如需回归对比（例如文章要复现 P1 的原始数字），把 enabled 翻回 true 单独跑即可：
+#   uv run python -m eval.run_eval --mock（或 real 模式）。
 id: p0-weather
 name: 天气查询（Tier1，必须 100% 可靠）
 prompt: "北京今天天气怎么样？"
 tier: tier1
 tags: [smoke, acceptance]
 mode: both
+enabled: false
 checks:
   - type: field
     field: city

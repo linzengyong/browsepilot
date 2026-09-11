@@ -1,12 +1,25 @@
-# P0 内容断言的原始形态（"答案含 2024"）：依赖 ddgs 返回的**具体内容** → P4-D6 标 fragile
-# （失败照实打印，但不计入门禁 exit code）。结构化解耦版见 t2_search_structural；
-# T5 会正式把 p0-search 拆成"结构版 + 内容版"（本文件先承接内容版语义）。
+# ⚠️ enabled: false —— **历史基线存档**（P4-T5 去重）。
+#
+# 这是 P1 验收证据（P1 "P0 场景 100% 可靠" 的原始形态），文章引用；P2 D1 起它在真实模式漂移
+# （ddgs 返回里没有 "2024" → 模型诚实拒编 → FAIL，非代码回归），P4-D6 因此标 fragile
+# （失败照实打印，但不计入门禁 exit code）。
+#
+# P4-T5 起因与 t2_search_content **同 prompt、同断言**（重复）而不再参与统计：语义被拆成两个
+# 新版场景，各自承接一半 ——
+#   - 内容断言 contains_keyword ["2024"]（依赖 ddgs 返回的具体内容，fragile）→ t2_search_content
+#   - "搜索工具真的被调用 + 链上零降级 + 正常完成"（不依赖具体内容与答案措辞）→ t2_search_structural
+#     （P4-D6 的结构解耦版；另加 degradation_absent / stop_reason_is）
+# 覆盖关系的**可执行**回归网见 tests/test_eval/test_scenarios.py 的 `_P0_SUCCEEDED_BY`。
+#
+# 如需回归对比（复现 P1/P2/P3 报告里的原始 p0-search 行），把 enabled 翻回 true 单独跑即可；
+# 注意它仍是内容型断言，真实模式可能如实地 FAIL（fragile 不 gate exit code）。
 id: p0-search
 name: 搜索结果提取（Tier1）
 prompt: "搜索一下 Python 3.13 正式发布时间"
 tier: tier1
 tags: [acceptance]
 mode: both
+enabled: false
 fragile: true
 checks:
   - type: contains_keyword

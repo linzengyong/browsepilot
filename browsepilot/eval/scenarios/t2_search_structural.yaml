@@ -1,10 +1,21 @@
-# P4-D6 的**结构断言**：断言"搜索工具被真的调用了"+"答案里出现了结果链接"，
-# 不依赖 ddgs 返回的**具体内容**（那会随引擎/时间漂移 → 见 t2_search_content 的 fragile 标记）。
+# P4-D6 的**结构断言**：断言"搜索工具被真的调用了"+"链上没有降级"+"正常完成"，
+# 不依赖 ddgs 返回的**具体内容**，也**不依赖答案的措辞**。
 #
 # tier 字段是**路由实际层级**：search 规则命中 tier1（与 p0-search 一致）；
 # t2_ 前缀是场景库分组（P2 语义），不是路由层级。
+#
+# P4-T5 真实模式抽查（1 次 eval smoke + 2 次探针）：原断言里的
+# `contains_keyword ["http"]`（"答案里出现了结果链接"）在真实模式稳定 FAIL —— answer 节点的
+# system prompt 只要求"用中文简洁回答，基于给定数据"，**从未**要求回显链接；ddgs 漂移
+# （返回里没有 Python 3.13 发布信息）时模型如实拒答，答案不含任何链接：
+#   "搜索结果里没有关于 Python 3.13 正式发布时间的信息，无法给出答案。"
+# → 那是**措辞依赖**，不是结构回归。修法（T2-fix 红线：不得改成虚假通过）：删掉链接断言，
+# 结构版只留结构断言；内容/措辞类断言全部归 t2_search_content（fragile，失败照实打印但不 gate）。
+# 删后仍能拦住坏运行：全策略失败 → degradation_absent 挂；partial（链上升级/只导航未观察）→
+# stop_reason_is 挂（回归网：test_scenarios.py 的 C1 合成失败/partial 网 +
+# `test_structural_search_scenario_does_not_assert_on_answer_wording`）。
 id: t2_search_structural
-name: 搜索结果结构（工具调用 + 链接；不依赖具体内容）
+name: 搜索结果结构（工具调用 + 无降级；不依赖内容/措辞）
 prompt: "搜索一下 Python 3.13 正式发布时间"
 tier: tier1
 tags: [smoke, acceptance]
@@ -12,8 +23,6 @@ mode: both
 checks:
   - type: tools_called
     tools: [search]
-  - type: contains_keyword
-    keywords: ["http"]
   # P4-T2 审查 I3：search 没有回退（失败即 all_strategies_failed）—— 正例场景不允许降级。
   - type: degradation_absent
   - type: stop_reason_is

@@ -1,11 +1,22 @@
-# P0 场景（保留）：任务里带 URL → tier2 read_page；内容断言与 t2_read_page 重叠
-# （T5 迁移时会去重，这里先保留 P0 的原始语义与 id）。
+# ⚠️ enabled: false —— **历史基线存档**（P4-T5 去重）。
+#
+# 这是 P1 验收证据（文章引用）；与 t2_read_page 的 prompt/断言重叠（同为 URL → tier2 read_page +
+# "Python"），P4-T5 起因重复不再参与统计：语义被 t2_read_page 承接 ——
+#   - contains_keyword ["Python"]        → t2_read_page（同关键词）
+#   - 任务带 URL → read_page/tier2 链路   → t2_read_page 的 tools_called [fetch_page]
+#     （更精确：断言"确实抓了页"，而不只是"答案里有 Python"）
+# t2_read_page 另加 degradation_absent / stop_reason_is（T2 加固）：fetch 失败升级到 browser_open
+# 也算降级 —— 旧基线会把"兜底救回"读成 PASS。
+# 覆盖关系的**可执行**回归网见 tests/test_eval/test_scenarios.py 的 `_P0_SUCCEEDED_BY`。
+#
+# 如需回归对比（复现 P1 的原始 p0-read-page 行），把 enabled 翻回 true 单独跑即可。
 id: p0-read-page
 name: 网页内容获取（Tier2）
 prompt: "打开 https://www.python.org 告诉我页面主要内容"
 tier: tier2
 tags: [acceptance]
 mode: both
+enabled: false
 checks:
   - type: contains_keyword
     keywords: ["Python"]
