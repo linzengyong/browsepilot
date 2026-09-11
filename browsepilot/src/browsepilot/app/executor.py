@@ -46,18 +46,25 @@ Tier3（T4 接线）要点：
   隐藏登录下拉 → 误报 HITL），而误报要花掉唯一的人工暂停机会。成本是每个交互动作一次
   innerText 提取（随后被截断到 20KB）；也正因为有成本，观察类工具（snapshot/scroll/execute_js）
   不跑检测。
-- **当前页跟踪**：executor 是 app 级共享对象，browser 工具共用**一个** current page
-  （``browser_open`` 首次向池索取，之后复用；snapshot/click/type/scroll 都作用在它身上）。
+- **当前页跟踪（P5：按 asyncio 上下文隔离）**：executor 仍是 app 级共享对象，但"当前页"放进
+  ``ContextVar``（``_page_var``）——**每个 asyncio 上下文/任务各一张页**，别的上下文看不到、
+  也不会把这一页导航走（旧行为是 executor 级共享一页：多客户端并发时 B 的 ``browser_open``
+  会把 A 的页带走，A 的 snapshot 看到的是 B 的页面——P3 final review #5 要求在 A2A 落地前解决）。同一上下文内（``browser_open`` →
+  ``browser_snapshot`` → click…）依旧复用同一张页，P4 的语义不变。``_page_lock`` 随之**收窄到
+  池操作**（取页的"检查-动作"对，:meth:`_acquire_page`）：页面动作不再全局串行 —— 各上下文
+  各跑各的页，这是 A2A 多客户端并行的前提。
   使用前查 ``is_closed()``（池到上限会回收最老的 busy page，``close()`` 会关掉全部 page）：
-  死页立即丢引用，下次 ``browser_open`` 重新取页——否则 current page 指向死页后，每个浏览器
+  死页立即丢引用，下次 ``browser_open`` 重新取页——否则当前页指向死页后，每个浏览器
   调用都永久失败且无法恢复。**失败导航的页面同样立即弃用**（``_discard_page``，F4）：它停在
   ``chrome-error://`` 且错误页导航可能还在飞，复用同一页的下一次 ``goto`` 会被它打断
-  （T6 冒烟 S6 确定性复现的假失败）。``aclose()`` 显式把当前页归还池（executor 退役时调用；不
-  调用则该池槽一直占着）——**尚未接到 app lifespan**（P4 议题，不在本次改动范围）。
-  并发限制：多会话并行时看到的是同一个页面（会互相串页）；``self._page_lock`` 只保证
-  "取页/换页"不交错（并发 open 不会各建一个 page），**不做会话隔离**——会话级隔离要把
-  page 放进会话上下文（P4+ 议题）。demo 阶段接受该限制并在此显式记录；``aclose()``/隔离
-  归还的页面同样在池里共享（多会话下别的消费者可能拿到，见 :meth:`aclose` 残余说明）。
+  （T6 冒烟 S6 确定性复现的假失败）。``aclose()`` 把本 executor **借出的全部页面**归还池
+  （``_held_pages``：跨上下文，因为逐场景 teardown 跑在外层任务里，见 :meth:`aclose`）；
+  **尚未接到 app lifespan**（P4 议题，不在本次改动范围）。
+  残余（逐条记录）：① 页不再跨上下文复用——一个上下文首次 ``browser_open`` 取一张新页，上下文
+  结束后无人归还（除非 ``aclose()`` 被调 / 池到上限回收最老的 busy 页），app 侧没接 lifespan
+  归还点 → 长跑会有页 churn；② 同一上下文内的**同页并发**动作不再有全局互斥（图里的工具
+  调用本就是顺序 ``await``；将来若在会话内并发编排工具，得自己串行）；③ 归还（``aclose``）与
+  弃用后的页仍停在最后打开的 URL 上，多会话下别的消费者可能从 idle 取到它。
 - **池可选**：``browser=None``（Tier3 未接线）时 6 个工具一律返回
   ``error_type="browser_unavailable"``，图不需要特判 Tier3：策略链按既有降级链走到
   all_strategies_failed + 明确告知（诚实原则）。
@@ -73,6 +80,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from contextvars import ContextVar
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -253,9 +261,16 @@ class AppToolExecutor:
             settings = Settings()
             policy = NavigationPolicy(settings.navigation_policy, settings.allowed_domains)
         self._policy = policy
-        #: 当前页（browser 工具共享；首次 browser_open 向池索取，之后复用）
-        self._page: Page | None = None
-        #: 串行化"取当前页 / 换当前页"（并发限制见模块 docstring）
+        #: 当前页（同一个上下文里的 6 个 browser 工具共用；首次需要页时向池索取，之后复用）：
+        #: **上下文局部**变量（P5）——每个 asyncio 任务/图节点各一张页，别的会话看不到也拿不走。
+        self._page_var: ContextVar[Page | None] = ContextVar(
+            f"browsepilot_current_page_{id(self)}", default=None
+        )
+        #: 本 executor 从池里借出、尚未归还/弃用的全部页面（跨上下文——上下文结束后没人替它
+        #: 归还，而 ``aclose()`` 由**外层任务**调用；见 :meth:`aclose`）。
+        self._held_pages: list[Page] = []
+        #: 池操作保护：取页的"检查-动作"对（:meth:`_acquire_page`）。不再用来串行不同上下文的
+        #: 页面动作（页面已按上下文隔离，见模块 docstring 的"当前页跟踪"）。
         self._page_lock = asyncio.Lock()
 
     async def list_tools(self) -> list[ToolSpec]:
@@ -304,12 +319,16 @@ class AppToolExecutor:
     # ── Tier3：浏览器工具（可选接线；失败即数据） ──────────────────────────────
 
     async def _call_browser(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        """浏览器工具入口：池缺失 → browser_unavailable；其余异常 → 结构化错误。"""
+        """浏览器工具入口：池缺失 → browser_unavailable；其余异常 → 结构化错误。
+
+        P5 起这里**不再**全局串行（旧行为：``async with self._page_lock`` 包住整次派发）：页面已经
+        按上下文隔离，不同会话的动作互不相干，各跑各的；``_page_lock`` 收窄到取页。同一张页上的
+        动作仍应由调用方顺序发起（图里的工具调用本就是顺序 ``await``）。
+        """
         if self._browser is None:
             return _browser_error("browser_unavailable", _BROWSER_MISSING_MSG)
         try:
-            async with self._page_lock:
-                return await self._dispatch_browser(name, arguments)
+            return await self._dispatch_browser(name, arguments)
         except _PoolUnavailableError as exc:
             return _browser_error("browser_unavailable", f"浏览器池不可用：{exc}")
         except Exception as exc:  # 兜底：ToolExecutor 契约是"失败即数据"，绝不冒泡
@@ -509,20 +528,30 @@ class AppToolExecutor:
     # ── 当前页生命周期（I2 隔离 / I3 恢复与释放） ─────────────────────────
 
     def _current_page(self) -> Page | None:
-        """当前页（使用前调用）：被池回收过（``is_closed()``）就丢引用，等重新取页。
+        """当前页（使用前调用）：本上下文没有页就返回 None；被池回收过（``is_closed()``）就丢引用。
 
-        池到上限会回收最老的 busy page（``new_page()``），``close()`` 会关全部 page：
-        不检查的话 ``self._page`` 永远指向死页，之后每个浏览器调用都失败且无法恢复
-        （那个池槽也永远不释放）。
+        页面是**上下文局部**的（P5，见模块 docstring）：别的会话/任务看不到这一页，也就不会串页。
+        死页处理与 P4 相同：不检查的话 ``_page_var`` 永远指向死页，之后每个浏览器调用都失败且
+        无法恢复（那个池槽也永远不释放）。
         """
-        page = self._page
+        page = self._page_var.get()
         if page is None:
             return None
         if _page_closed(page):
             logger.info("current page is closed (evicted/closed by pool); dropping reference")
-            self._page = None
+            self._forget_page(page)
             return None
         return page
+
+    def _forget_page(self, page: Page) -> None:
+        """丢掉对某页的引用：清本上下文的当前页（若正持有）+ 从借出记录里剔掉。
+
+        死页、弃用页、归还页三条路径共用 —— 引用不丢的话，归还过的页会被再归还一次、或者死页
+        被当成还能用的页（旧实现里只有一个 ``self._page``，这里是它的多上下文版本）。
+        """
+        if self._page_var.get() is page:
+            self._page_var.set(None)
+        self._held_pages = [held for held in self._held_pages if held is not page]
 
     async def _guard_current_url(self, page: Page, action: str) -> ToolResult | None:
         """**入口复查**（I1）：使用当前页之前先看它在哪；返回 None = 放行。
@@ -630,8 +659,7 @@ class AppToolExecutor:
         """
         if page is None:
             return
-        if self._page is page:
-            self._page = None
+        self._forget_page(page)
         if self._browser is None:
             return
         try:
@@ -653,25 +681,48 @@ class AppToolExecutor:
             logger.debug("page release failed: {}", _describe(exc))
 
     async def aclose(self) -> None:
-        """释放当前页占用的池槽（置空引用 + 归还池；幂等）：不调则该池槽一直占着。
+        """释放本 executor 借出的**全部**页面（跨上下文；幂等）：不调则那些池槽一直占着。
 
-        残余限制（与模块 docstring 的共享页限制同源）：归还的页面仍停在最后打开的 URL 上，
-        多会话并发时别的消费者可能拿到它；本 executor 随后会重新取页（``_current_page``），
-        不会继续在旧页上动作。尚未接到 app lifespan（P4 议题）。
+        P5 起"当前页"是上下文局部的，而 ``aclose()`` 由**外层任务**调用（评测 harness 的逐场景
+        teardown；页面则是图节点上下文取的）——只归还"本上下文的当前页"等于什么都不归还，
+        C2③ 的逐场景隔离就成了空话。所以这里按**借出记录**（``_held_pages``）归还：本 executor
+        从池里拿过、既没弃用也没归还的页，一个不落。
+
+        残余限制（与模块 docstring 同源）：归还的页面仍停在最后打开的 URL 上，多会话并发时
+        别的消费者可能从 idle 取到它；正在使用该页的上下文不会被叫停（页引用已归还，但只有池
+        的 idle 复用才算“换了手”——归还后本 executor 不会再在旧页上动作）。尚未接到 app
+        lifespan（P4 议题）。
         """
-        page, self._page = self._page, None
-        await self._release_page(page)
+        pages, self._held_pages = self._held_pages, []
+        self._page_var.set(None)
+        for page in pages:
+            await self._release_page(page)
 
     async def _acquire_page(self) -> Page:
-        """取当前页（首次向池索取并记住）；池不可用 → :class:`_PoolUnavailableError`。"""
+        """取当前页（本上下文首次向池索取并记住）；池不可用 → :class:`_PoolUnavailableError`。
+
+        ``_page_lock`` 保护这里的"检查-取页"对（**池操作**）：同一上下文里并发调用不会各自
+        ``new_page()``（那会突破池的 ``max_pages``）。不同上下文（会话/任务）**各自取页**，正是
+        P5 的隔离目标。顺带清一次借出记录里的死页（池回收过的页不该一直被引用拦着，见
+        :meth:`_forget_page`）。
+        """
         pool = self._browser
         if pool is None:  # _call_browser 已拦住；这里只是给类型收窄
             raise _PoolUnavailableError(_BROWSER_MISSING_MSG)
-        try:
-            self._page = await pool.new_page()
-        except Exception as exc:  # 未 start() / 启动失败 / 浏览器崩了
-            raise _PoolUnavailableError(f"BrowserPool.new_page() 失败（{_describe(exc)}）") from exc
-        return self._page
+        async with self._page_lock:
+            existing = self._current_page()
+            if existing is not None:
+                return existing
+            self._held_pages = [held for held in self._held_pages if not _page_closed(held)]
+            try:
+                page = await pool.new_page()
+            except Exception as exc:  # 未 start() / 启动失败 / 浏览器崩了
+                raise _PoolUnavailableError(
+                    f"BrowserPool.new_page() 失败（{_describe(exc)}）"
+                ) from exc
+            self._page_var.set(page)
+            self._held_pages.append(page)
+            return page
 
 
 # ── 内部 helper（全部 failsafe：不抛异常给调用方） ────────────────────────────

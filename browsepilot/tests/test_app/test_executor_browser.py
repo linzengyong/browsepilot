@@ -1,8 +1,9 @@
 """T4 接线单测：AppToolExecutor 的 6 个 Tier3 浏览器工具。
 
 覆盖主线：**policy 门**（navigate 之前把关、拒绝路径绝不建页/导航）、**动作后 URL 复查**
-（重定向/点击跳转/JS 跳转回流后的落点也要在策略内，I2）、**当前页跟踪**（open 复用同一个 page；
-snapshot/click/type/scroll 都作用在它身上；池回收后的恢复与 ``aclose()`` 释放，I3）、
+（重定向/点击跳转/JS 跳转回流后的落点也要在策略内，I2）、**当前页跟踪**（同一上下文里 open
+复用同一个 page；snapshot/click/type/scroll 都作用在它身上；**P5：页面按 asyncio 上下文隔离**——
+并发会话各拿各的页、``aclose()`` 跨上下文归还；池回收后的恢复，I3）、
 **结构化降级**（未注入池 / 池未启动 / 快照为空 / 动作失败 一律返回 ToolResult，绝不抛）、
 **D5/D6 HITL 桥**（open/click/type 之后采样**渲染后可见文本**（F1：``body.inner_text()``；
 原始 HTML 绝不进检测），命中登录/验证码后按置信度处置：high → 挂 ``needs_human`` +
@@ -243,11 +244,38 @@ class FakePage:
         return self.html
 
 
-class FakeBrowser:
-    """BrowserPool 替身：只实现 executor 用到的 new_page()/release()/discard()；可注入启动失败。"""
+class _SessionPageFactory:
+    """``page_factory``：每次 ``new_page()`` 都给一张**新**页，且每张页的可见内容不同。
 
-    def __init__(self, page: FakePage | None = None, *, start_error: Exception | None = None):
+    真池在并发会话下就是这样各建一张页（idle 里没有可复用的），而假池的"单页复用"会让
+    "谁的 snapshot 看到谁的页"无法分辨 —— 会话隔离的断言需要内容可区分的页。
+    """
+
+    def __init__(self) -> None:
+        self.pages: list[FakePage] = []
+
+    def __call__(self) -> FakePage:
+        name = chr(ord("A") + len(self.pages))
+        page = FakePage(snapshot_tree=f'- link "Session {name}" [ref=e{len(self.pages) + 1}]\n')
+        self.pages.append(page)
+        return page
+
+
+class FakeBrowser:
+    """BrowserPool 替身：只实现 executor 用到的 new_page()/release()/discard()；可注入启动失败。
+
+    ``page_factory`` 给"并发会话各取各页"的测试缝（每次都给新页，模拟池没有 idle 可复用）。
+    """
+
+    def __init__(
+        self,
+        page: FakePage | None = None,
+        *,
+        start_error: Exception | None = None,
+        page_factory: Any = None,
+    ):
         self._page = page
+        self._page_factory = page_factory
         self.start_error = start_error
         self.created: list[FakePage] = []
         self.new_page_calls = 0
@@ -273,6 +301,11 @@ class FakeBrowser:
         await asyncio.sleep(0)  # 真实建页有 await 点：并发测试需要这个让出点
         if self.start_error is not None:
             raise self.start_error
+        if self._page_factory is not None:
+            page = self._page_factory()  # 每次一张新页（并发会话拿不到同一张）
+            self._page = page
+            self.created.append(page)
+            return page
         if self._page is None or self._page.is_closed():
             self._page = FakePage()  # 池回收后是新建/复用 idle（不会把死页再交出去）
         self.created.append(self._page)
@@ -518,16 +551,59 @@ async def test_browser_pool_not_started_degrades_to_browser_unavailable():
 
 
 @pytest.mark.asyncio
-async def test_concurrent_opens_share_one_page():
-    """并发 open 也不会各建一个 page（检查 current page 与建页之间没有互斥时会）。"""
+async def test_concurrent_sessions_do_not_share_a_page():
+    """P5（A2A 前置）：页面按 asyncio **上下文**隔离 —— 两个并发会话各拿各的页，互不串页。
+
+    旧行为（P3 final review #5，executor docstring 已认）：``self._page`` 是 app 级共享 ——
+    会话 B 的 ``browser_open`` 会把会话 A 的页导航走，A 随后的 snapshot 看到的是 B 的页面。
+    这里两个会话各自做 open → snapshot（同一个 task 内 = 同一个上下文），页的内容可区分，
+    所以"谁的 snapshot 拿到谁的页"是直接断言，不靠时序。
+    """
+    factory = _SessionPageFactory()
+    browser = FakeBrowser(page_factory=factory)
+    ex = make_executor(browser)
+
+    async def session(url: str) -> tuple[dict, dict]:
+        opened = await ex.call("browser_open", {"url": url})
+        snapshot = await ex.call("browser_snapshot", {})
+        return opened.data, snapshot.data
+
+    (a_open, a_snap), (b_open, b_snap) = await asyncio.gather(
+        session("https://example.com/a"), session("https://example.com/b")
+    )
+
+    assert browser.new_page_calls == 2  # 各取各的页（不再共用一张）
+    assert (a_open["url"], b_open["url"]) == ("https://example.com/a", "https://example.com/b")
+    assert factory.pages[0].goto_calls == ["https://example.com/a"]
+    assert factory.pages[1].goto_calls == ["https://example.com/b"]
+    # 串页的话两条会话的 snapshot 会是同一张页的 refs（旧行为下这里必然相等）
+    assert a_snap["refs"] != b_snap["refs"]
+    assert (a_snap["url"], b_snap["url"]) == ("https://example.com/a", "https://example.com/b")
+
+
+@pytest.mark.asyncio
+async def test_session_page_is_invisible_outside_its_context_and_released_by_aclose():
+    """P5 的两条不变量（一条测试两个方向）：某会话（独立 task = 独立上下文）打开的页
+
+    - **不串给别的上下文**：外层上下文看不到它（旧行为下 ``self._page`` 是共享的 → 看得到）；
+    - **``aclose()`` 仍能归还它**：评测 harness 的逐场景 teardown 跑在**外层任务**里（图节点
+      才是取页的上下文）—— 只归还"本上下文的当前页"等于什么都不归还，页面永远占着池槽，
+      C2③"逐场景隔离"就成了空话。
+    """
     browser = FakeBrowser()
     ex = make_executor(browser)
-    await asyncio.gather(
-        ex.call("browser_open", {"url": "https://example.com/a"}),
-        ex.call("browser_open", {"url": "https://example.com/b"}),
-    )
+
+    async def session() -> None:
+        await ex.call("browser_open", {"url": "https://example.com/session"})
+
+    await asyncio.create_task(session())
     assert browser.new_page_calls == 1
-    assert browser.created[0].goto_calls == ["https://example.com/a", "https://example.com/b"]
+    assert (await ex.call("browser_snapshot", {})).error_type == "no_open_page"
+
+    await ex.aclose()
+    assert browser.released == browser.created  # 借出的页一个不落
+    await ex.aclose()  # 幂等：借出记录已清空，不重复归还
+    assert browser.released == browser.created
 
 
 @pytest.mark.asyncio
