@@ -1,6 +1,13 @@
 # HITL（登录墙 → 人工介入）：需真浏览器，且 headless 下检测行为需实测 → 不进 CI/acceptance
 # 门禁，留给 T7 真实运行（docs/v2-p3-report.md §十二 的运维前置）。
 #
+# P5-T0b（裁决 b）：场景**非 fragile**，但 github.com/login 在本机 30s 超时（环境不可达 ≠
+# 产品失败）——它一旦进默认跑，real 全量跑的 exit 1 就永远由环境问题构成（污染发布验收
+# 信号）。所以标 `hitl-live`：既不在 `--tag acceptance` / `--tag smoke` 里，**也不在无 --tag 的
+# 默认全量跑里**（见 eval/run_eval.py 的 EXPLICIT_ONLY_TAGS）；只有显式 `--tag hitl-live` 才跑。
+# 可选改进（P5+，不在本次范围）：换一个可达的登录墙站点，或本地 fixture 登录页——那时可把它
+# 降回 acceptance/hitl 口径（环境可达性一解决，这条断言就能进常规门禁）。
+#
 # 断言为什么只有这两条（读 graph.py 的结论，T2 已用探针实测）：
 # - HITL 的 interrupt 发生在 **answer 之前** → final_answer / stop_reason 都还是空
 #   （stop_reason 默认 ""，**不是** partial）。所以不断言 stop_reason/final_answer ——
@@ -16,7 +23,7 @@ id: hitl_login_detect
 name: 登录墙触发 HITL（需真浏览器 + headful；T7 验证）
 prompt: "用浏览器去 github.com/login 这个登录页看看能不能直接进去"
 tier: tier3
-tags: [hitl, browser]
+tags: [hitl, browser, hitl-live]
 mode: real
 checks:
   - type: needs_human

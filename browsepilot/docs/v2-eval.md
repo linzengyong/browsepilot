@@ -84,6 +84,7 @@ tag（§4.3）决定场景在哪个面里是"必过"，`--tag` 取任一匹配�
 - `mode` 不匹配本次运行 → `[SKIP]`，不计 pass/fail、不进 exit code —— "跑不了"（mock 没有浏览器）不是"跑失败了"，环境不匹配不能污染成功率；
 - `enabled: false` → `[DISABLED]`（列出但不跑）：P3 遗留的交互链用这个口子声明；
 - `--tag` 选不中任何可运行场景 → **exit 1**（空跑全绿与"跑过且全绿"在日志上无法区分）；
+- 显式专用 tag（`hitl-live`）**只在** `--tag hitl-live` 下被选中：不在门禁 tag 里，无 `--tag` 的默认全量跑也跳过它（打印跳过原因）—— 环境依赖的场景（站点不可达 → 必然 FAIL 且非 fragile）不得让全量 real 跑的 exit 1 由环境构成（P5-T0b 裁决 b；口径见 §4.3，事实见 §8.2）；
 - exit code = **任一非 fragile 失败 → 1，否则 0**；场景抛异常计为失败且**不中断**后续场景（`run_all` 逐场景捕获，打 `[FAIL] … EXCEPTION …` 继续跑）。
 
 ### 3.4 fail-loud：缺数据 → FAIL，不是 0
@@ -147,10 +148,13 @@ P1 的结论是**单轮**读数（"p0-weather 评测 PASS（查天气 100% 可�
 | tag | 语义（`eval/scenarios.py`） | 当前场景（16 文件口径） |
 |-----|------------------------------|--------------------------|
 | `smoke` | CI 必跑的确定性核心（mock 下可复现、不依赖外部内容漂移） | `t1_weather_beijing` / `t1_weather_shanghai` / `t1_weather_not_found` / `t2_read_page` / `t2_read_page_failure` / `t2_search_structural`（+ 归档的 `p0-weather`）—— 与 §7.6 冒烟运行 `passed=6` 一致 |
-| `acceptance` | 阶段验收全量（**缺省值**：不写 tags 就是这条） | 除 `degrade_browser_unavailable` 外的全部运行中场景 |
+| `acceptance` | 阶段验收全量（**缺省值**：不写 tags 就是这条） | 除 `degrade_browser_unavailable` / `hitl_login_detect` 外的全部运行中场景 |
 | `browser` | 需要真浏览器 | `t3_browser_open` / `t3_browser_snapshot` / `t3_browser_interaction` / `hitl_login_detect` |
 | `hitl` | 需要真浏览器 + 人工介入（headful，`BP_BROWSER_HEADLESS=false`） | `hitl_login_detect` |
+| `hitl-live` | 真人在环 + **可达登录墙**（P5-T0b 裁决 b）：**只在显式 `--tag hitl-live` 时被选中** —— 不在任何门禁 tag 里，也不进无 `--tag` 的默认全量跑（`run_eval.EXPLICIT_ONLY_TAGS`），跳过时打印原因 | `hitl_login_detect` |
 | `degrade` | 降级行为（工具不可用时的诚实失败） | `degrade_browser_unavailable`（`mode: mock`："没有浏览器"只能在 mock 里稳定构造） |
+
+> **`hitl-live` 为什么要单独一格**（P5-T0b，详见 §8.2）：`hitl_login_detect` **非 fragile**，但它依赖"可达的登录墙站点"——本机到 github.com/login 的 `goto` 30s 超时 → 在可预见的将来**必然 FAIL**。若它留在默认跑里，无 `--tag` 的 real 全量跑**永远** exit 1，而这个 1 由**环境**构成（不是产品缺陷）——发布验收信号里混进与产品无关的噪声。隔离后：`--tag acceptance` / `--tag smoke` 不含它（本来就不含）；无 `--tag` 的默认全量跑也跳过它（**打印原因**，不静默少跑一条）；要跑就显式 `--tag hitl-live`（=声明"这次站点可达 / 我接受它失败"）。换可达站点或本地 fixture 页后可以把它降回 `hitl`/`acceptance` 口径（P5+ 可选改进）。
 
 ### 4.4 校验与编写规则（fail-loud）
 
@@ -211,7 +215,7 @@ checks:
 | id | tier | mode | tags | 状态 | fragile | 断言类型 |
 |----|------|------|------|------|---------|----------|
 | `degrade_browser_unavailable` | tier3 | mock | degrade | 运行中 | — | `tier_is` / `tools_called` / `contains_keyword` / `not_contains` |
-| `hitl_login_detect` | tier3 | real | hitl, browser | 运行中 | — | `needs_human` / `tools_called` |
+| `hitl_login_detect` | tier3 | real | hitl, browser, hitl-live | 运行中 | — | `needs_human` / `tools_called` |
 | `multi_turn_context` | tier1 | real | acceptance | 运行中 | — | `contains_keyword` |
 | `p0-read-page` | tier2 | both | acceptance | 归档 | — | `contains_keyword` |
 | `p0-search` | tier1 | both | acceptance | 归档 | ✓ | `contains_keyword` |
@@ -308,6 +312,8 @@ Install（uv sync --all-extras --frozen）→ Lint → Types → Tests → Eval 
 - **跑**：mock 模式（`uv run python -m eval.run_eval --mock`）—— 只依赖 fake deps，无网络可复现。
 - **不跑**：真实模式。CI 无网络、无模型 key、无浏览器；且真实结果受 ddgs 结果漂移影响会 flaky，把 flaky 接进必过门禁等于把门禁变成噪声源（P4-D8）。真实模式为手动/验收运行（可选定时任务），**绝不进 CI**。
 
+> **CI 说明**：这套 workflow 至今**没有一次**真实的 Actions 运行记录（本地分支不推送）—— 引用 CI 时必须如实标注，见 §6.5。
+
 ### 6.3 真实模式运行前提
 
 与 §1 的环境表同源；这里是跑 acceptance 的最小前提：
@@ -317,7 +323,7 @@ Install（uv sync --all-extras --frozen）→ Lint → Types → Tests → Eval 
 | 模型 | `BP_DEFAULT_MODEL=deepseek/deepseek-chat` | 思考模型（deepseek-flash / v4-pro）拒绝 forced tool_choice → structured 调用报错；显式钉住非思考模型 |
 | 模型 key | `BP_MODEL_API_KEY` | 仅进程内环境变量（不入库）；留空时回退 LiteLLM 的 provider 环境变量 |
 | 浏览器（tier3） | `BP_BROWSER_CHANNEL=msedge`，或 `uv run playwright install chromium` | 本机 Playwright 需 chromium rev 1217、缓存为 1208 → 默认启动失败；池起不来时报告环境行写 `unavailable (start failed)`，tier3 的失败**在报告里**归因到环境而非任务 |
-| HITL 场景 | `BP_BROWSER_HEADLESS=false` | 人工介入需要可见窗口 |
+| HITL 场景 | `BP_BROWSER_HEADLESS=false` | 人工介入需要可见窗口；且该场景（`hitl_login_detect`）**只在显式 `--tag hitl-live` 时**才会被选中（需可达登录墙站点，见 §4.3 / §6.5） |
 
 ### 6.4 真实模式 / 3 轮 acceptance（P4-D7）
 
@@ -332,6 +338,22 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 - `--md data/eval-reports/`（可再加 `--json data/eval-reports/`）：路径是目录 → 写 `<时间戳>.md`；目录会自动创建。`data/` 在 gitignore，报告不进 git —— 摘要与结论入 `docs/`。
 - exit code：任一**非 fragile** 失败即 1；fragile 场景失败只计数（P4-D6：ddgs 内容漂移不是回归）。
 - 单场景排查：`--tag smoke` 只跑确定性核心；先在 `--mock` 下复现（无需任何前提），再上真实模式。
+- HITL 单场景（需真实可达的登录墙站点 + `BP_BROWSER_HEADLESS=false`）：`uv run python -m eval.run_eval --tag hitl-live` —— 它**不**在 `--tag acceptance` / `--tag smoke` / 无 tag 的默认全量跑里（§4.3）。
+
+### 6.5 CI 说明（P5-T0b）：workflow 已就绪，但**从未在 GitHub Actions 上实际执行过**
+
+- **事实**：`.github/workflows/ci.yml` 已写好（触发：push `master`/`v2.0` + PR；步骤 = Install →
+  Lint → Types → Tests → Eval (mock)，全部 `working-directory: browsepilot`），但本地分支**不推到远程**
+  （用户明确不推送）→ **没有任何一次 Actions 运行记录**。CI 口径目前只有"声明"，没有"执行证据"。
+- **本地等价验证**：`bash browsepilot/eval/gate.sh`（§6.1）逐条跑 CI 的四步，无网络 / 无 key / 无浏览器；
+  P5-T0b 当次（2026-09-11）全绿 **exit 0**：`pytest tests/ -q` = **868 passed**、`ruff check src/ eval/ tests/`
+  = clean、`mypy src/browsepilot/` = clean、`python -m eval.run_eval --mock` = `passed=8 skipped=4 disabled=4`（exit 0）。
+  语义与 CI **完全同口径**（同一个脚本、同一组命令、同一份 mock 场景集），差别只在"谁来跑"：CI 是
+  ubuntu-latest + `uv sync --all-extras --frozen`，本地是当前开发机（Python 3.14，依赖由 `uv.lock` 钉住）。
+- **发布报告必须如实标注**：引用 CI 时写"workflow 已就绪 + 本地 `gate.sh` 等价验证（exit 0）"，
+  **不得**写"CI 通过 / CI 绿"——那是一条没有执行证据的声明（诚实原则：未验证 ≠ 通过，与 §8.2 同一口径）。
+- **补口**：首次 `git push` 后的第一件事是核对一次真实的 Actions 运行结果，把结论（run id / 时间 / 结论）
+  补进本节；若 Actions 上出现与本机不一致的失败，以 Actions 为准修口径。
 
 ## 7. 量化结果（T7/T8 完成）
 
@@ -431,6 +453,8 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 
 冒烟先行的理由：把"凭据/网络/浏览器池是否可用"和"3 轮验收"分开——冒烟 6/6 PASS 之后才开 3 轮，否则 45 分钟里的失败会混进环境噪声。四份原始日志都在 `data/eval-reports/`（含 3 轮的 `p4-t7-run.log`）。
 
+> **P5-T0b 口径变更（2026-09-11）**：上表"全量一轮"的 `executed=11` 是**当时**的默认跑口径（无 tag 选全部 mode 匹配的场景，含 `hitl_login_detect`）。此后该场景标 `hitl-live` → 无 tag 的默认全量跑**不再选它**（改为打印跳过原因），同一命令现在是 `executed=10`，exit code 不再由这条**环境不可达**的失败决定（口径见 §4.3 / §6.4）。历史数字保持原样（它是当时的真实读数），引用时按本注读。
+
 ### 7.7 数据可信度限制（读这节数字前先读这里）
 
 - **token 是 chat-only 下限**：`usage_source=chat_only`——`structured`/`stream` 调用没有 usage 面，不进总和。3 轮样本池里 **30/63 次模型调用有计量（47.6%）**，所以 10191 是**下限**而不是"总消耗"（报告里就是这个口径，每场景还带 `measured_calls/model_calls`）。
@@ -457,6 +481,8 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 - 直接原因：本机到 `github.com/login` 的 `Page.goto` **30s 超时**（headless/headful 同因）→ 页面从未加载 → 登录墙检测（需采样可见文本/密码框）不可能触发；场景注释假设的"国内可达"在本机不成立（§7.5 A2 的探针原文）。
 - 结论：`needs_human` 链路 = **未验证**（既不是通过，也不是已确认缺陷）。要闭环需要**可达的登录墙站点**（P5 建议：换站点或本地 fixture 登录页）。
 - 读数影响：全量 1 轮的 exit=1 就是由这一条非 fragile 失败构成的（§7.6）；它的计数在"产品失败"里，但归因是**环境**，报告环境行/探针原文已把这条链路分开列。
+- **P5-T0b 处置（裁决 b，2026-09-11）**：新增 tag `hitl-live` 并把它从**默认全量跑**里摘出去（`run_eval.EXPLICIT_ONLY_TAGS`：无 `--tag` 不选它、跳过时打印原因；要跑就 `--tag hitl-live`）。无 tag 的 real 全量跑从此不再被这条环境失败污染 exit code，而 `--tag acceptance` 本来就不含它（§4.3 / §6.4）。**没有**改断言、**没有**标 `fragile`（fragile 的口径是"外部内容漂移"，这里是"环境不可达"，两回事）、也**没有**删场景（链路仍是"未验证"，不是"已通过"）。
+- **仍缺的证据**：`needs_human` 链路的端到端验证 —— 需要一个可达的登录墙站点（或本地 fixture 登录页；注意 `NavigationPolicy` 白名单，`file://` 会被拦，fixture 得挂在允许的 host 上）。做到后可把它降回 `hitl`/`acceptance` 口径（P5+ 可选改进）。
 
 ### 8.3 fragile 只解决"不误报回归"，不解决"可复现"
 
@@ -492,7 +518,7 @@ BP_DEFAULT_MODEL=deepseek/deepseek-chat BP_MODEL_API_KEY=... \
 
 | 项 | 状态 | 证据 |
 |----|------|------|
-| HITL `needs_human` 链路 | **未验证**（站点不可达） | §7.5 A2；§8.2 |
+| HITL `needs_human` 链路 | **未验证**（站点不可达；P5-T0b 已移入 `hitl-live`，默认跑不再选它） | §7.5 A2；§8.2 |
 | `cost_usd` / 成本统计 | **未采集**（价格表超时） | §7.7；§8.1 |
 | 多轮"全败路径不注入 history" | **未验证**（未触发） | §7.5 B；§8.5 |
 | tier3 交互链（type/click） | **未接入**（`enabled: false`） | §8.4；`graph.py` 的 `_STRATEGY_CHAIN` |

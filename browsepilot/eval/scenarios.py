@@ -16,7 +16,8 @@ Schema v2（P4-T2）把场景从"prompt + checks"扩成**声明式评测单元**
 - ``enabled=False``：声明了但暂不跑的场景（P3 遗留的交互链、未接线的多轮 harness）。
 - ``follow_up``：多轮场景第 2..n 轮的 prompt（harness 接线见 T3/P4-T3：逐轮 ``run_task`` +
   history 摘要，**checks 评估最后一轮的 outcome**）。
-- ``tags``：P4-D2 的 ``KNOWN_TAGS``；缺省 = ``acceptance``。
+- ``tags``：P4-D2 的 ``KNOWN_TAGS``；缺省 = ``acceptance``。其中 ``hitl-live`` 是**显式点名
+  才跑**的 tag（无 ``--tag`` 的默认全量跑不选它，见 ``run_eval.EXPLICIT_ONLY_TAGS``）。
 
 校验原则是 **fail-loud**：未知 tag / 未知 mode / 未知字段 / 空 checks / 空 prompt /
 重复 id 都是**加载错误**——一次笔误不该静默变成"少跑一条场景"或"少断言一条"
@@ -31,13 +32,16 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
-KNOWN_TAGS: tuple[str, ...] = ("smoke", "acceptance", "browser", "hitl", "degrade")
-"""P4-D2 的 tag 集合。
+KNOWN_TAGS: tuple[str, ...] = ("smoke", "acceptance", "browser", "hitl", "hitl-live", "degrade")
+"""P4-D2 的 tag 集合（P5-T0b 加 ``hitl-live``）。
 
 - ``smoke``：CI 必跑的确定性核心（mock 下可复现、不依赖外部内容漂移）
 - ``acceptance``：阶段验收全量（缺省值）
 - ``browser``：需要真浏览器
 - ``hitl``：需要真浏览器 + 人工介入（headful）
+- ``hitl-live``：真人在环 + **可达登录墙**（P5-T0b 裁决 b）：环境依赖，不进任何门禁 tag，也
+  不进无 ``--tag`` 的默认全量跑（见 ``run_eval.EXPLICIT_ONLY_TAGS``）——只有显式
+  ``--tag hitl-live`` 才跑（声明"这次站点可达"）
 - ``degrade``：降级行为（工具不可用时的诚实失败）
 """
 

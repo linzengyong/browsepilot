@@ -16,6 +16,10 @@ Modes:
 - ``--tag`` 按 tag 过滤（T7 的 ``--tag acceptance``）；未知 tag 由 argparse 直接拒绝；
   选到 **0 条可运行场景**时非零退出 —— 空跑全绿与"跑过且全绿"在日志上无法区分，
   静默通过等于假通过（与 C1 同一条原则）。
+- **只有显式点名才跑的 tag**（``EXPLICIT_ONLY_TAGS``，P5-T0b 裁决 b）：带这类 tag 的场景
+  **不进无 ``--tag`` 的默认全量跑**（会以 ``[SKIP]`` + 原因列出），必须 ``--tag <那个 tag>`` ——
+  用于"环境依赖、本环境必然失败"的场景（实例：``hitl-live`` 需要可达登录墙，本机
+  github.com/login 30s 超时 → 非 fragile 失败会让 real 全量跑的 exit 1 永远由环境构成）。
 
 场景的**执行/观测**整体在 :mod:`eval.harness`（P4-T3）：这里只做选择、打印与 exit code。
 具体地，``_run_scenario`` 把一条场景交给 ``harness.run_scenario`` —— 它负责多轮（``follow_up``）
@@ -76,6 +80,22 @@ from eval.report import Round, ScenarioResult
 from eval.scenarios import KNOWN_TAGS, Check, Scenario, load_scenarios
 
 SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
+
+EXPLICIT_ONLY_TAGS: frozenset[str] = frozenset({"hitl-live"})
+"""必须**显式** ``--tag`` 才会被选中的 tag（无 ``--tag`` 的默认全量跑跳过它们）。
+
+P5-T0b（裁决 b）：``hitl-live`` 场景（``hitl_login_detect``）非 fragile，但它依赖"可达的登录墙
+站点"——本环境到 github.com/login 的 ``goto`` 30s 超时 → **必然 FAIL**（P4 §7.5 A2 / §8.2）。
+不隔开的话，无 ``--tag`` 的 real 全量跑**永远** exit 1，而这个 1 由环境构成：发布验收信号里
+混进了与产品无关的噪声。隔离口径：
+
+- 门禁 tag（``acceptance`` / ``smoke``）本来就不含它；
+- 默认全量跑（无 ``--tag``）也跳过它，且**打印跳过原因**（不静默少跑一条）；
+- 显式 ``--tag hitl-live`` 仍然照跑 —— 显式点名 = 声明"这次站点可达 / 我接受它失败"。
+
+tag 词汇表在 :data:`eval.scenarios.KNOWN_TAGS`（加新 tag 要同时改两处，这是有意的：
+词汇表属 schema，选中语义属 runner）。
+"""
 
 
 def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
@@ -142,8 +162,13 @@ def select_scenarios(
 ) -> ScenarioSelection:
     """按运行 ``mode`` 与 ``tags`` 过滤场景；停用（``enabled=False``）单独列出。
 
-    判定次序：停用 → mode 不匹配 → tag 不匹配。取**最根本**的那条原因：停用是"声明了也暂不跑"，
-    比"这次模式不匹配"更值得报出来 —— 否则 mock 的日志里看不出 tier3 交互场景为什么没跑。
+    判定次序：停用 → mode 不匹配 → tag 不匹配 → **默认跑里的显式专用 tag**。取**最根本**的
+    那条原因：停用是"声明了也暂不跑"，比"这次模式不匹配"更值得报出来 —— 否则 mock 的日志里
+    看不出 tier3 交互场景为什么没跑。
+
+    ``EXPLICIT_ONLY_TAGS`` 只影响**无** ``--tag`` 的默认全量跑：带这些 tag 的场景跳过并给出
+    原因（不是静默少跑一条）。给了 ``--tag`` 就完全按用户点名跑 —— ``--tag hitl`` /
+    ``--tag browser`` 这些既有口径不变。
     """
     if mode not in ("mock", "real"):
         raise ValueError(f"mode must be 'mock' or 'real', got {mode!r}")
@@ -158,6 +183,14 @@ def select_scenarios(
             skipped.append((scenario, f"mode={scenario.mode}（本次运行 = {mode}）"))
         elif wanted and not wanted & set(scenario.tags):
             skipped.append((scenario, f"tags={scenario.tags} 不含 --tag {sorted(wanted)}"))
+        elif not wanted and EXPLICIT_ONLY_TAGS & set(scenario.tags):
+            needed = sorted(EXPLICIT_ONLY_TAGS & set(scenario.tags))
+            skipped.append(
+                (
+                    scenario,
+                    f"tags={scenario.tags} 需显式 --tag {' 或 '.join(needed)}（不进默认全量跑）",
+                )
+            )
         else:
             runnable.append(scenario)
     return ScenarioSelection(runnable=runnable, skipped=skipped, disabled=disabled)

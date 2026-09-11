@@ -556,6 +556,50 @@ def test_select_scenarios_rejects_unknown_mode():
         run_eval.select_scenarios([_scenario(id="x")], mode="mokc")
 
 
+# ── P5-T0b（裁决 b）：`hitl-live` 是"可达站点依赖"的场景，必须显式点名才跑 ──
+#
+# 事实：hitl_login_detect 非 fragile，但本机到 github.com/login 的 goto 30s 超时 → **必然
+# FAIL**（P4 §7.5 A2 / §8.2）。它一旦进默认跑，real 全量跑的 exit 1 就永远由环境问题构成
+# —— 那等于把环境噪声写进产品的发布验收信号。
+
+
+def test_select_scenarios_keeps_explicit_only_tags_out_of_the_default_run():
+    """无 ``--tag`` 的全量默认跑不选 ``hitl-live``；显式 ``--tag hitl-live`` 才跑（机制层）。"""
+    from eval import run_eval
+
+    live = _scenario(id="live", tags=["hitl", "browser", "hitl-live"], mode="real")
+    plain = _scenario(id="plain", mode="real")
+
+    default = run_eval.select_scenarios([live, plain], mode="real")
+    assert [s.id for s in default.runnable] == ["plain"]
+    assert [s.id for s, _ in default.skipped] == ["live"]
+    assert "hitl-live" in default.skipped[0][1]  # 跳过的原因里说清"要显式点名"
+
+    explicit = run_eval.select_scenarios([live, plain], mode="real", tags=["hitl-live"])
+    assert [s.id for s in explicit.runnable] == ["live"]
+
+
+def test_hitl_login_scenario_is_out_of_every_gate_selection():
+    """场景集口径（真实文件）：`hitl_login_detect` 不带 acceptance/smoke，默认全量也不选它。"""
+    from eval import run_eval
+
+    scenarios = es.load_scenarios(SCENARIOS_DIR)
+    hitl = next(s for s in scenarios if s.id == "hitl_login_detect")
+    assert "hitl-live" in hitl.tags
+    assert not {"acceptance", "smoke"} & set(hitl.tags)
+
+    for tags in (["acceptance"], ["smoke"]):
+        selection = run_eval.select_scenarios(scenarios, mode="real", tags=tags)
+        assert "hitl_login_detect" not in {s.id for s in selection.runnable}, tags
+
+    default = run_eval.select_scenarios(scenarios, mode="real")  # 无 --tag = 默认全量
+    assert "hitl_login_detect" not in {s.id for s in default.runnable}
+    assert "hitl_login_detect" in {s.id for s, _ in default.skipped}
+
+    explicit = run_eval.select_scenarios(scenarios, mode="real", tags=["hitl-live"])
+    assert [s.id for s in explicit.runnable] == ["hitl_login_detect"]
+
+
 async def test_run_all_reports_skip_and_disabled_without_counting_them(
     tmp_path, monkeypatch, capsys
 ):
@@ -705,6 +749,7 @@ def test_scenario_set_declares_modes_tags_and_flags():
     for scenario_id in ("p0-weather", "t1_weather_beijing", "t2_search_structural"):
         assert by_id[scenario_id].mode == "both", scenario_id
     assert {"hitl", "browser"} <= set(by_id["hitl_login_detect"].tags)
+    assert "hitl-live" in by_id["hitl_login_detect"].tags  # P5-T0b：显式点名才跑（裁决 b）
     assert by_id["degrade_browser_unavailable"].tags == ["degrade"]
     assert "browser" in by_id["t3_browser_open"].tags
     assert by_id["t3_browser_interaction"].enabled is False  # P3 遗留：交互链未入图
