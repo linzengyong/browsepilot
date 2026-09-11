@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "browser-mcp": {
-      "type": "streamable-http",
-      "url": "http://localhost:9400/mcp"
-    }
-  }
-}

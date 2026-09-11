@@ -51,7 +51,7 @@ check_untyped_defs = true
 ignore_missing_imports = true
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/browsepilot", "browser_mcp", "backend", "frontend"]
+packages = ["src/browsepilot"]
 
 [[tool.uv.index]]
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
