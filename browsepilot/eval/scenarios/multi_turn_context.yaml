@@ -1,11 +1,12 @@
-# ⚠️ enabled: false —— schema 已支持多轮（follow_up 字段），但 **harness 还没接线**。
+# ✅ enabled: true —— 多轮由 harness 接线（P4-T3）：prompt 跑第一轮，follow_up 逐轮跑，
+# 第 n 轮带上前几轮的 "Q: … / A: …" 历史摘要（与 app.main._build_history_entries 同格式），
+# checks 评估**最后一轮**的 outcome。mode: real —— 见下方"为什么 real-only"。
 #
-# 为什么先停用而不是"跑首轮"：只跑 prompt 首轮、却按"多轮上下文"的口径断言 = 假通过
-# （首轮的答案天然含"北京"）。断言的价值在于它真的能证明所声明的东西。
-#
-# 接线要做两件事（T3/T5）：
-# 1) 用 run_task(history=[...]) 跑 follow_up 的每一轮（history = 前几轮的 "Q: … / A: …" 摘要）
-# 2) checks 评估**最后一轮**的 outcome（而不是首轮）
+# 接线做了三件事：
+# 1) run_task(history=[...]) 跑 follow_up 的每一轮（history = 前几轮的 "Q: … / A: …" 摘要）
+# 2) checks 评估**最后一轮**的 outcome（而不是首轮：首轮答案天然含"北京"，拿它断言等于假通过）
+# 3) 注入 tool_calls/token_usage/duration_ms；tool_calls 是**整场景**（各轮累加）的口径
+#    （多轮场景的工具链要看全；token/duration 同理是整场景成本）
 #
 # 为什么只有"答案含北京"这一条断言（T2 读 graph.py + router.py 的结论）：
 # - "那明天呢？" 不含"北京"，所以最终答案里出现"北京" = 历史注入到了 answer 节点（这就是
@@ -13,15 +14,23 @@
 # - **不**断言 tools_called：classify 与 execute 的参数提取都只看 task 原文（不看 history），
 #   第二轮流到哪个工具/能不能提出城市是不确定的 —— 那是另一个架构缺口（T7 需实测记录），
 #   不该写成一条必然抖动的断言。
+# - 已知缺口（如实记录，不拿它当断言）：result_data 带 error（策略链全败）时 answer 走的是
+#   "抱歉，这个任务暂时无法完成"模板，那条路径**不注入 history**。第二轮若落到那里，本场景
+#   会如实 FAIL —— 那是真实的架构缺口信号，不是把断言放宽的理由（T7 收集真实数据时归因）。
+#
+# 为什么 real-only：mock 的 FakeProvider/FakeExecutor 只是任务感知的替身，没有真实分类能力，
+# "那明天呢？" 在规则层无法分类（不含"怎么样/天气"等词）→ 落到 fake 的 intent=search →
+# search 无结果 → all_strategies_failed（不含历史的道歉文案）。mock 下这条场景是"跑不了"
+# 而不是"跑失败了"（与 tier3 场景同一条口径），所以 SKIP、不计入 pass/fail。
 id: multi_turn_context
-name: 多轮上下文（先天气后追问；harness 接线前停用）
+name: 多轮上下文（先天气后追问"那明天呢"；harness 已接线）
 prompt: "北京今天天气怎么样？"
 follow_up:
   - "那明天呢？"
 tier: tier1
 tags: [acceptance]
 mode: real
-enabled: false
+enabled: true
 checks:
   - type: contains_keyword
     keywords: ["北京"]  # 第二轮 prompt 里没有"北京"：最终答案出现即证明历史注入生效

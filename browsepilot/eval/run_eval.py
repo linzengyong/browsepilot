@@ -16,23 +16,26 @@ Modes:
   选到 **0 条可运行场景**时非零退出 —— 空跑全绿与"跑过且全绿"在日志上无法区分，
   静默通过等于假通过（与 C1 同一条原则）。
 
-工具名注入（P4-T1 ``checks.py`` 的约定）：v2 的 ``AgentState`` 不写 ``execution_log``，所以这里在
-executor 外面套一层 :class:`_ToolCallRecorder`，把"图确实调过哪些工具"（含失败调用）注入
-``outcome["tool_calls"]``——否则 mock 下所有 ``tools_called`` 断言都是假失败。T3 的 harness 在这条
-注入链上继续加用量/耗时采集（``token_usage`` / ``duration_ms``）。
+场景的**执行/观测**整体在 :mod:`eval.harness`（P4-T3）：这里只做选择、打印与 exit code。
+具体地，``_run_scenario`` 把一条场景交给 ``harness.run_scenario`` —— 它负责多轮（``follow_up``）
+与三个注入字段：``outcome["tool_calls"]``（v2 的 ``AgentState`` 不写 ``execution_log``，所以
+"图确实调过哪些工具"由 harness 从 ``call()`` 记录；否则 mock 下所有 ``tools_called`` 断言都是假失败）、
+``outcome["token_usage"]``（从 ``ChatResult.usage`` 累加，拿不到就字段缺席）、
+``outcome["duration_ms"]``（整场景墙钟）。字段名/来源见 ``eval/harness.py`` 的模块 docstring。
 
 真实模式（P4 评测体系的前置接线，运维前置见 docs/v2-p3-report.md §十二「P4 评测前置（运维）」）：
 
 - **注入浏览器池**：``AppToolExecutor`` 拿不到池时 6 个 Tier3 工具统一返回
   ``browser_unavailable`` —— tier3 场景会**全部**失败，而那是接线问题不是任务失败
   （P3 final review 给 P4 的关键输入）。所以 real 模式走同一个组合根：Settings →
-  BrowserPool + AppToolExecutor（策略也从同一个 Settings 显式构造，I3）。
+  BrowserPool + AppToolExecutor（策略也从同一个 Settings 显式构造，I3），装配在
+  ``harness.build_real_deps``；``_real_stack`` 只是保留给测试的薄壳（monkeypatch seam）。
   池起不来（本机没装 chromium rev / channel 写错）时打 WARNING 继续评测 Tier1/2：
   宁可让 tier3 的失败在报告里**可见地**归因到环境，也不要静默产出误导性的成功率。
-- **逐场景隔离**（C2③）：每个场景跑完 ``executor.aclose()`` 把当前页还给池。不隔离的话
-  下一个场景的 ``browser_snapshot`` 可能拍到上一个场景留下的页面，报 completed 却答非所问
-  （C2b：未与任务目标匹配的快照不得算完成）。
-- 池的生命周期跨场景（``_run_real`` 的 start/close），**页面**的生命周期逐场景；
+- **逐场景隔离**（C2③）：每个场景跑完 ``executor.aclose()`` 把当前页还给池（``teardown``）。
+  不隔离的话下一个场景的 ``browser_snapshot`` 可能拍到上一个场景留下的页面，报 completed
+  却答非所问（C2b：未与任务目标匹配的快照不得算完成）。
+- 池的生命周期跨场景（``harness.pool_lifecycle`` 的 start/close），**页面**的生命周期逐场景；
   因此 ``run_all`` 本身是 async（一个事件循环跑完全部场景）。
 
 ``finally`` 里跑 teardown：场景自己炸了（模型/服务异常）也要归还页面，否则脏页留给下一个场景。
@@ -44,11 +47,9 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from browsepilot.agent.api import run_task
-from browsepilot.agent.tools import ToolExecutor, ToolResult, ToolSpec
 from browsepilot.agent.tracer import JsonlTracer, Tracer
+from eval import harness
 from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
 from eval.scenarios import KNOWN_TAGS, Check, Scenario, load_scenarios
@@ -67,42 +68,19 @@ def check_outcome(outcome: dict, check: Check) -> tuple[bool, str]:
     return result.passed, result.detail
 
 
-class _ToolCallRecorder:
-    """包装 executor，记录 ``call()`` 的**全部**工具名（含失败调用）。
-
-    ``outcome["tool_calls"]`` 的唯一数据源：v2 的 ``AgentState`` 不写 ``execution_log``
-    （见 ``eval/checks.py`` 的 ``_tool_names`` 说明），所以"图确实把任务交给了哪个工具"由 harness
-    注入。失败调用同样记录——降级链走到哪一步、哪一步失败了，靠的就是这串工具名；无调用 →
-    空列表，``tools_called`` 断言据此 FAIL（没数据不算通过）。
-    """
-
-    def __init__(self, executor: ToolExecutor) -> None:
-        self._executor = executor
-        self.calls: list[str] = []
-
-    async def list_tools(self) -> list[ToolSpec]:
-        return await self._executor.list_tools()
-
-    async def call(self, name: str, arguments: dict[str, Any]) -> ToolResult:
-        self.calls.append(name)
-        return await self._executor.call(name, arguments)
-
-
 async def _run_scenario(
     scenario: Scenario, *, provider, executor, tracer, teardown=None
 ) -> tuple[dict, list[tuple[bool, str]]]:
     """跑一个场景并评估 checks；``teardown``（real 模式 = ``executor.aclose``）在 finally 里跑。
 
-    executor 外面套 :class:`_ToolCallRecorder`：工具名必须以 ``outcome["tool_calls"]`` 的形式
-    进 outcome（``tools_called`` 断言的数据源）。teardown 拿到的仍是**原** executor —— 归还页面
-    是它的职责，跟记录无关。
+    执行交给 :func:`eval.harness.run_scenario`（多轮 + ``tool_calls`` / ``token_usage`` /
+    ``duration_ms`` 三个注入字段），这里只评估 checks 与归还页面。teardown 拿到的仍是**原**
+    executor —— 归还页面是它的职责，跟记录无关。
     """
-    recorder = _ToolCallRecorder(executor)
     try:
-        outcome = await run_task(
-            scenario.prompt, provider=provider, executor=recorder, tracer=tracer
+        outcome = await harness.run_scenario(
+            scenario, provider=provider, executor=executor, tracer=tracer
         )
-        outcome["tool_calls"] = list(recorder.calls)
         checks = [check_outcome(outcome, c) for c in scenario.checks]
     finally:
         if teardown is not None:
@@ -206,57 +184,26 @@ async def run_all(
 
 
 def _real_stack():
-    """真实模式的组合根：Settings → 模型 + Tier1/2 服务 + 浏览器池 + executor + 策略。
+    """真实模式的组合根（薄壳）：Settings → ``harness.build_real_deps``。
 
-    导入刻意留在函数里：``--mock``（CI）不该拉起 litellm / playwright / ddgs 的依赖链。
-    池配置与 app（``app.main._default_app``）同源：headless / max_pages / channel（空串 → None）。
+    保留这个函数的理由是**测试 seam**：既有测试 monkeypatch 它注入 fake pool/executor
+    （真浏览器不进 pytest）。导入与装配都在 harness 里（``--mock`` 不该拉起
+    litellm / playwright / ddgs 的依赖链）。
     """
-    from browsepilot.app.browser.browser_pool import BrowserPool
-    from browsepilot.app.browser.policy import NavigationPolicy
     from browsepilot.app.config import Settings
-    from browsepilot.app.executor import AppToolExecutor
-    from browsepilot.app.services.fetch import PageFetchService
-    from browsepilot.app.services.search import SearchService
-    from browsepilot.app.services.weather import WeatherService
-    from browsepilot.model.litellm_provider import LiteLLMProvider
 
-    settings = Settings()
-    provider = LiteLLMProvider(
-        settings.default_model,
-        api_key=settings.model_api_key or None,
-        base_url=settings.model_base_url or None,
-    )
-    pool = BrowserPool(
-        headless=settings.browser_headless,
-        max_pages=settings.browser_max_pages,
-        channel=settings.browser_channel or None,
-    )
-    executor = AppToolExecutor(
-        WeatherService(),
-        SearchService(),
-        PageFetchService(),
-        browser=pool,
-        # I3：池与策略都从这**同一个** Settings 构造（不显式传的话 executor 自己再读一次
-        # 环境，把显式配置静默覆盖掉）。
-        policy=NavigationPolicy(settings.navigation_policy, settings.allowed_domains),
-    )
-    return provider, executor, pool
+    deps = harness.build_real_deps(Settings())
+    return deps.provider, deps.executor, deps.pool
 
 
 async def _run_real(tracer: Tracer, tags: list[str] | None = None) -> int:
-    """真实模式：起池 → 逐场景隔离评测 → 关池；池起不来就诚实降级（打警告，不静默）。"""
+    """真实模式：起池 → 逐场景隔离评测 → 关池；池起不来就诚实降级（打警告，不静默）。
+
+    池的生命周期在 :func:`eval.harness.pool_lifecycle` 里（含降级与异常安全）；``teardown``
+    是逐场景的页面归还点（C2③）。
+    """
     provider, executor, pool = _real_stack()
-    started = False
-    try:
-        await pool.start()
-        started = True
-    except Exception as exc:
-        print(
-            f"[eval] WARNING: BrowserPool.start() failed ({exc}); "
-            "Tier3 工具一律 browser_unavailable —— 这些 tier3 失败是环境问题，不是任务失败"
-        )
-        executor.attach_browser(None)  # 不变式：executor 手里的要么是已启动的池，要么是 None
-    try:
+    async with harness.pool_lifecycle(pool, executor):
         return await run_all(
             provider=provider,
             executor=executor,
@@ -265,9 +212,6 @@ async def _run_real(tracer: Tracer, tags: list[str] | None = None) -> int:
             mode="real",
             tags=tags,
         )
-    finally:
-        if started:
-            await pool.close()
 
 
 def main() -> int:

@@ -14,7 +14,8 @@ Schema v2（P4-T2）把场景从"prompt + checks"扩成**声明式评测单元**
 - ``fragile``：断言依赖外部动态内容（ddgs 结果漂移）。失败照实打 FAIL，但**不进 exit code**，
   报告里单独计数（P4-D6）。
 - ``enabled=False``：声明了但暂不跑的场景（P3 遗留的交互链、未接线的多轮 harness）。
-- ``follow_up``：多轮场景第 2..n 轮的 prompt（harness 接线在 T3/T5，本轮先落 schema）。
+- ``follow_up``：多轮场景第 2..n 轮的 prompt（harness 接线见 T3/P4-T3：逐轮 ``run_task`` +
+  history 摘要，**checks 评估最后一轮的 outcome**）。
 - ``tags``：P4-D2 的 ``KNOWN_TAGS``；缺省 = ``acceptance``。
 
 校验原则是 **fail-loud**：未知 tag / 未知 mode / 未知字段 / 空 checks / 空 prompt /
@@ -90,7 +91,7 @@ class Scenario(BaseModel):
     tags: list[str] = Field(default_factory=lambda: ["acceptance"])
     mode: ScenarioMode = "both"
     checks: list[Check] = Field(default_factory=list)
-    timeout_seconds: float = 120.0  # 由 harness 强制（T3）；schema 先声明
+    timeout_seconds: float = 120.0  # 由 harness 按**轮**强制（P4-T3）；schema 只声明
     fragile: bool = False  # 依赖外部动态内容的断言：失败不计入门禁 exit code
     enabled: bool = True  # False = 列出为 [DISABLED]、不跑
     follow_up: list[str] = Field(default_factory=list)  # 多轮场景第 2..n 轮 prompt
