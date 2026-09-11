@@ -24,3 +24,6 @@ jobs:
       - name: Tests
         working-directory: browsepilot
         run: uv run pytest tests/ -q
+      - name: Eval (mock)
+        working-directory: browsepilot
+        run: uv run python -m eval.run_eval --mock
