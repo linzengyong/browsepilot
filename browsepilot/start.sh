@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# BrowsePilot — 一键启动所有服务 (MCP Pool + Backend + Frontend)
+# BrowsePilot — 一键启动所有服务 (Backend + Frontend)
 # Usage: bash start.sh
 
 set -e
@@ -18,8 +18,8 @@ fi
 cleanup() {
     echo ""
     echo "正在停止所有服务..."
-    kill $MCP_PID $BACKEND_PID $FRONTEND_PID 2>/dev/null
-    wait $MCP_PID $BACKEND_PID $FRONTEND_PID 2>/dev/null
+    kill $BACKEND_PID $FRONTEND_PID 2>/dev/null
+    wait $BACKEND_PID $FRONTEND_PID 2>/dev/null
     echo "所有服务已停止"
 }
 trap cleanup EXIT INT TERM
@@ -28,23 +28,16 @@ echo "=========================================="
 echo "  BrowsePilot — 启动所有服务"
 echo "=========================================="
 
-# ---- MCP Pool (Playwright MCP on port 9400) ----
-echo "[1/3] 启动 MCP Pool (Playwright MCP)..."
-python -m browser_mcp.main &
-MCP_PID=$!
-sleep 3
-echo "  MCP Pool PID: $MCP_PID"
-
-# ---- Backend (Port 8000) ----
-echo "[2/3] 启动 Backend (port 8000)..."
-uvicorn backend.app.main:app --host 127.0.0.1 --port 8000 &
+# ---- Backend (Port 8001) ----
+echo "[1/2] 启动 Backend (port 8001)..."
+uv run uvicorn browsepilot.app.main:app --host 127.0.0.1 --port 8001 &
 BACKEND_PID=$!
 sleep 2
 echo "  Backend PID: $BACKEND_PID"
 
 # ---- Vue3 Frontend (Port 5173) ----
-echo "[3/3] 启动 Frontend (port 5173)..."
-cd frontend-vue && npm run dev &
+echo "[2/2] 启动 Frontend (port 5173)..."
+(cd frontend-vue && npm run dev) &
 FRONTEND_PID=$!
 sleep 3
 echo "  Frontend PID: $FRONTEND_PID"
@@ -52,9 +45,8 @@ echo "  Frontend PID: $FRONTEND_PID"
 echo ""
 echo "=========================================="
 echo "  所有服务已启动"
-echo "  Backend:  http://localhost:8000"
+echo "  Backend:  http://localhost:8001"
 echo "  Frontend: http://localhost:5173"
-echo "  (MCP pool on port 9400, no HTTP UI)"
 echo "=========================================="
 echo ""
 echo "按 Ctrl+C 停止所有服务"

@@ -1,0 +1,10 @@
+# Keep the build context small — local venvs, caches and build artifacts are never
+# needed inside the image (the runtime image gets .venv from the builder stage).
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+frontend-vue/node_modules/
+frontend-vue/dist/
+frontend-vue/.vite/
