@@ -39,6 +39,16 @@ Modes:
   因此 ``run_all`` 本身是 async（一个事件循环跑完全部场景）。
 
 ``finally`` 里跑 teardown：场景自己炸了（模型/服务异常）也要归还页面，否则脏页留给下一个场景。
+
+报告（P4-D3/D4，实现在 :mod:`eval.report`）：
+
+- ``--json <path>`` / ``--md <path>``：跑完把**整份**报告写出来（缺省不写，一次跑只产出日志）。
+  路径带后缀 = 文件；结尾分隔符 / 已存在目录 / 无后缀 = 目录，写入 ``<目录>/<时间戳>.json|.md``
+  （P4-D4 的 ``data/eval-reports/<timestamp>.json`` 与 P4-D7 的 ``--md data/eval-reports/`` 形状）。
+- ``--repeat N``（P4-D7）：同一场景集重复 N 轮，报告含**每轮**结果 + 跨轮方差
+  （成功率/延迟 min-max + stdev）与 flaky 标注。exit code 语义不变：**任何**一轮出现非 fragile
+  失败就 gate（0/1 之外不新增码）。
+- 空跑（``--tag`` 选不中任何可运行场景）不写报告：`run_all` 已经非零退出，没有数据可报。
 """
 
 from __future__ import annotations
@@ -49,9 +59,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from browsepilot.agent.tracer import JsonlTracer, Tracer
-from eval import harness
+from eval import harness, report
 from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
+from eval.report import Round, ScenarioResult
 from eval.scenarios import KNOWN_TAGS, Check, Scenario, load_scenarios
 
 SCENARIOS_DIR = Path(__file__).resolve().parent / "scenarios"
@@ -131,11 +142,16 @@ async def run_all(
     teardown=None,
     mode: str = "mock",
     tags: list[str] | None = None,
+    results: list[ScenarioResult] | None = None,
 ) -> int:
     """顺序跑选中的场景并打印逐场景结果；``teardown`` 在每个**跑过的**场景之后跑。
 
     跳过/停用的场景不跑也不 teardown（没取过页面就没有页面要还）。exit code 只由
     **非 fragile 的失败**决定（D6/D8：环境不匹配与内容漂移不该让门禁变红）。
+
+    ``results`` 是给报告层用的**收集器**：传了列表就按加载顺序追加每条场景的结果行
+    （PASS/FAIL/SKIP/DISABLED 四种都记 —— 报告要能解释"为什么这条没跑"），返回码形状不变
+    （既有调用方与测试都读 int）。
     """
     scenarios = load_scenarios(SCENARIOS_DIR)
     selection = select_scenarios(scenarios, mode=mode, tags=tags)
@@ -154,18 +170,44 @@ async def run_all(
     disabled_ids = {scenario.id for scenario in selection.disabled}
     passed = failed = fragile_failed = 0
     for scenario in scenarios:
+        common = {
+            "id": scenario.id,
+            "tier": scenario.tier,
+            "tags": tuple(scenario.tags),
+            "mode": mode,
+            "fragile": scenario.fragile,
+        }
         if scenario.id in disabled_ids:
             print(f"  [DISABLED] {scenario.id} ({scenario.name})")
+            if results is not None:
+                results.append(ScenarioResult(**common, disabled=True))
             continue
         reason = skip_reasons.get(scenario.id)
         if reason is not None:
             print(f"  [SKIP] {scenario.id}: {reason}")
+            if results is not None:
+                results.append(ScenarioResult(**common, skipped=True, skip_reason=reason))
             continue
-        _, checks = await _run_scenario(
+        outcome, checks = await _run_scenario(
             scenario, provider=provider, executor=executor, tracer=tracer, teardown=teardown
         )
         ok = all(result for result, _ in checks)
         detail = "; ".join(text for _, text in checks)
+        # 报告侧的失败明细只留**失败**的那几条（通过项不是"根因"）；采集不到的数字保持缺席（不填 0）。
+        failures = "; ".join(text for passed_check, text in checks if not passed_check) or None
+        usage = outcome.get("token_usage") or {}
+        if results is not None:
+            results.append(
+                ScenarioResult(
+                    **common,
+                    passed=ok,
+                    duration_ms=outcome.get("duration_ms"),
+                    tokens=usage.get("total_tokens"),
+                    cost_usd=usage.get("cost_usd"),
+                    stop_reason=outcome.get("stop_reason"),
+                    failure_detail=failures,
+                )
+            )
         if ok:
             passed += 1
             print(f"  [PASS] {scenario.id}: {detail}")
@@ -183,6 +225,91 @@ async def run_all(
     return 1 if failed else 0
 
 
+def _write_reports(
+    rounds: list[Round],
+    *,
+    mode: str,
+    model: str | None,
+    tags: list[str] | None,
+    json_path: str | None,
+    md_path: str | None,
+) -> None:
+    """把若干轮的结果落成 JSON/Markdown 报告（同一时间戳 → 两个文件名成对）。
+
+    汇总口径：``summary`` = **跨轮样本池**（每轮各算一遍；多轮报告另给每轮表与方差，
+    见 :mod:`eval.report`）。环境行带上模型 id 与 git HEAD 短号 —— 报告要能回答
+    "这批数字是哪份代码、哪个模型、什么时候跑出来的"。
+    """
+    stamp = report.timestamp()
+    pooled = [result for round_ in rounds for result in round_.results]
+    aggregates = report.aggregate(pooled)
+    env = report.environment(
+        mode=mode,
+        model=model,
+        extra={"repeats": len(rounds), "tags": sorted(tags) if tags else None},
+    )
+    if json_path:
+        target = report.write_json(
+            aggregates, pooled, json_path, environment=env, rounds=rounds, stamp=stamp
+        )
+        print(f"[eval] report (JSON): {target}")
+    if md_path:
+        target = report.write_markdown(
+            aggregates, pooled, md_path, environment=env, rounds=rounds, stamp=stamp
+        )
+        print(f"[eval] report (Markdown): {target}")
+
+
+async def run_rounds(
+    *,
+    provider,
+    executor,
+    tracer: Tracer,
+    mode: str,
+    tags: list[str] | None = None,
+    repeat: int = 1,
+    teardown=None,
+    json_path: str | None = None,
+    md_path: str | None = None,
+    model: str | None = None,
+) -> int:
+    """跑 ``repeat`` 轮同一场景集 → 汇总 → （可选）写报告；返回 exit code（0/1）。
+
+    - 每轮都是**完整**的一遍（同一选择、同一顺序）：多轮的目的是量波动，不是抽样。
+    - exit code 与单轮同语义：任何一轮出现非 fragile 失败就 gate（fragile 失败只计数）。
+    - 空跑（``--tag`` 选不中可运行场景）时 ``run_all`` 返回 1 且一条结果都没有：不写报告、
+      也不再重复 N 遍（没有数据可报，日志里已经报了原因）。
+    """
+    if repeat < 1:
+        raise ValueError(f"repeat must be >= 1, got {repeat}")
+    rounds: list[Round] = []
+    exit_code = 0
+    for index in range(1, repeat + 1):
+        if repeat > 1:
+            print(f"[eval] round {index}/{repeat}")
+        results: list[ScenarioResult] = []
+        exit_code = (
+            await run_all(
+                provider=provider,
+                executor=executor,
+                tracer=tracer,
+                teardown=teardown,
+                mode=mode,
+                tags=tags,
+                results=results,
+            )
+            or exit_code
+        )
+        if not results:  # 空跑：run_all 已经报错并返回 1
+            break
+        rounds.append(Round(index=index, results=results))
+    if rounds and (json_path or md_path):
+        _write_reports(
+            rounds, mode=mode, model=model, tags=tags, json_path=json_path, md_path=md_path
+        )
+    return exit_code
+
+
 def _real_stack():
     """真实模式的组合根（薄壳）：Settings → ``harness.build_real_deps``。
 
@@ -196,21 +323,33 @@ def _real_stack():
     return deps.provider, deps.executor, deps.pool
 
 
-async def _run_real(tracer: Tracer, tags: list[str] | None = None) -> int:
+async def _run_real(
+    tracer: Tracer,
+    tags: list[str] | None = None,
+    *,
+    repeat: int = 1,
+    json_path: str | None = None,
+    md_path: str | None = None,
+) -> int:
     """真实模式：起池 → 逐场景隔离评测 → 关池；池起不来就诚实降级（打警告，不静默）。
 
     池的生命周期在 :func:`eval.harness.pool_lifecycle` 里（含降级与异常安全）；``teardown``
-    是逐场景的页面归还点（C2③）。
+    是逐场景的页面归还点（C2③）。池跨**全部轮次**只起一次（多轮之间不给模型换环境），
+    否则 P4-D7 的"方差"里混进了池起停的噪声。模型 id 进环境行。
     """
     provider, executor, pool = _real_stack()
     async with harness.pool_lifecycle(pool, executor):
-        return await run_all(
+        return await run_rounds(
             provider=provider,
             executor=executor,
             tracer=tracer,
             teardown=executor.aclose,
             mode="real",
             tags=tags,
+            repeat=repeat,
+            json_path=json_path,
+            md_path=md_path,
+            model=getattr(provider, "model", None),
         )
 
 
@@ -225,20 +364,53 @@ def main() -> int:
         choices=list(KNOWN_TAGS),
         help=f"只跑带该 tag 的场景（可重复；缺省 = 全部；可选：{', '.join(KNOWN_TAGS)}）",
     )
+    parser.add_argument(
+        "--json",
+        dest="json_path",
+        metavar="PATH",
+        help="机器可读报告写到该路径（目录 = 写入 <目录>/<时间戳>.json；缺省不写）",
+    )
+    parser.add_argument(
+        "--md",
+        dest="md_path",
+        metavar="PATH",
+        help="人读报告写到该路径（目录 = 写入 <目录>/<时间戳>.md；缺省不写）",
+    )
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        metavar="N",
+        help="同一场景集重复 N 轮（报告含每轮结果 + 跨轮方差；缺省 1）",
+    )
     args = parser.parse_args()
+    if args.repeat < 1:
+        parser.error("--repeat 必须 >= 1（跑 0 轮不是一次评测，是空跑）")
 
     tracer = JsonlTracer(out_dir=Path("data/traces"))
     if args.mock:
         return asyncio.run(
-            run_all(
+            run_rounds(
                 provider=FakeProvider(),
                 executor=FakeExecutor(),
                 tracer=tracer,
                 mode="mock",
                 tags=args.tag,
+                repeat=args.repeat,
+                json_path=args.json_path,
+                md_path=args.md_path,
+                model="mock (FakeProvider)",
             )
         )
-    return asyncio.run(_run_real(tracer, tags=args.tag))
+    return asyncio.run(
+        _run_real(
+            tracer,
+            tags=args.tag,
+            repeat=args.repeat,
+            json_path=args.json_path,
+            md_path=args.md_path,
+        )
+    )
 
 
 if __name__ == "__main__":
