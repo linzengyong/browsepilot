@@ -30,10 +30,15 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
-from browsepilot.agent.tools import ToolExecutor
+from browsepilot.agent.tools import ToolExecutor, ToolResult
 from browsepilot.app.browser.detect import MAX_HTML_SAMPLE_CHARS, detect_intervention
 from browsepilot.app.browser.policy import NavigationPolicy
-from browsepilot.app.executor import MAX_JS_RESULT_CHARS, AppToolExecutor
+from browsepilot.app.executor import (
+    MAX_JS_RESULT_CHARS,
+    AppToolExecutor,
+    _is_browser_error_url,
+    _promote_click_that_navigated,
+)
 from browsepilot.app.services.weather import Weather
 
 BROWSER_TOOLS = [
@@ -112,7 +117,9 @@ class FakeLocator:
         if self._page.click_url is not None:  # 点链接/弹窗跳转（动作后 URL 复查的测试缝）
             self._page.url = self._page.click_url
         if self._page.fail_click:
-            raise PlaywrightTimeoutError(f"click timeout: {self.selector}")
+            # 默认 PlaywrightTimeoutError（导航打断的形状）；click_exc 可换成别的失败档
+            exc = self._page.click_exc or PlaywrightTimeoutError(f"click timeout: {self.selector}")
+            raise exc
 
     async def fill(self, value: str, *, timeout: float | None = None) -> None:
         self._page.calls.append(("fill", self.selector, value))
@@ -183,6 +190,7 @@ class FakePage:
         self.fail_networkidle_wait = False
         self.fail_snapshot = False
         self.fail_click = False
+        self.click_exc: Exception | None = None  # 点击失败的具体异常（默认 None = timeout 档）
         self.fail_fill = False  # type 的 Playwright 尝试失败 → 走 JS 赋值兜底（I1 测试缝）
         self.fail_locator_evaluate = False
         self.fail_evaluate = False
@@ -838,6 +846,103 @@ async def test_click_failure_without_navigation_stays_error():
     assert "navigated" not in result.data
 
 
+@pytest.mark.parametrize(
+    "error_type", ["invalid_target", "action_failed", "playwright_error", "navigation_failed"]
+)
+def test_only_a_timeout_click_failure_can_be_promoted(error_type):
+    """F2①：只有 ``timeout`` 是“点击等待被导航打断”的形状 —— 其他失败档即使 URL 变了也不提升。
+
+    ``invalid_target``（目标定不出来）/ ``action_failed`` / ``playwright_error`` 是别的原因：
+    这些失败路径上 URL 变了也不构成“点击生效”的证据（可能是页面自己跳走的）。旧实现无条件
+    提升（只看 URL 变化）→ P4 拿到假成功。
+    """
+    page = FakePage(url="https://example.com/next")
+    result = _promote_click_that_navigated(
+        ToolResult(status="error", error_type=error_type, error_message=f"{error_type}: boom"),
+        "https://example.com/start",
+        page,
+    )
+    assert result.status == "error"
+    assert result.error_type == error_type
+    assert "navigated" not in result.data
+
+
+def test_timeout_click_failure_with_a_real_cross_page_navigation_is_promoted():
+    """正对照（C3a 不能被收窄掉）：真跨页 timeout 仍然提升成成功，原错误留在数据里诊断。"""
+    page = FakePage(url="https://example.com/next")
+    result = _promote_click_that_navigated(
+        ToolResult(
+            status="error",
+            error_type="timeout",
+            error_message="click timeout: e2",
+            data={"target": "e2"},
+        ),
+        "https://example.com/start",
+        page,
+    )
+    assert result.status == "success"
+    assert result.data["navigated"] is True
+    assert result.data["url_before"] == "https://example.com/start"
+    assert result.data["url"] == "https://example.com/next"
+    assert result.data["error_before_navigation"]["error_type"] == "timeout"
+
+
+@pytest.mark.parametrize(
+    "hash_url", ["https://example.com/start#reviews", "https://example.com/start#"]
+)
+def test_hash_only_change_after_a_timeout_is_not_a_navigation(hash_url):
+    """F2②：``#fragment`` 变化是**页内锚点**，不是导航 —— 没换页面就不能当“点击生效”。
+
+    旧实现比 URL 字符串：``/start`` → ``/start#reviews`` 也算“跳走了”，于是失败的点击
+    被记成成功（假成功）；只比 ``#`` 之前的部分才是“页面有没有换”。
+    """
+    page = FakePage(url=hash_url)
+    result = _promote_click_that_navigated(
+        ToolResult(status="error", error_type="timeout", error_message="click timeout: e2"),
+        "https://example.com/start",
+        page,
+    )
+    assert result.status == "error"
+    assert "navigated" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_click_timeout_with_only_a_hash_change_is_not_promoted():
+    """F2② 的接线面：同页锚点跳转不能让失败的点击在真实路径上变成“成功”。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/start"})
+    page.click_url = "https://example.com/start#reviews"  # 同页锚点：URL 字符串变了，页面没换
+    page.fail_click = True
+    page.fail_locator_evaluate = True
+
+    result = await ex.call("browser_click", {"ref": "e2"})
+
+    assert result.status == "error"
+    assert result.error_type == "timeout"
+    assert "navigated" not in result.data
+
+
+@pytest.mark.asyncio
+async def test_non_timeout_click_failure_is_not_promoted():
+    """F2① 的接线面：``action_failed``（驱动/页面异常）即使 URL 也变了，也不得报成成功。"""
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/start"})
+    page.click_url = "https://example.com/next"  # URL 确实变了
+    page.fail_click = True
+    page.click_exc = RuntimeError("browser crashed mid-click")  # → action_failed（不是 timeout）
+    page.fail_locator_evaluate = True
+
+    result = await ex.call("browser_click", {"ref": "e2"})
+
+    assert result.status == "error"
+    assert result.error_type == "action_failed"
+    assert "navigated" not in result.data
+
+
 @pytest.mark.asyncio
 async def test_click_into_a_browser_error_page_is_reported_as_navigation_failure():
     """C3b：点击把页面带去 DNS 失败的地址 → 页面停在 ``chrome-error://chromewebdata/``。
@@ -882,6 +987,50 @@ async def test_execute_js_into_a_browser_error_page_is_navigation_failure():
     assert result.data["action"] == "browser_execute_js"
     assert browser.released == []
     assert browser.discarded == [page]
+
+
+def test_browser_error_url_recognition_is_prefix_based():
+    """F5：错误页判定必须按 scheme/host 前缀，**不能**做子串匹配。
+
+    ``"neterror" in url`` / ``"chromewebdata" in url`` 会误伤合法地址（``https://example.com/neterror``）：
+    成功动作后的复查把它当错误页 → 结果被替换成 ``navigation_failed`` 并 discard **活页**
+    （页面内容/登录态一起丢，真实数据丢失）。四种真错误页写法仍要认全。
+    """
+    for url in (
+        "chrome-error://chromewebdata/",
+        "edge-error://edgewebdata/",
+        "chrome://network-error/",
+        "about:neterror?e=dnsNotFound&u=https%3A%2F%2Fexample.com%2F",
+    ):
+        assert _is_browser_error_url(url) is True, url
+    for url in (
+        "https://example.com/neterror",
+        "https://example.com/chromewebdata",
+        "https://chromewebdata.example.com/",
+        "https://example.com/path?q=chrome-error",
+    ):
+        assert _is_browser_error_url(url) is False, url
+
+
+@pytest.mark.asyncio
+async def test_legit_url_containing_neterror_text_is_not_an_error_page():
+    """F5 的接线面：URL 里出现 ``neterror`` 只是路径文本 → 成功动作后照常放行、页面还活着。
+
+    旧子串判定把 ``https://example.com/neterror`` 当错误页：成功结果被替换成
+    ``navigation_failed`` + discard 活页，连后续 snapshot 都拿不到页（真实数据丢失）。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.evaluate_url = "https://example.com/neterror"
+
+    result = await ex.call("browser_execute_js", {"expression": "document.title"})
+
+    assert result.status == "success"  # 动作结果原样保留
+    assert browser.discarded == []
+    assert browser.released == []
+    assert (await ex.call("browser_snapshot", {})).status == "success"  # 页面没被误杀
 
 
 @pytest.mark.asyncio
@@ -936,6 +1085,42 @@ async def test_snapshot_entry_allows_a_blank_page():
 
     assert result.status == "success"
     assert browser.discarded == []
+
+
+@pytest.mark.parametrize(
+    "error_url",
+    [
+        "chrome-error://chromewebdata/",  # 页面 JS/meta 重定向到死主机 / goto 以错误页提交
+        "about:neterror?e=dnsNotFound",  # 同一类错误页的 about 写法
+    ],
+)
+@pytest.mark.asyncio
+async def test_snapshot_entry_on_a_browser_error_page_is_a_navigation_failure(error_url):
+    """F1：入口守卫必须先认错误页（C3b 的归因规则在这条路径上漏了）。
+
+    页面停在 ``chrome-error://chromewebdata/``（页面 JS/meta 重定向到死主机、或两次工具调用
+    之间导航以错误页提交）时，旧顺序先跑 ``validate`` → 把真实网络故障（DNS 失败/连接被拒，
+    P4 高频）报成 ``navigation_blocked``「安全策略拒绝」+ discard；``about:neterror`` 更糟
+    —— ``about:*`` 先命中“空白页放行”，错误页被**静默放行**。
+
+    真相是导航失败：按 ``navigation_failed`` 如实上报 + 同样 discard（错误页不复用，同 F4）。
+    """
+    page = FakePage()
+    browser = FakeBrowser(page)
+    ex = make_executor(browser)
+    await ex.call("browser_open", {"url": "https://example.com/"})
+    page.url = error_url  # 两次调用之间页面被带到错误页（测试缝）
+
+    result = await ex.call("browser_snapshot", {})
+
+    assert result.status == "error"
+    assert result.error_type == "navigation_failed"
+    assert "错误页" in result.error_message
+    assert result.data["action"] == "browser_snapshot"
+    assert result.data["reason"] == "browser_error_page"
+    assert result.data["page_discarded"] is True
+    assert browser.discarded == [page]
+    assert browser.released == []  # 错误页不回 idle（会被下一个消费者取走）
 
 
 @pytest.mark.asyncio

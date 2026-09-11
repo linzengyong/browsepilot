@@ -478,8 +478,10 @@ def test_chat_resume_after_login_wall_uses_human_response(tmp_path):
             if line.startswith("data: ")
         ]
     assert [e["type"] for e in events] == ["answer", "done"]
-    assert events[1]["stop_reason"] == "completed"
-    # 答案不再要求人工（旧行为：模型只看到过期的 human_prompt → 复述"请手动登录"）
+    # F3：暂停发生在**导航步**（browser_open）上 → resume 后没有任何观察（观察步从未运行），
+    # 所以 stop_reason 是 partial 而不是 completed（旧断言把假成功钉成了“正确行为”）。
+    assert events[1]["stop_reason"] == "partial"
+    # 答案不再要求人工（旧行为：模型只看到过期的 human_prompt → 复述“请手动登录”）
     assert "手动登录" not in events[0]["text"]
     assert "已基于人工反馈继续" in events[0]["text"]
     # resume 那一轮的 prompt：人工反馈在里面，过期提示不在（system 也讲清了人工已完成）

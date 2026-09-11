@@ -23,11 +23,16 @@ Tier3（T4 接线）要点：
   导航失败时读到的是浏览器错误页（``chrome-error://chromewebdata/``）——它的 scheme 不在白名单，
   直接 validate 会把真实的 ``navigation_failed``（DNS 失败/连接被拒，P4 高频）伪装成策略拒绝，
   所以按**导航失败**如实上报 + ``discard``（C3b）；``about:blank`` 是新建页面的初始状态，
-  既不是跳转也不是违规。**残余**：重定向后导航失败（最终 URL 未知）不在复查范围。
+  既不是跳转也不是违规。**入口守卫与动作后复查共用同一个有序判定**（F1：错误页 → 空白页 → 策略，
+  顺序不得倒过来 —— ``about:neterror`` 曾因空白页先命中而在入口路径上被静默放行，
+  ``chrome-error://`` 则被报成“安全策略拒绝”）。**残余**：重定向后导航失败（最终 URL 未知）
+  不在复查范围。
 - **跨页点击的假失败（C3a）**：点击触发导航时 Playwright 的 ``click`` 等待会被导航打断并报
-  timeout，而动作其实已经生效（T6 冒烟实测 1/2）——失败前记下 ``url_before``，失败且 URL 已变
-  （且新地址不是错误页/空白页）→ 按“已生效”返回成功 + ``data["navigated"]=True``，
-  原错误保留在 ``data["error_before_navigation"]``；URL 没变就是真失败，不提升（假成功更难查）。
+  timeout，而动作其实已经生效（T6 冒烟实测 1/2）——失败前记下 ``url_before``，失败且
+  ``error_type == timeout``、去掉 ``#fragment`` 后 URL 真的变了（且新地址不是错误页/空白页）
+  → 按“已生效”返回成功 + ``data["navigated"]=True``，原错误保留在
+  ``data["error_before_navigation"]``。URL 没变 / 只有页内锚点变化 / 非 timeout 档都是真失败，
+  **不提升**（F2：把没生效的点击记成成功同样是错的，且假成功更难查）。
 - **D5/D6 HITL 桥**：登录墙/人机验证/确认弹窗必须由人处理——``browser_open``（导航成功后）、
   ``browser_click``、``browser_type`` 之后采样页面（**渲染后可见文本**：``body.inner_text()`` 的前
   20KB + 可见密码框探测，都是 best-effort），交给 ``browser.detect.detect_intervention``；
@@ -69,6 +74,7 @@ import asyncio
 import json
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from loguru import logger
 from playwright.async_api import Page
@@ -521,79 +527,93 @@ class AppToolExecutor:
     async def _guard_current_url(self, page: Page, action: str) -> ToolResult | None:
         """**入口复查**（I1）：使用当前页之前先看它在哪；返回 None = 放行。
 
-        为什么观察类工具也要看：复查只在**动作后**做，覆盖不到"页面已经带出去了但下一个调用
-        只读不写"的路径——一直在违规页上取快照等于假装没看见（本入口目前只装在
+        为什么观察类工具也要看：复查只在**动作后**做，覆盖不到“页面已经带出去了但下一个调用
+        只读不写”的路径——一直在违规页上取快照等于假装没看见（本入口目前只装在
         ``browser_snapshot`` 上；交互工具的落点由它们自己的动作后复查接住）。
-        放行的两种：URL 读不出来（页面已关/驱动异常，交给 closed-page 恢复路径）与
-        空白页（``about:blank``：新建页面的初始状态，不是"跳到了哪里"）。
-        拦截：``navigation_blocked`` + **弃用该页**（同 I2：违规源不回 idle）。
+
+        判定与动作后复查**共用** :meth:`_classify_page_url`（F1：顺序一致，错误页先于策略）——
+        停在 ``chrome-error://chromewebdata/`` 的页面（页面 JS/meta 重定向到死主机、或两次工具
+        调用之间导航以错误页提交）必须报 ``navigation_failed``：真相是网络失败，交给 ``validate``
+        会变成“安全策略拒绝”（C3b 修过动作后复查，入口这条路径漏了一次）；``about:neterror``
+        同样被先认出来，不再被空白页判定静默放行。
+
+        放行的两种：URL 读不出来（页面已关/驱动异常，交给 closed-page 恢复路径）与判定为
+        ``_URL_OK``（空白页 / 策略内）。拦截：``navigation_failed`` / ``navigation_blocked``
+        + **弃用该页**（同 I2：错误页与违规源都不回 idle）。
         """
         url = _page_url(page)
-        if not url or _is_blank_url(url):
+        if not url:
             return None
-        allowed, reason = self._policy.validate(url)
-        if allowed:
+        verdict, reason = self._classify_page_url(url)
+        if verdict == _URL_OK:
             return None
         await self._discard_page(page)
+        if verdict == _URL_ERROR_PAGE:
+            return _browser_error(
+                "navigation_failed",
+                f"当前页面停在浏览器错误页（导航失败）：{_preview(url)}",
+                data=_verdict_data(action, url, reason),
+            )
         return _browser_error(
             "navigation_blocked",
             f"当前页面停在策略不允许的 URL：{reason}",
-            data={
-                "action": action,
-                "url": _preview(url),
-                "reason": reason,
-                "page_discarded": True,
-            },
+            data=_verdict_data(action, url, reason),
         )
+
+    def _classify_page_url(self, url: str) -> tuple[str, str]:
+        """当前页 URL 的复查判定（F1）：``(档位, 原因)``，``(_URL_OK, "")`` = 放行。
+
+        **顺序即优先级**，入口守卫与动作后复查共用这一个 helper——两处各自维护顺序必然漂移
+        （C3b 修过动作后复查，入口守卫又漏了一次）：
+
+        1. 浏览器错误页（``chrome-error://…`` / ``about:neterror``）→ ``_URL_ERROR_PAGE``：
+           它的 scheme 不在白名单，先跑 ``validate`` 会把真实网络故障（DNS 失败 / 连接被拒，
+           P4 高频）报成“安全策略拒绝”（错误归因全错）；``about:neterror`` 更会被空白页判定
+           静默放行。
+        2. 空白页（``about:blank``，新建页面的初始状态）→ 放行：不是跳转，也不是违规。
+        3. 其余交给策略 ``validate``。
+        """
+        if _is_browser_error_url(url):
+            return _URL_ERROR_PAGE, "browser_error_page"
+        if _is_blank_url(url):
+            return _URL_OK, ""
+        allowed, reason = self._policy.validate(url)
+        return (_URL_OK, "") if allowed else (_URL_BLOCKED, reason)
 
     async def _revalidate_after_action(
         self, page: Page, action: str, result: ToolResult
     ) -> ToolResult:
         """动作后复查当前 URL（I2）：入参把关挡不住“动作把页面带出去”（链接/弹窗/重定向/JS 跳转）。
 
-        四条出路（顺序即优先级）：
+        判定用 :meth:`_classify_page_url`（与入口守卫**共用同一套顺序**，F1）：
 
         1. URL 读不出来（页面已关/驱动异常）→ 原结果返回：那不是"跳到了违规地址"，
            交给 closed-page 恢复路径（:meth:`_current_page`）。
-        2. 浏览器错误页（``chrome-error://chromewebdata/``）→ **导航失败**（C3b）：
-           DNS 失败/连接被拒绝（P4 高频）的页面就停在这里，scheme 不在白名单 ——
-           直接交给策略会把真实网络故障记成"安全策略拦截"（错误归因全错）。
+        2. ``_URL_ERROR_PAGE``（浏览器错误页 ``chrome-error://chromewebdata/`` / ``about:neterror``）
+           → **导航失败**（C3b）：DNS 失败/连接被拒绝（P4 高频）的页面就停在这里，scheme 不在
+           白名单 —— 直接交给策略会把真实网络故障记成"安全策略拦截"（错误归因全错）。
            按导航失败如实上报 + **弃用**（错误页不复用，同 F4），不 release、不 quarantine。
-        3. 空白页（``about:blank``）→ 原结果返回：不是跳转，也不是策略违规。
-        4. 策略外 → ``navigation_blocked`` + **弃用当前页**：后续调用不会继续在违规源上动作，
-           必须先重新 ``browser_open`` 过策略门（永远不回 idle：归还等于把违规源交给下个消费者）。
-        放行（策略内）→ 原结果原样返回：动作本身的结果才是数据。
+        3. ``_URL_OK``（空白页 / 策略内）→ 原结果原样返回：动作本身的结果才是数据。
+        4. ``_URL_BLOCKED`` → ``navigation_blocked`` + **弃用当前页**：后续调用不会继续在违规源上
+           动作，必须先重新 ``browser_open`` 过策略门（永远不回 idle：归还等于把违规源交给下个消费者）。
         """
         url = _page_url(page)
         if not url:
             return result
-        if _is_browser_error_url(url):
-            await self._discard_page(page)
+        verdict, reason = self._classify_page_url(url)
+        if verdict == _URL_OK:
+            return result
+        await self._discard_page(page)
+        if verdict == _URL_ERROR_PAGE:
             return _browser_error(
                 "navigation_failed",
                 f"动作后页面停在浏览器错误页（导航失败）：{_preview(url)}",
-                data={
-                    "action": action,
-                    "url": _preview(url),
-                    "reason": "browser_error_page",
-                    "page_discarded": True,
-                },
+                data=_verdict_data(action, url, reason),
             )
-        if _is_blank_url(url):
-            return result
-        allowed, reason = self._policy.validate(url)
-        if allowed:
-            return result
-        await self._discard_page(page)
         return _browser_error(
             "navigation_blocked",
             f"动作后页面跳转到策略不允许的 URL：{reason}",
-            data={
-                "action": action,
-                "url": _preview(url),
-                "reason": reason,
-                "page_discarded": True,
-            },
+            data=_verdict_data(action, url, reason),
         )
 
     async def _discard_page(self, page: Page | None) -> None:
@@ -708,27 +728,49 @@ def _navigation_failure(result: ToolResult) -> ToolResult:
     )
 
 
+#: 可以“提升成成功”的点击失败档（F2）：只有 timeout 是“等待被导航打断”的形状。
+_PROMOTABLE_CLICK_ERROR_TYPE = "timeout"
+
+
+def _url_without_fragment(url: str) -> str:
+    """URL 去掉 ``#fragment``（F2）：``#`` 之后的变化是**页内锚点**，不是导航。
+
+    ``https://x/p`` → ``https://x/p#reviews`` 只换了页内位置，页面本身没变：
+    点击等待就算被打断也不代表“点击生效了”。只比 ``#`` 之前的部分才是“页面有没有换”。
+    """
+    return urlunsplit(urlsplit(url)._replace(fragment=""))
+
+
 def _promote_click_that_navigated(
     result: ToolResult, url_before: str, page: Page
 ) -> ToolResult:
-    """点击失败但页面真的跳走了 → 按"已生效"返回成功（C3a）。
+    """点击失败但页面真的跳走了 → 按“已生效”返回成功（C3a）。
 
     T6 冒烟实测（跨页点击假失败 1/2）：点击触发导航时 Playwright 的 ``click`` 等待会被导航
-    打断并报 timeout，而动作其实已经生效（URL 已变）——把"已生效"记成失败会把 P4 的成功任务
-    算成失败。所以失败路径对比动作前的 URL：
+    打断并报 timeout，而动作其实已经生效（URL 已变）——把“已生效”记成失败会把 P4 的成功任务
+    算成失败。所以失败路径对比动作前的 URL。**三道门全过才算导航**（F2 收窄，旧实现只看
+    “URL 字符串变了”）：
 
-    - 没变 / 读不出来 → 原错误（失败是真的）；
-    - 变成浏览器错误页或空白页 → 原错误（要么导航失败要么没有落点，交给复查看）。
-      尤其不能提升成成功：那会把"点了一个打不开的链接"记成任务成功。
-    - 变成新地址 → 成功 + ``data["navigated"]=True``；原错误原样保留在
-      ``data["error_before_navigation"]``（诊断不丢）。
+    1. ``error_type == "timeout"``：只有它是“等待被导航打断”的形状。``invalid_target`` /
+       ``action_failed`` / ``playwright_error`` 是别的原因，这些失败路径上 URL 变了也不构成
+       “点击生效”的证据（可能是页面自己跳走的），按成功交出就是假成功。
+    2. 页面真的换了：只比 ``#`` 之前的部分（:func:`_url_without_fragment`）——``/start`` →
+       ``/start#reviews`` 是同页锚点，不是导航。两侧 URL 都要读得出来：读不出来就没有“变”的
+       基准，不提升。
+    3. 新地址不是浏览器错误页 / 空白页：要么导航失败要么没有落点，交给复查看。
+       尤其不能提升成成功：那会把“点了一个打不开的链接”记成任务成功。
+
+    没变 / 读不出来 / 命中错误页与空白页 → 原错误（失败是真的）。真的换了页面 → 成功 +
+    ``data["navigated"]=True``；原错误原样保留在 ``data["error_before_navigation"]``（诊断不丢）。
 
     复查（:meth:`AppToolExecutor._revalidate_after_action`）照常跟在后面：跳到的地址仍要过策略。
     """
-    if result.status == "success":
+    if result.status == "success" or result.error_type != _PROMOTABLE_CLICK_ERROR_TYPE:
         return result
     url_after = _page_url(page)
-    if not url_after or url_after == url_before:
+    if not url_after or not url_before:
+        return result
+    if _url_without_fragment(url_after) == _url_without_fragment(url_before):
         return result
     if _is_browser_error_url(url_after) or _is_blank_url(url_after):
         return result
@@ -749,15 +791,34 @@ def _promote_click_that_navigated(
     )
 
 
-def _is_browser_error_url(url: str) -> bool:
-    """浏览器错误页（导航失败）的 URL（C3b）：``chrome-error://chromewebdata/``。
+#: 当前页 URL 复查的三档判定（F1）：入口守卫与动作后复查共用（顺序即优先级）。
+_URL_OK = "ok"
+_URL_ERROR_PAGE = "error_page"
+_URL_BLOCKED = "blocked"
 
-    自己的 scheme 不在策略白名单里，直接交给 ``validate`` 会被记成"安全策略拦截" ——
+
+#: 浏览器错误页的 scheme/host 前缀（F5）：判定只认前缀，绝不子串匹配。
+_BROWSER_ERROR_PREFIXES = (
+    "chrome-error:",  # Chromium：chrome-error://chromewebdata/
+    "edge-error:",  # Edge：edge-error://edgewebdata/
+    "chrome://network-error",  # 手输/内部导航进的网络错误页
+    "about:neterror",  # about:neterror?e=dnsNotFound（页面 JS/meta 重定向常见落点）
+)
+
+
+def _is_browser_error_url(url: str) -> bool:
+    """浏览器错误页（导航失败）的 URL（C3b / F5）：``chrome-error://chromewebdata/`` 等。
+
+    自己的 scheme 不在策略白名单里，直接交给 ``validate`` 会被记成“安全策略拦截” ——
     而真实原因是 DNS 解析失败 / 连接被拒绝（P4 高频）：错误归因不能错。
-    （``neterror`` 是同一类页面的别名写法，一并认。）
+
+    判定只能按 **scheme/host 前缀**（F5）：``"neterror" in url`` / ``"chromewebdata" in url``
+    这类子串判定会把合法地址（``https://example.com/neterror``、``https://chromewebdata.example.com/``）
+    当成错误页 —— 成功动作后的复查据此把结果替换成 ``navigation_failed`` 并 discard **活页**
+    （页面内容/登录态一起丢，真实数据丢失）。四种写法（Chromium / Edge / 内部网络错误页 /
+    ``about:neterror``）都按前缀认。
     """
-    lowered = url.strip().lower()
-    return lowered.startswith("chrome-error:") or "chromewebdata" in lowered or "neterror" in lowered
+    return url.strip().lower().startswith(_BROWSER_ERROR_PREFIXES)
 
 
 def _is_blank_url(url: str) -> bool:
@@ -767,6 +828,11 @@ def _is_blank_url(url: str) -> bool:
     或把它当"已导航"（页面其实什么都没加载）。
     """
     return url.strip().lower().startswith("about:")
+
+
+def _verdict_data(action: str, url: str, reason: str) -> dict[str, Any]:
+    """复查判定命中时的 ``data`` 形状（F1）：两个复查点完全一致（只差文案）。"""
+    return {"action": action, "url": _preview(url), "reason": reason, "page_discarded": True}
 
 
 def _js_write_violation(expression: str) -> str | None:

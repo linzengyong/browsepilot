@@ -42,15 +42,25 @@ def _human_feedback_note(human_response: str) -> str:
 
 
 def _answer_payload(state: AgentState) -> dict:
-    """进答案模型的数据（C1）：resume 之后 ``human_prompt`` 已经过期。
+    """进答案模型的数据（C1 / F4）：HITL 的**控制面**字段不进去。
 
-    ``human_prompt`` 是**打断时对人工的请求**（"请在浏览器中手动登录后继续任务。"），
-    人工反馈到了就再也没人要做这件事了；留在数据里会把模型带回"再请用户手动登录一次"
-    的老路（P3 final review C1：resume 白做）。所以移除它，换上人工反馈本身。
+    ``human_prompt`` 是**打断时对人工的请求**（“请在浏览器中手动登录后继续任务。”），
+    ``intervention`` 是它的机器可读副本（``"login"`` / ``"captcha"`` 这类稳定码，也可能只是
+    medium 置信度“只记录不暂停”的痕迹）；人工反馈到了就再也没人要做这件事了，
+    留着会把模型带回“再请用户手动登录一次”的老路（P3 final review C1：resume 白做），
+    所以 resume 之后连它们一起换成人工反馈本身（``human_response``）。
+    原始字段仍留在 state 的 ``result_data`` 与 trace 里（诊断不丢）。
+
+    ``needs_human`` 是“转 hitl 节点暂停”的控制面开关（``graph.execute`` 看它决定要不要 interrupt），
+    不是给答案模型的数据：resume 之后人已经做完了，agent 的下一步是交答案而不是再请求一次暂停
+    （P3 收口 re-review F4：光靠 system 里那句“人工已经做完”挡不住数据里的“需要人工”）——
+    所以**无条件**剥掉。
     """
     data = dict(state.result_data)
+    data.pop("needs_human", None)
     if state.human_response:
         data.pop("human_prompt", None)
+        data.pop("intervention", None)
         data["human_response"] = state.human_response
     return data
 
@@ -124,6 +134,41 @@ def _partial_note(data: dict) -> str:
     )
 
 
+#: 链上“成功后仍需继续”的步骤（C2）：``browser_open`` 只是**导航**，而浏览器任务的目标在页面上
+#: ——“已打开 https://…”不等于任务完成。所以 open 成功后继续走 ``browser_snapshot``，观察结果才是
+#: 任务的数据（导航信息并进 data）；观察失败时数据只到“打开了哪个页面”，结果按 partial 上报
+#: （见 :func:`_observation_result` / :func:`_navigation_only_result`）。
+_CONTINUE_AFTER: dict[str, str] = {"browser_open": "browser_snapshot"}
+
+
+def _continues_to_observation(chain: list[str], index: int, tool_name: str) -> bool:
+    """本步是链上“仍需继续”的**导航步**吗（C2 / F3 共用同一个判断，避免两处漂移）。
+
+    ``True`` = “这一步本身只是导航，页面内容还在后面的观察步里”：成功分支靠它继续走观察步；
+    HITL 分支靠它识别“暂停在导航步上 → resume 后没有观察”（F3：resume 走 hitl → answer，
+    观察步永远不会跑，所以那时只有 open 元数据、没有页面内容，不得报 completed）。
+    """
+    follow_up = _CONTINUE_AFTER.get(tool_name)
+    return follow_up is not None and follow_up in chain[index + 1 :]
+
+
+def _hitl_result_data(
+    data: dict, chain: list[str], index: int, tool_name: str
+) -> dict:
+    """HITL 暂停时的 ``result_data``（F3）：暂停在导航步上就标 ``partial``。
+
+    链是 [browser_open, browser_snapshot] 时，暂停点通常是 open（登录墙在导航落地后就被检测到）：
+    ``result_data`` 只有 open 元数据 + ``needs_human``，人工做完后 resume 直接进 answer，
+    观察步**从未运行**——模型可能对从未读过的页面作答。所以标 partial + 稳定 reason
+    （与 ``no_navigation_for_task`` / ``no_observation_after_navigation`` 同族），
+    ``stop_reason`` 随之是 partial 而不是 completed。
+    暂停在非导航步（如 tier1 的 weather 确认）时不标：那一步的结果就是任务的数据本身。
+    """
+    if not _continues_to_observation(chain, index, tool_name):
+        return data
+    return {**data, "partial": True, "partial_reason": "hitl_no_observation"}
+
+
 def build_graph(
     executor: ToolExecutor,
     tracer: Tracer,
@@ -148,12 +193,6 @@ def build_graph(
         "read_page": ["fetch_page", "browser_open"],
         "browser_task": ["browser_open", "browser_snapshot"],
     }
-
-    # 链上"成功后仍需继续"的步骤（C2）：browser_open 只是**导航**，而浏览器任务的目标在页面上
-    # ——"已打开 https://…"不等于任务完成。所以 open 成功后继续走 browser_snapshot，
-    # 观察结果才是任务的数据（导航信息并进 data）；观察失败时数据只到"打开了哪个页面"，
-    # 结果按 partial 上报（见 _observation_result / _navigation_only_result）。
-    _CONTINUE_AFTER: dict[str, str] = {"browser_open": "browser_snapshot"}
 
     # 工具 → 参数模型。``None`` = 工具不需要参数（不用花一次模型调用去提取）。
     # Tier3 的工具参数形态由 BrowserParams 描述（url/target/text/direction/expression），
@@ -215,6 +254,8 @@ def build_graph(
         - 观察收尾必须能区分"本任务导航过"与"只是看了一眼当时开着的页面"：
           没导航过的快照标 ``partial``（不得报 completed）。
         - 导航成功但观察失败 → 标 ``partial``（打开了页面，但没取到内容）。
+        - HITL 暂停在**导航步**上（F3，见 :func:`_hitl_result_data`）：resume 走 hitl → answer，
+          观察步永远不会跑 → 标 ``partial``（``hitl_no_observation``），不得报 completed。
         """
         with tracer.span("execute", intent=state.intent):
             chain = _STRATEGY_CHAIN.get(state.intent, ["search"])
@@ -261,17 +302,19 @@ def build_graph(
                 )
                 if tool_result.status == "success":
                     if tool_result.data.get("needs_human"):
-                        # HITL：工具需要人工确认 → 交给 hitl 节点 interrupt
+                        # HITL：工具需要人工确认 → 交给 hitl 节点 interrupt（F3：暂停在导航步上时
+                        # 标 partial —— resume 后走 hitl → answer，观察步永远不会跑）
                         return {
-                            "result_data": tool_result.data,
+                            "result_data": _hitl_result_data(
+                                tool_result.data, chain, index, tool_name
+                            ),
                             "pending_human_action": True,
                             "human_prompt": str(tool_result.data.get("human_prompt", "")),
                             "degradation_log": _merge_degradation(
                                 state.degradation_log, degradation
                             ),
                         }
-                    follow_up = _CONTINUE_AFTER.get(tool_name)
-                    if follow_up is not None and follow_up in chain[index + 1 :]:
+                    if _continues_to_observation(chain, index, tool_name):
                         # 导航步成功：继续走观察步（导航信息随结果一起进 data）
                         navigation = dict(tool_result.data)
                         continue
@@ -366,7 +409,12 @@ def build_graph(
             return {"final_answer": text, "stop_reason": stop_reason}
 
     async def hitl(state: AgentState) -> dict:
-        """Human-in-the-loop：interrupt 暂停执行，resume 后带上人工确认回 answer。"""
+        """Human-in-the-loop：interrupt 暂停执行，resume 后带上人工确认回 answer。
+
+        resume 只回到 answer：链上还没跑的步骤（典型的是导航步之后的观察步）**不会**自动继续
+        —— 所以暂停在导航步上时，数据里只有 open 元数据，靠 ``partial`` 如实上报（F3，见
+        :func:`_hitl_result_data`）；想拿到页面内容得由下一轮任务重新发起。
+        """
         with tracer.span("hitl"):
             response = interrupt({"human_prompt": state.human_prompt})
             return {

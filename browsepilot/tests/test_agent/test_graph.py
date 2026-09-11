@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from browsepilot.agent.graph import _merge_degradation, build_graph
+from browsepilot.agent.graph import _answer_payload, _merge_degradation, build_graph
 from browsepilot.agent.params import WeatherParams
 from browsepilot.agent.router import IntentResult
 from browsepilot.agent.state import AgentState
@@ -257,6 +257,7 @@ async def test_hitl_interrupt_then_resume(tmp_path):
     assert resumed["human_response"] == "确认，就北京"
     assert resumed["pending_human_action"] is False
     assert resumed["hitl_triggered_count"] == 1
+    # 负对照（F3 的反面）：暂停在**非导航步**（weather 的结果本身就是任务数据）→ 仍是 completed
     assert resumed["stop_reason"] == "completed"
 
 
@@ -352,13 +353,104 @@ async def test_hitl_resume_feeds_human_response_back_to_the_answer(tmp_path):
     assert "我已经在浏览器里登录好了，现在停在账户页" in prompt
     assert "人工反馈" in prompt
     assert "手动登录" not in prompt  # 过期的 human_prompt 已从 data 里剔除
+    assert "needs_human" not in prompt  # F4：引发暂停的控制面字段也不进上下文
+    assert "intervention" not in prompt
     # system prompt 里把"人工已经做完"说清楚（否则模型会再请人工操作一遍）
     assert "不要再让用户手动登录" in provider.last_system_content
 
     # ② 最终答案：由人工反馈驱动，不再要求人工
     assert "已基于人工反馈继续" in resumed["final_answer"]
     assert "手动登录" not in resumed["final_answer"]
-    assert resumed["stop_reason"] == "completed"
+    # ③ F3：暂停点在**导航步**（browser_open）上 → resume 后没有观察，不得报 completed
+    #（同一场景的详细断言见 test_hitl_pause_on_the_navigation_step_resumes_as_partial）
+    assert resumed["stop_reason"] == "partial"
+    assert resumed["result_data"]["partial_reason"] == "hitl_no_observation"
+
+
+# ── F4：answer payload 里的 HITL 控制面字段 ──────────────────────────────────
+
+
+def test_answer_payload_drops_the_hitl_control_fields():
+    """F4：``_answer_payload`` 要剥掉引发暂停的**控制面**字段（``needs_human`` / ``intervention``）。
+
+    C1 只剥了 ``human_prompt``：``needs_human=True`` 还在数据里，resume 后唯一防线是 system
+    里那句“人工已经做完”——模型完全可以顺着数据里的“需要人工”再要求人工确认一遍。
+    ``intervention``（human_prompt 的机器可读副本）是同一类过期信息，一并剥掉。
+    """
+    state = AgentState(
+        result_data={
+            "action": "browser_open",
+            "url": "https://example.com/login",
+            "needs_human": True,
+            "human_prompt": "页面需要登录：请在浏览器中手动登录后继续任务。",
+            "intervention": "login",
+        },
+        human_response="我已经在浏览器里登录好了",
+    )
+    data = _answer_payload(state)
+    assert data["human_response"] == "我已经在浏览器里登录好了"
+    assert "needs_human" not in data
+    assert "human_prompt" not in data
+    assert "intervention" not in data
+    assert data["url"] == "https://example.com/login"  # 数据面照常保留
+
+
+def test_answer_payload_without_a_resume_keeps_the_prompt_but_drops_the_flag():
+    """F4 的边界：没 resume 就进 answer 的路径（hitl 预算用完，第二次 needs_human 不再暂停）。
+
+    那时 ``human_prompt`` / ``intervention`` 是模型如实告知“需要人工”的唯一提示，保留；
+    而 ``needs_human`` 是“转 hitl 暂停”的控制面开关，从不进上下文。
+    """
+    state = AgentState(
+        result_data={
+            "action": "browser_open",
+            "url": "https://example.com/login",
+            "needs_human": True,
+            "human_prompt": "请手动登录",
+            "intervention": "login",
+        }
+    )
+    data = _answer_payload(state)
+    assert "needs_human" not in data
+    assert data["human_prompt"] == "请手动登录"
+    assert data["intervention"] == "login"
+
+
+# ── F3：暂停在导航步上的 HITL，resume 后不得报 completed ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_hitl_pause_on_the_navigation_step_resumes_as_partial(tmp_path):
+    """F3：暂停点是**导航步**（browser_open）时，resume 后没有任何观察 —— 不得报 completed。
+
+    链是 [browser_open, browser_snapshot]：open 命中登录墙 → HITL 暂停 →（人工做完）→ answer。
+    resume 走 hitl → answer，观察步**从未运行**：``result_data`` 只有 open 元数据（+needs_human），
+    模型可能对从未读过的页面作答 —— 旧行为把这种结果报成 ``completed``（假成功）。
+    标 ``partial`` + 稳定 reason（与 no_navigation_for_task / no_observation_after_navigation 同族）。
+    """
+    from langgraph.checkpoint.memory import MemorySaver
+    from langgraph.types import Command
+
+    tracer = JsonlTracer(trace_id="t19", out_dir=tmp_path / "traces")
+    ex = LoginWallExecutor()
+    provider = StubProvider()
+    graph = build_graph(ex, tracer, provider, checkpointer=MemorySaver())
+    config = {"configurable": {"thread_id": "f3-hitl-nav"}}
+
+    paused = await graph.ainvoke(AgentState(task="帮我点击页面上的登录按钮"), config=config)
+    assert paused["pending_human_action"] is True
+    assert paused["final_answer"] == ""  # 暂停在 hitl 节点
+
+    resumed = await graph.ainvoke(Command(resume="我已经登录好了，现在停在账户页"), config=config)
+
+    assert resumed["stop_reason"] == "partial"  # ← 不是 completed
+    assert resumed["result_data"]["partial"] is True
+    assert resumed["result_data"]["partial_reason"] == "hitl_no_observation"
+    # 观察步确实从未运行（链上只有导航那一次调用）
+    assert "browser_snapshot" not in ex.calls
+    # 答案模型被告知这次是 partial：不能把“只打开了页面”说成完成
+    assert "partial" in provider.last_user_content
+    assert "没有完成与任务目标匹配" in provider.last_user_content
 
 
 @pytest.mark.asyncio
