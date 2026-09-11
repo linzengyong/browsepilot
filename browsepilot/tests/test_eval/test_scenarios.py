@@ -7,6 +7,7 @@ from pydantic import ValidationError
 import eval.scenarios as es
 from browsepilot.agent.tracer import JsonlTracer
 from browsepilot.model.messages import Message
+from eval.checks import run_check
 from eval.fake_deps import FakeExecutor, FakeProvider
 from eval.run_eval import check_outcome, main, run_all
 from eval.scenarios import Check
@@ -75,6 +76,20 @@ def test_unknown_field_is_rejected():
     """``mdoe: real`` 这种笔误不得被静默忽略（否则场景会在 mock 下被跑/被跳过得莫名其妙）。"""
     with pytest.raises(ValidationError):
         es.Scenario(**_minimal(mdoe="real"))
+
+
+def test_check_rejects_unknown_fields():
+    """Check 同样 ``extra="forbid"``（P4-T2 审查 I1）：``keyword:``（漏 s）这类笔误必须报错
+    —— 静默忽略 = 少断言一条，而日志上看不出来。"""
+    with pytest.raises(ValidationError):
+        es.Check(type="contains_keyword", keyword=["北京"])
+    assert es.Check(type="contains_keyword", keywords=["北京"]).keywords == ["北京"]
+
+
+def test_unknown_tier_is_rejected():
+    """``tier`` 是路由的**实际**层级，只有三个合法值：拼错（``tier4``）不得静默落进场景集。"""
+    with pytest.raises(ValidationError):
+        es.Scenario(**_minimal(tier="tier4"))
 
 
 def test_scenario_without_checks_is_rejected():
@@ -149,11 +164,16 @@ def test_run_eval_smoke(capsys, monkeypatch):
     assert "p0-weather" in out
 
 
-# FakeProvider/FakeExecutor 定义在 eval/fake_deps.py（run_eval --mock 与测试共用）：
-# FakeProvider.chat 返回 ChatResult(text="Python 3.13 于 2024 年发布")；structured 按 schema 字段
-# 给 city=北京/query=q/url=https://example.com；FakeExecutor.call 对 weather 返回
-# data={"city": "北京", "temperature_c": 26.0}，对 search 返回 data={"results": []}，
-# 对 fetch_page 返回 data={"text": "Python 主页"}，其余返回 success 空 data。
+# FakeProvider/FakeExecutor 定义在 eval/fake_deps.py（run_eval --mock 与测试共用）。
+# v0.4 起 fake 是**任务感知**的（不是固定罐头值）：FakeProvider.structured 按 schema 字段名从
+# 任务文本取值（city="北京"/query=去掉搜索动词的任务原文/url=任务里的 URL 或补 scheme 的域名）；
+# chat 从 answer 节点塞进 user message 的 ``数据：{json}`` 合成回答（搜索结果/天气/页面正文），
+# 没有数据面（chitchat/knowledge_qa 直答）时才退回固定文本 "Python 3.13 于 2024 年发布"。
+# FakeExecutor.call：weather 对已知城市（北京/上海）返回 data={"city", "temperature_c", …}、
+# 其余 city_not_found；search 对认识的查询（含 python）返回 data={"results": [...]}、
+# 其余 service_error；fetch_page 对 python.org / example.com 返回 data={"text", "title", …}、
+# 其余 service_error；6 个浏览器工具一律 browser_unavailable（mock 没有浏览器）。
+# 这些行为的契约测试在本文件尾部（"fake 契约"一节）。
 
 
 def test_check_field_expected():
@@ -440,6 +460,16 @@ async def test_run_all_tag_filter_runs_only_matching(tmp_path, monkeypatch, caps
     assert "[SKIP] b-acceptance" in out
 
 
+def test_main_tag_with_zero_runnable_scenarios_exits_nonzero(capsys, monkeypatch):
+    """P4-T2 审查 Minor：``--tag browser`` 在 mock 下选不到任何可运行场景（tier3/HITL 都是
+    real-only）—— 必须非零退出，而不是打印 passed=0 failed=0 静默“通过”。"""
+    monkeypatch.setattr("sys.argv", ["run_eval", "--mock", "--tag", "browser"])
+    assert main() == 1
+    out = capsys.readouterr().out
+    assert "0 条可运行场景" in out
+    assert "passed=" not in out  # 没有假装跑过一轮
+
+
 async def test_fragile_failure_does_not_gate_but_is_still_reported(tmp_path, monkeypatch, capsys):
     """D6：内容漂移（fragile）不该让门禁变红，但报告里必须看得见它失败了。"""
     from eval import run_eval
@@ -603,6 +633,160 @@ def test_mock_run_is_green_over_the_real_scenario_set(capsys, monkeypatch):
         if not scenario.enabled:
             assert f"[DISABLED] {scenario.id}" in out
     assert "fragile_failed=0" in out
+
+
+# ── C1 回归网：合成失败/partial outcome 不得让正例场景全绿 ──
+#
+# 背景（P4-T1+T2 审查 C1）：harness 记录的 ``tool_calls`` 是**尝试**（含失败），而失败模板的
+# answer 会把用户输入原样带出来（search 兜底 "no results for query: '<任务原文>'"、navigate 失败
+# "打开页面失败：<url>"）—— 只断言 tools_called / contains_keyword 的正例场景因此能在
+# "策略链全败"或"只打开没观察"（partial）的运行上 PASS。实例：t3_browser_open 的 keywords
+# 含小写 "example.com"，被 "打开页面失败：https://example.com…" 满足。
+#
+# 这个回归网把原则编码进 CI：对每条**正例**场景构造"全策略失败"与"partial"合成 outcome，
+# 要求至少一项断言失败。合成 outcome 刻意复刻真实失败模板（消息回显任务文本/URL、
+# tool_calls = 尝试过的工具），即**对断言最不利**的形状。
+
+#: 失败路径场景：它们断言的**就是**"失败必须诚实"（失败文案 / 不编造 / 不抛栈），
+#: 合成失败 outcome 本来就应当让它们通过 —— 不适用"失败不得全绿"这条属性。
+_FAILURE_PATH_SCENARIOS = frozenset(
+    {
+        "t1_weather_not_found",  # 断言失败文案（不得编造温度）
+        "t2_read_page_failure",  # 断言失败文案（不得抛栈/编造）
+        "degrade_browser_unavailable",  # 断言无浏览器时的降级文案（mock-only）
+    }
+)
+
+_TOOL_FAILURE_TEMPLATES = {
+    # 与 executor/actions 的真实模板同形：失败消息回显用户输入（URL / 任务原文）
+    "browser_open": "打开页面失败：{prompt}（net::ERR_NAME_NOT_RESOLVED）",
+    "browser_snapshot": "还没有打开的页面：请先调用 browser_open(url) 再观察或操作",
+}
+_DEFAULT_FAILURE_TEMPLATE = "{tool} failed for: {prompt}"
+
+
+def _positive_scenarios() -> list[es.Scenario]:
+    """正例场景（非 fragile、非失败路径）：合成失败/partial outcome 必须让它们挂至少一项。"""
+    return [
+        s for s in _all_scenarios() if not s.fragile and s.id not in _FAILURE_PATH_SCENARIOS
+    ]
+
+
+def _effective_prompt(scenario: es.Scenario) -> str:
+    """被评测的那一轮的 prompt（多轮场景评估最后一轮 = ``follow_up[-1]``）。"""
+    return scenario.follow_up[-1] if scenario.follow_up else scenario.prompt
+
+
+def _attempted_tools(scenario: es.Scenario) -> list[str]:
+    """失败运行会记录的工具名 = 场景 tools_called 期望的工具（记录的是**尝试**，含失败）。
+
+    没有 tools_called 断言的场景（P0 的数据断言）用占位工具名：那些场景的断言不看工具名，
+    这里只影响合成 outcome 里 degradation 消息的形状。
+    """
+    tools = [
+        tool
+        for check in scenario.checks
+        if check.type == "tools_called"
+        for tool in (check.tools or [])
+    ]
+    return list(dict.fromkeys(tools)) or ["search"]
+
+
+def _synthetic_all_failed(scenario: es.Scenario) -> dict:
+    """策略链全败时的 outcome（graph 的 all_strategies_failed 形状 + answer 模板 + harness 注入）。
+
+    忠实点：``tool_calls`` 记**尝试过**的工具；``stop_reason`` 是 "completed"（graph 只看
+    ``result_data["partial"]``，全败形状没标 partial —— 所以光靠 stop_reason 抓不住全败，
+    ``degradation_absent`` 才是那条断言）；错误消息回显任务原文（真实模板就是这么长）。
+    """
+    prompt = _effective_prompt(scenario)
+    tools = _attempted_tools(scenario)
+    degradation = [
+        {
+            "strategy": tool,
+            "error": "service_error",
+            "message": _TOOL_FAILURE_TEMPLATES.get(tool, _DEFAULT_FAILURE_TEMPLATE).format(
+                tool=tool, prompt=prompt
+            ),
+        }
+        for tool in tools
+    ]
+    return {
+        "tier": scenario.tier,
+        "stop_reason": "completed",
+        "final_answer": (
+            "抱歉，这个任务暂时无法完成："
+            + "；".join(f"{d['strategy']}: {d['message']}" for d in degradation)
+            + "。可以换个说法试试。"
+        ),
+        "result_data": {"error": "all_strategies_failed", "degradation": degradation},
+        "degradation_log": degradation,
+        "tool_calls": tools,
+        "pending_human_action": False,
+    }
+
+
+def _synthetic_partial(scenario: es.Scenario) -> dict:
+    """链上"部分成功"的 outcome（graph 的 partial 路径 + 模型的复述式回答）。
+
+    ``partial`` / ``partial_reason`` 与 graph ``_observation_result`` /
+    ``_navigation_only_result`` 同形；``degradation_log`` 记下那条失败的策略
+    （真实 partial 一定有失败：只打开没观察 = 观察步失败）。
+    """
+    prompt = _effective_prompt(scenario)
+    tools = _attempted_tools(scenario)
+    degradation = [
+        {
+            "strategy": tools[-1],
+            "error": "service_error",
+            "message": _TOOL_FAILURE_TEMPLATES.get(
+                tools[-1], _DEFAULT_FAILURE_TEMPLATE
+            ).format(tool=tools[-1], prompt=prompt),
+        }
+    ]
+    return {
+        "tier": scenario.tier,
+        "stop_reason": "partial",
+        "final_answer": f"关于任务「{prompt}」：页面已经打开，但还没有取到内容，暂时无法给出结论。",
+        "result_data": {
+            "navigated": True,
+            "opened_url": "https://example.com",
+            "partial": True,
+            "partial_reason": "no_observation_after_navigation",
+        },
+        "degradation_log": degradation,
+        "tool_calls": tools,
+        "pending_human_action": False,
+    }
+
+
+def _assert_not_all_green(scenario: es.Scenario, outcome: dict, kind: str) -> None:
+    results = [(check, run_check(outcome, check)) for check in scenario.checks]
+    detail = "; ".join(f"{check.type}={result.detail}" for check, result in results)
+    assert any(not result.passed for _, result in results), (
+        f"{scenario.id}: 合成{kind} outcome 让**全部**断言通过 —— 该场景在真实{kind}运行上会假通过；"
+        f"明细：{detail}"
+    )
+
+
+@pytest.mark.parametrize("scenario", _positive_scenarios(), ids=lambda s: s.id)
+def test_synthetic_all_failed_outcome_fails_at_least_one_check(scenario):
+    """C1 回归：全策略失败（工具被尝试、失败文案回显任务文本）不得让正例场景全绿。"""
+    _assert_not_all_green(scenario, _synthetic_all_failed(scenario), "全失败")
+
+
+@pytest.mark.parametrize("scenario", _positive_scenarios(), ids=lambda s: s.id)
+def test_synthetic_partial_outcome_fails_at_least_one_check(scenario):
+    """C1 回归：partial（打开了/链路降级但没完成）不得让正例场景全绿。"""
+    _assert_not_all_green(scenario, _synthetic_partial(scenario), "partial")
+
+
+def test_synthetic_outcome_guard_covers_scenarios_and_exclusions_exist():
+    """回归网的覆盖面必须显式：排除清单里的 id 必须真实存在（写错 id = 场景悄悄逃出回归网），
+    且正例集合非空（空集 = 回归网什么也没盖住）。"""
+    ids = {s.id for s in _all_scenarios()}
+    assert _FAILURE_PATH_SCENARIOS <= ids
+    assert _positive_scenarios()
 
 
 # ── fake 契约（断言可信度的地基）：mock 下的 PASS 必须来自 fake 的**真实行为** ──

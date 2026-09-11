@@ -7,6 +7,10 @@
 #
 # 断言写下的是**启用后的预期语义**：输入 → 点击的调用序列出现在 outcome 里，
 # 且答案能说出输入的内容（Python）。
+#
+# P4-T2 审查 C1 回归网要求所有非 fragile 场景都必须能在失败运行上挂至少一项：
+# contains_keyword ["Python"] 单独存在时会被失败文案里的任务原文回显满足（"…输入 Python…"），
+# 所以补 degradation_absent —— 链条任何一步失败（如 browser_open: 打开页面失败…）都不算通过。
 id: t3_browser_interaction
 name: 浏览器交互（输入 + 点击；交互链未入图，暂不启用）
 prompt: "用浏览器在 example.com 的搜索框里输入 Python 然后点击搜索按钮"
@@ -19,3 +23,4 @@ checks:
     tools: [browser_open, browser_type, browser_click]
   - type: contains_keyword
     keywords: ["Python"]
+  - type: degradation_absent

@@ -12,7 +12,9 @@ Modes:
 - ``enabled=False`` → ``[DISABLED]``（列出但不跑）：P3 遗留的交互链、未接线的多轮 harness。
 - ``fragile=True`` 的场景失败照实打 FAIL，但**不计入** exit code（P4-D6：ddgs 内容漂移不是回归），
   汇总里单独计数，供报告引用。
-- ``--tag`` 按 tag 过滤（T7 的 ``--tag acceptance``）；未知 tag 由 argparse 直接拒绝。
+- ``--tag`` 按 tag 过滤（T7 的 ``--tag acceptance``）；未知 tag 由 argparse 直接拒绝；
+  选到 **0 条可运行场景**时非零退出 —— 空跑全绿与"跑过且全绿"在日志上无法区分，
+  静默通过等于假通过（与 C1 同一条原则）。
 
 工具名注入（P4-T1 ``checks.py`` 的约定）：v2 的 ``AgentState`` 不写 ``execution_log``，所以这里在
 executor 外面套一层 :class:`_ToolCallRecorder`，把"图确实调过哪些工具"（含失败调用）注入
@@ -161,6 +163,15 @@ async def run_all(
     selection = select_scenarios(scenarios, mode=mode, tags=tags)
     scope = f", tags={sorted(tags)}" if tags else ""
     print(f"[browsepilot eval v0.3] {len(scenarios)} scenarios loaded (mode={mode}{scope})")
+    if tags and not selection.runnable:
+        # 空跑不得算通过（P4-T2 审查 Minor）：没有这条时下面会打印 passed=0 failed=0 并返回 0，
+        # 与"跑过且全绿"在日志上无法区分（--tag 与 mode 的组合选错了也看不出来）。
+        print(
+            f"[eval] ERROR: --tag {sorted(tags)} 选中 0 条可运行场景"
+            f"（skipped={len(selection.skipped)}, disabled={len(selection.disabled)}）"
+            " —— 空跑不算通过"
+        )
+        return 1
     skip_reasons = {scenario.id: reason for scenario, reason in selection.skipped}
     disabled_ids = {scenario.id for scenario in selection.disabled}
     passed = failed = fragile_failed = 0

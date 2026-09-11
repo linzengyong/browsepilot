@@ -14,3 +14,7 @@ checks:
     tools: [search]
   - type: contains_keyword
     keywords: ["http"]
+  # P4-T2 审查 I3：search 没有回退（失败即 all_strategies_failed）—— 正例场景不允许降级。
+  - type: degradation_absent
+  - type: stop_reason_is
+    expected: completed

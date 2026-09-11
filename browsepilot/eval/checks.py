@@ -26,7 +26,8 @@
 ============== =======================================================
 type           语义
 ============== =======================================================
-field          ``result_data[field] == expected``；``kind: number`` 只断言"是数值"
+field          ``result_data[field] == expected``；``kind: number`` 只断言"是数值"；
+               缺 ``field`` / 缺 ``expected`` → FAIL（空声明不得算通过）
 contains_keyword  ``final_answer`` 含任一 keyword
 not_contains   ``final_answer`` 不含任何 keyword
 tools_called   工具名集合：``mode: contains``（默认，全出现）| ``not_contains`` | ``exact_sequence``（有序子序列）
@@ -74,9 +75,24 @@ def run_check(outcome: dict[str, Any], check: Check) -> CheckResult:
 
 
 def _field(outcome: dict[str, Any], check: Check) -> CheckResult:
-    value = _result_data(outcome).get(check.field or "")
+    if check.field is None:
+        # 空声明（YAML 里写了 `type: field` 但漏了 `field:`）不得按 None == None 通过（I1）
+        return CheckResult(
+            False,
+            "field check 未声明 field（空断言不得算通过；检查 YAML 里的 field 写法）",
+            "field",
+        )
+    value = _result_data(outcome).get(check.field)
     if check.kind == "number":
         return CheckResult(_number(value) is not None, f"{check.field}={value!r} (number)", "field")
+    if check.expected is None:
+        # 漏写 expected 时，"数据缺失"（None）会与 expected=None 相等 —— 失败运行恰好没有该字段，
+        # 这条断言就会在**最不该通过**的运行上通过（I1）。
+        return CheckResult(
+            False,
+            f"field check 未声明 expected（{check.field}={value!r}；空断言不得算通过）",
+            "field",
+        )
     ok = value == check.expected
     return CheckResult(ok, f"{check.field}={value!r} expected={check.expected!r}", "field")
 

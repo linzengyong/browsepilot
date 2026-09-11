@@ -1,3 +1,13 @@
+# Tier1 正例（P4-T2 审查 I2/I3 加固）：happy path 必须与失败/partial 可区分。
+#
+# 为什么光有 contains_keyword 不够：weather 失败后回退 search，search 也失败时的错误消息是
+# `no results for query: '<任务原文>'` —— 城市名被原样回显，于是"答案含北京"在最彻底的
+# 失败运行上也成立（T1+T2 审查 I2 的假通过）。
+#
+# 断言分工：
+# - field city：数据断言（p0-weather 的先例）—— 只有 weather 工具真的成功才有这个字段；
+#   代价：search 兜底"救回"任务时本条会失败 —— 对**正例**场景这是可接受的（兜底 = 主路径没走通）。
+# - degradation_absent / stop_reason_is：策略链一次失败都不许有；partial 不得报 completed。
 id: t1_weather_beijing
 name: 北京天气（Tier1 正例：路由 + 工具 + 城市名）
 prompt: "北京今天天气怎么样？"
@@ -7,7 +17,16 @@ mode: both
 checks:
   - type: tier_is
     expected: tier1
+  - type: field
+    field: city
+    expected: 北京
   - type: tools_called
     tools: [weather]
+  - type: degradation_absent
+  - type: stop_reason_is
+    expected: completed
+  # 保留：可读性断言（城市名出现在答案里）。失败运行上的假通过由上面 field /
+  # degradation_absent 两条挡住 —— 回归网见 tests/test_eval/test_scenarios.py 的
+  # "合成失败 outcome 不得让正例场景全绿"。
   - type: contains_keyword
     keywords: ["北京"]

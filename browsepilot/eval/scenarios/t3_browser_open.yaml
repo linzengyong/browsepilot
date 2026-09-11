@@ -4,6 +4,14 @@
 # - 任务里**不能**出现 http(s)://（_URL_RE 优先 → tier2 read_page）
 # - 不能出现 打开/访问/读/阅读/摘要（read_page 关键字规则排在 browser_task 之前）
 # - "浏览器" / "搜索框" / 电商站点词是 browser_task 的强触发词
+#
+# P4-T2 审查 C1 加固：happy path 必须与"完全失败/partial"可区分。
+# - tools_called 记的是**尝试**（含失败，见 run_eval._ToolCallRecorder）：browser_open 失败也会
+#   出现在列表里 → 它只能证明"链走到了这一步"，不能证明"页面真的打开了"。
+# - 关键词必须是**证据型**：原来的 ["Example", "example.com"] 会被失败文案
+#   `打开页面失败：https://example.com（…）` 满足（小写域名被原样回显）→ 去掉小写域名。
+# - degradation_absent / stop_reason_is：链上任何一步失败、或 partial（只打开没观察）都不得
+#   算通过（P3 链语义：open 成功后还要走观察步，见 t3_browser_snapshot）。
 id: t3_browser_open
 name: 浏览器打开页面并说清看到什么（Tier3，需真浏览器）
 prompt: "用浏览器看看 example.com 页面上有什么内容"
@@ -16,4 +24,7 @@ checks:
   - type: tools_called
     tools: [browser_open]
   - type: contains_keyword
-    keywords: ["Example", "example.com"]
+    keywords: ["Example", "Domain"]  # 页面标题 "Example Domain"；失败文案里不出现
+  - type: degradation_absent
+  - type: stop_reason_is
+    expected: completed

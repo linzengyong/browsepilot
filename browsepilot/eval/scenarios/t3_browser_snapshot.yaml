@@ -2,7 +2,15 @@
 # open 成功后继续走观察步），所以**两个工具都必须出现在调用序列里**——只断言 browser_open
 # 的话，"打开了但没看内容"（partial）也会通过。
 #
-# 内容断言故意宽松（页面/快照/标题/链接任一）：页面内容随站点变化，结构才是稳定的。
+# P4-T2 审查 C1 加固（这条场景原来能在"全失败"运行上 PASS）：
+# - 原关键词 ["页面", "快照", "标题", "链接"] 全是通用中文词：失败文案
+#   `打开页面失败：…` / `还没有打开的页面：请先调用 browser_open(url)…` 里就有"页面"
+#   → 换成**只可能来自真实页面内容**的证据词（example.com 的标题 "Example Domain"）。
+# - tools_called 用 exact_sequence：断言 P3 链的**顺序**语义（记录的是尝试，只有顺序带信息）。
+# - stop_reason_is: completed：partial（只打开没观察）不得算通过；degradation_absent：
+#   链上任何失败都要拦住 —— 全失败时 graph 的 stop_reason 仍是 "completed"（它只看
+#   result_data["partial"]），所以这条断言必须和 degradation_absent 成对出现。
+# - not_contains：失败模板词（graph/executor 的固定文案）作为补充防线。
 # 提示词同样要绕过 read_page 规则（见 t3_browser_open 的注释）。
 id: t3_browser_snapshot
 name: 浏览器观察当前页面（Tier3 观察链 open→snapshot）
@@ -13,5 +21,11 @@ mode: real
 checks:
   - type: tools_called
     tools: [browser_open, browser_snapshot]
+    mode: exact_sequence
   - type: contains_keyword
-    keywords: ["页面", "快照", "标题", "链接"]
+    keywords: ["Example", "Domain"]  # 页面标题 "Example Domain"；失败文案里不出现
+  - type: stop_reason_is
+    expected: completed
+  - type: degradation_absent
+  - type: not_contains
+    keywords: ["无法完成", "打开页面失败", "还没有打开的页面"]

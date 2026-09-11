@@ -61,6 +61,32 @@ def test_field_missing_key_fails():
     ).passed
 
 
+def test_field_empty_declaration_fails_loud():
+    """I1：空声明（漏 ``field`` / 漏 ``expected``）不得算通过。
+
+    失败运行的 ``result_data`` 是空的：漏写 ``expected`` 时 ``None == None`` 恰好成立 ——
+    这条断言会在**最不该通过**的运行上通过。
+    """
+    only_type = run_check(_outcome(), Check(type="field"))
+    assert not only_type.passed
+    assert "field" in only_type.detail
+
+    missing_expected = run_check(_outcome(), Check(type="field", field="city"))
+    assert not missing_expected.passed
+    assert "expected" in missing_expected.detail
+
+    # 数据本身就缺（None）也不例外："没写 expected"与"数据里真的是 None"不是一回事
+    assert not run_check(
+        _outcome(result_data={"city": None}), Check(type="field", field="city")
+    ).passed
+
+    # kind=number 只断言"是数值"，不要求 expected（但 field 仍必须有）
+    assert run_check(
+        _outcome(result_data={"temperature_c": 26.0}),
+        Check(type="field", field="temperature_c", kind="number"),
+    ).passed
+
+
 def test_field_result_carries_kind_and_detail():
     result = run_check(
         _outcome(result_data={"city": "北京"}),

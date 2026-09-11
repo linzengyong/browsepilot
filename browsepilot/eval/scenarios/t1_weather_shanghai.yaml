@@ -1,5 +1,9 @@
 # 与 beijing 成对：城市名必须来自**任务**（mock：FakeProvider 从任务文本抽 city，
 # real：模型抽 city），否则"答案含城市名"这条断言只是在复述 fake 的固定值。
+#
+# P4-T2 审查 I2/I3 加固：与 beijing 一样加 field city（数据断言）+ degradation_absent
+# + stop_reason_is —— 失败时 search 兜底的错误消息 `no results for query: '<任务原文>'`
+# 含城市名，contains_keyword 单独存在时会在失败运行上假通过。
 id: t1_weather_shanghai
 name: 上海天气（Tier1 正例：换一个城市，证明确实在解析任务）
 prompt: "上海今天天气怎么样？"
@@ -9,7 +13,13 @@ mode: both
 checks:
   - type: tier_is
     expected: tier1
+  - type: field
+    field: city
+    expected: 上海
   - type: tools_called
     tools: [weather]
+  - type: degradation_absent
+  - type: stop_reason_is
+    expected: completed
   - type: contains_keyword
     keywords: ["上海"]

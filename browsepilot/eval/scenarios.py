@@ -53,7 +53,12 @@ class Check(BaseModel):
     - ``tier_is`` / ``stop_reason_is``：``expected``
     - ``tokens_below``：``limit``；``latency_below``：``limit_ms``
     - ``degradation_absent`` / ``needs_human``：无参数
+
+    ``extra="forbid"``（P4-T2 审查 I1）：``keyword:``（漏 s）这类笔误必须报错——
+    静默忽略 = 少断言一条，而日志上看不出来（与 :class:`Scenario` 同一条原则）。
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     # 类型集合（P4-D1）：field | contains_keyword | not_contains | tools_called | tier_is |
     # stop_reason_is | tokens_below | latency_below | degradation_absent | needs_human
@@ -80,7 +85,8 @@ class Scenario(BaseModel):
     id: str
     name: str
     prompt: str
-    tier: str = "tier1"  # 路由的**实际**层级（search 规则 → tier1，即便文件叫 t2_*）
+    # 路由的**实际**层级（search 规则 → tier1，即便文件叫 t2_*）；拼错（tier4）在加载时报错
+    tier: Literal["tier1", "tier2", "tier3"] = "tier1"
     tags: list[str] = Field(default_factory=lambda: ["acceptance"])
     mode: ScenarioMode = "both"
     checks: list[Check] = Field(default_factory=list)
