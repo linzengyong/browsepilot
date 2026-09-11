@@ -5,6 +5,7 @@ import pytest
 from pydantic import ValidationError
 
 import eval.scenarios as es
+from browsepilot.agent.router import classify_by_rules
 from browsepilot.agent.tracer import JsonlTracer
 from browsepilot.model.messages import ChatResult, Message
 from eval.checks import run_check
@@ -946,19 +947,24 @@ def _effective_prompt(scenario: es.Scenario) -> str:
     return scenario.follow_up[-1] if scenario.follow_up else scenario.prompt
 
 
-def _attempted_tools(scenario: es.Scenario) -> list[str]:
-    """失败运行会记录的工具名 = 场景 tools_called 期望的工具（记录的是**尝试**，含失败）。
-
-    没有 tools_called 断言的场景（P0 的数据断言）用占位工具名：那些场景的断言不看工具名，
-    这里只影响合成 outcome 里 degradation 消息的形状。
-    """
+def _declared_tools(scenario: es.Scenario) -> list[str]:
+    """场景 ``tools_called`` 断言声明的工具名（按声明顺序去重）。"""
     tools = [
         tool
         for check in scenario.checks
         if check.type == "tools_called"
         for tool in (check.tools or [])
     ]
-    return list(dict.fromkeys(tools)) or ["search"]
+    return list(dict.fromkeys(tools))
+
+
+def _attempted_tools(scenario: es.Scenario) -> list[str]:
+    """失败运行会记录的工具名 = 场景 tools_called 期望的工具（记录的是**尝试**，含失败）。
+
+    没有 tools_called 断言的场景（P0 的数据断言）用占位工具名：那些场景的断言不看工具名，
+    这里只影响合成 outcome 里 degradation 消息的形状。
+    """
+    return _declared_tools(scenario) or ["search"]
 
 
 def _synthetic_all_failed(scenario: es.Scenario) -> dict:
@@ -1056,6 +1062,206 @@ def test_synthetic_outcome_guard_covers_scenarios_and_exclusions_exist():
     ids = {s.id for s in _all_scenarios()}
     assert _FAILURE_PATH_SCENARIOS <= ids
     assert _positive_scenarios()
+
+
+# ── 第三种形状：「降级成功」（主策略失败 → 兜底步成功） ──
+#
+# 前两个形状（全失败 / partial）盖不住这一条：**链降级了、但兜底步把任务"救回来"** ——
+# ``result_data`` 没有 error、``degradation_log`` 非空、``stop_reason=completed``。它是最像
+# happy path 的坏形状（答案看起来是正常回答），也正是 D7 抓出真实缺陷的那条：
+# 「亚特兰蒂斯今天天气？」→ weather ``city_not_found`` → 设计内的 search 兜底搜到同名的真实实体
+# （三亚亚特兰蒂斯水世界）→ 答案直接给它的天气（含"℃"），**没声明原始尝试失败过**。
+#
+# 逐场景判断（不能无脑加）：形状可达的前提是**链上真有兜底步** ——
+#   1. 用生产的 ``classify_by_rules`` 分类被评测那一轮的 prompt（纯函数，无模型）；
+#   2. 按 ``graph._STRATEGY_CHAIN``（测试侧副本 :data:`_STRATEGY_CHAIN`）取链；
+#   3. 只有 ``weather``（weather → search）与 ``read_page``（fetch_page → browser_open）两条链是
+#      "前一步失败、后一步仍可能成功并 completed 收尾"。
+# 其余场景（search 单步链 / browser_task 的续步链 / 规则分不出 intent）构造不出该形状，
+# 逐条在 :data:`_DEGRADED_SUCCESS_EXEMPT` 里写明理由（守卫测试钉住成员、计数与分区）。
+#
+# 与另两个形状不同，这里**不排除失败路径场景**：它们断言的是"失败必须诚实"，而
+# "兜底成功但不声明降级"的答案恰好必须让它们挂（D7 的缺陷正是在 ``t1_weather_not_found``
+# 上抓到的）—— 失败路径豁免只适用于"合成失败 outcome 本就应当让它们通过"的前两个形状。
+
+#: ``graph._STRATEGY_CHAIN`` 的**测试侧副本**（策略链是 ``build_graph`` 里的局部字典，import 不到）：
+#: intent → 按顺序尝试的工具。链一变，下面的适用性判定与计数就会爆出来。
+_STRATEGY_CHAIN: dict[str, tuple[str, ...]] = {
+    "weather": ("weather", "search"),
+    "search": ("search",),
+    "read_page": ("fetch_page", "browser_open"),
+    "browser_task": ("browser_open", "browser_snapshot"),
+}
+
+#: 链上带**兜底步**的 intent（前一步失败、后一步仍可能成功并以 completed 收尾）。
+#: ``browser_task`` 不在内：它的第二步是**续步**（``_CONTINUE_AFTER``：open 失败后的观察收尾一律
+#: 标 partial，见 ``graph._observation_result``）—— completed 的降级成功形状不可达（partial 形状
+#: 已覆盖那一条）；``search`` 只有一步（失败即 ``all_strategies_failed``）。
+_FALLBACK_CHAIN_INTENTS = frozenset({"weather", "read_page"})
+
+#: 第三形状**不适用**的场景 → 理由（判据：链上有没有兜底步，见 :data:`_FALLBACK_CHAIN_INTENTS`）。
+#: 守卫测试钉住成员、计数与"适用 ∪ 豁免 = 全部非 fragile 场景"的分区 —— 没有场景能静默逃出。
+#: 另一类豁免（"断言本就允许诚实的兜底回答"）目前**没有成员**：正例场景都带 ``degradation_absent`` /
+#: 数据断言，而失败路径场景的"必须说找不到"也不允许"未声明降级的兜底答案"（D7 缺陷）。
+#: 将来若某场景的断言确实允许兜底，加进这里并写明理由。
+_DEGRADED_SUCCESS_EXEMPT: dict[str, str] = {
+    "t2_search_structural": "intent=search 的链只有 [search]（search 无有意义回退，失败即 all_strategies_failed）→ 没有可成功的兜底步",
+    "t3_browser_open": "intent=browser_task 的链 [browser_open, browser_snapshot] 第二步是**续步**（_CONTINUE_AFTER）：open 失败后观察收尾标 partial（no_navigation_for_task）→ 不存在 completed 的降级成功形状",
+    "t3_browser_snapshot": "同上（同一条 browser_task 链）",
+    "t3_browser_interaction": "同上（同一条 browser_task 链；交互步尚未入图）",
+    "hitl_login_detect": "本场景断言 HITL 暂停（interrupt 在 answer 之前，pending_human_action 才是信号），不是 completed 运行；且 browser_task 链上没有兜底步",
+    "multi_turn_context": "被评测的轮（“那明天呢？”）规则分不出 intent（要模型分类，场景注释已记录该不确定性）→ 链无从判定；且它的断言（答案含北京）只能被 history 注入满足，与兜底无关",
+    "degrade_browser_unavailable": "本场景的前提就是**没有浏览器**（mock-only：6 个 tier3 工具统一 browser_unavailable）→ 链上任何一步都不可能成功；且链是 browser_task（无兜底步）",
+}
+
+
+def _intent_of(scenario: es.Scenario) -> str | None:
+    """被评测那一轮的 intent（**生产路由规则**分类；规则分不出来 → ``None``，不猜）。
+
+    场景的链取决于实际 intent（``graph`` 的 ``_STRATEGY_CHAIN.get(state.intent, ["search"])``）：
+    用生产的 ``classify_by_rules``（纯函数、无模型）分类，"逐场景判断"才是可核对的。
+    """
+    decision = classify_by_rules(_effective_prompt(scenario))
+    return None if decision is None else decision.intent
+
+
+def _degraded_success_steps(scenario: es.Scenario) -> tuple[str, str] | None:
+    """→ ``(失败的主策略, 成功的兜底步)``；链上没有兜底步时 ``None``（形状不可达）。"""
+    intent = _intent_of(scenario)
+    chain = _STRATEGY_CHAIN.get(intent) if intent is not None else None
+    if chain is None or intent not in _FALLBACK_CHAIN_INTENTS:
+        return None
+    return chain[0], chain[1]
+
+
+def _degraded_success_scenarios() -> list[es.Scenario]:
+    """第三形状**适用**的场景 = 非 fragile 且链上有兜底步（豁免清单见 :data:`_DEGRADED_SUCCESS_EXEMPT`）。"""
+    return [
+        scenario
+        for scenario in _all_scenarios()
+        if not scenario.fragile
+        and scenario.id not in _DEGRADED_SUCCESS_EXEMPT
+        and _degraded_success_steps(scenario) is not None
+    ]
+
+
+def _synthetic_degraded_success(scenario: es.Scenario) -> dict:
+    """「降级成功」形状的 outcome：主策略失败 → 链上的兜底步成功（graph 的两条路径都读过了）。
+
+    忠实点（仍按"对断言**最不利**"构造）：
+
+    - ``result_data`` **没有 error**：兜底步成功了，graph 走"数据成功"的 answer 分支
+      （``_degraded_provenance`` 只在 ``result_data`` 无 error 时交 ``degraded_from``）。
+    - ``degradation_log`` 记下失败的那一步（graph 里是 ``_merge_degradation`` 的产物），
+      ``stop_reason`` = completed（没标 partial）—— 降级链把任务"救回来"了，
+      在 outcome 上看跟 happy path 一样"完成"。
+    - 答案是**基于兜底数据**的正常回答（不提降级：D7 的真实答案就是这样，
+      ``_DEGRADED_ANSWER_RULE`` 之前的形状），并回显任务原文 —— 关键词断言可能被它满足
+      （与失败模板回显任务原文是同一个坑）。
+    - ``tool_calls`` 记**尝试**：主策略（失败）+ 兜底步都调用过（harness 的口径）。
+    """
+    steps = _degraded_success_steps(scenario)
+    if steps is None:
+        raise AssertionError(
+            f"{scenario.id}: 第三形状只适用于链上有兜底步的场景（见 _FALLBACK_CHAIN_INTENTS）"
+        )
+    failed, fallback = steps
+    prompt = _effective_prompt(scenario)
+    degradation = [
+        {
+            "strategy": failed,
+            "error": "service_error",
+            "message": _TOOL_FAILURE_TEMPLATES.get(failed, _DEFAULT_FAILURE_TEMPLATE).format(
+                tool=failed, prompt=prompt
+            ),
+        }
+    ]
+    return {
+        "tier": scenario.tier,
+        "stop_reason": "completed",
+        "final_answer": f"关于任务「{prompt}」：{fallback} 已经拿到结果，以下是整理后的答案。",
+        "result_data": {"source": fallback, "query": prompt},
+        "degradation_log": degradation,
+        "tool_calls": [failed, fallback],
+        "pending_human_action": False,
+    }
+
+
+def test_synthetic_degraded_success_is_the_third_shape():
+    """形状自检：与另两个形状可区分（三层形状各自的特征键都不同）。"""
+    scenarios = _degraded_success_scenarios()
+    assert scenarios  # 空集 = 回归网什么也没盖住
+    for scenario in scenarios:
+        outcome = _synthetic_degraded_success(scenario)
+        failed, fallback = _degraded_success_steps(scenario)
+        assert not outcome["result_data"].get("error"), scenario.id  # 兜底步成功了
+        assert outcome["degradation_log"], scenario.id
+        assert outcome["stop_reason"] == "completed", scenario.id
+        assert outcome["tool_calls"] == [failed, fallback], scenario.id
+        # 与另两个形状可区分：全失败带 error；partial 的 stop_reason 是 partial
+        assert _synthetic_all_failed(scenario)["result_data"].get("error"), scenario.id
+        assert _synthetic_partial(scenario)["stop_reason"] == "partial", scenario.id
+
+
+def test_synthetic_degraded_success_shape_is_adversarial_not_a_strawman():
+    """形状有效性：把**鉴别性断言**（``degradation_absent`` / ``field`` 数据断言）拿掉后，
+    第三形状在剩下的断言（tier / tools_called / stop_reason / contains_keyword）上是**全绿**的 ——
+    它不是"构造出来必挂"的稻草人，而是真能假通过的形状（D7 的真实运行：链降级了、答案看起来正常）。
+    这些鉴别性断言一旦被删/被放宽，下面的回归网就会立刻爆。
+    """
+    scenario = next(s for s in _all_scenarios() if s.id == "t1_weather_beijing")
+    weakened = scenario.model_copy(
+        update={
+            "checks": [
+                check
+                for check in scenario.checks
+                if check.type not in ("degradation_absent", "field")
+            ]
+        }
+    )
+    results = [
+        (check, run_check(_synthetic_degraded_success(scenario), check))
+        for check in weakened.checks
+    ]
+    assert weakened.checks
+    assert all(result.passed for _, result in results), [
+        (check.type, result.detail) for check, result in results
+    ]
+
+
+@pytest.mark.parametrize("scenario", _degraded_success_scenarios(), ids=lambda s: s.id)
+def test_synthetic_degraded_success_outcome_fails_at_least_one_check(scenario):
+    """C1 回归的第三形状：**兜底成功**不得让场景全绿 —— 主策略失败、兜底步拿到数据、
+    ``stop_reason=completed``（D7 的缺陷形状：weather 未命中 → search 兜底把任务"救回"）。"""
+    _assert_not_all_green(scenario, _synthetic_degraded_success(scenario), "降级成功")
+
+
+def test_degraded_success_guard_scopes_and_exemptions_are_explicit():
+    """第三形状的覆盖面必须显式且机械化：适用集合 = **链上真有兜底步**的非 fragile 场景
+    （判定 = 生产路由 ``classify_by_rules`` + ``graph._STRATEGY_CHAIN`` 的测试侧副本），
+    其余场景必须在豁免清单里逐条写明理由 —— 豁免清单写错 id / 新场景悄悄逃出回归网，这里都会爆。"""
+    ids = {s.id for s in _all_scenarios()}
+    assert set(_DEGRADED_SUCCESS_EXEMPT) <= ids  # 写错 id = 某条豁免理由挂在不存在的场景上
+    assert all(reason.strip() for reason in _DEGRADED_SUCCESS_EXEMPT.values())
+    non_fragile = [scenario for scenario in _all_scenarios() if not scenario.fragile]
+    with_fallback = {
+        scenario.id for scenario in non_fragile if _degraded_success_steps(scenario) is not None
+    }
+    exempt = set(_DEGRADED_SUCCESS_EXEMPT)
+    assert with_fallback == {s.id for s in _degraded_success_scenarios()}  # 适用性由链判定
+    assert not with_fallback & exempt
+    assert with_fallback | exempt == {s.id for s in non_fragile}  # 分区：没有场景静默逃出
+    # 计数钉住（增删场景 / 改链 → 必须在这里显式决定它属于哪一边）
+    assert with_fallback == {
+        "p0-weather",
+        "p0-read-page",
+        "t1_weather_beijing",
+        "t1_weather_not_found",  # D7 的缺陷形状就在这条上抓到
+        "t1_weather_shanghai",
+        "t2_read_page",
+        "t2_read_page_failure",
+    }
+    assert len(exempt) == 7
 
 
 # ── fake 契约（断言可信度的地基）：mock 下的 PASS 必须来自 fake 的**真实行为** ──

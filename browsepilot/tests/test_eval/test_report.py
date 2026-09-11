@@ -1014,6 +1014,13 @@ def test_usage_coverage_reads_the_self_describing_snapshot():
         None,
         None,
     )  # 没有诚实分母就不断言覆盖度
+    # M2（P4 final review Minor）：没有 token 数字但调用发生过 → 分母仍在、N 如实为 0
+    assert run_eval._usage_coverage(
+        {"usage_source": "chat_only", "chat_calls": 0, "model_calls": 2}
+    ) == (0, 2)
+    assert run_eval._usage_coverage(
+        {"usage_source": "chat_only", "chat_calls": 1, "estimated_calls": 1, "model_calls": 2}
+    ) == (0, 2)
 
 
 async def test_run_all_maps_usage_coverage_into_result_rows(tmp_path, monkeypatch):

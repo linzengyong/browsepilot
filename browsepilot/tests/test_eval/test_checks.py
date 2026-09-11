@@ -247,6 +247,24 @@ def test_stop_reason_is_positive_and_negative():
     ).passed
 
 
+def test_tier_and_stop_reason_fail_loud_when_expected_is_missing():
+    """缺 ``expected`` 的空声明必须 fail-loud（与 ``field`` 对称，P4 final review Minor）。
+
+    实际值来自 outcome、键取不到时是 ``None``：漏写 ``expected`` 时 ``None == None`` 会**通过**
+    —— "tier / stop_reason 取不到"正是失败运行最容易出现的形状，这条空断言恰好会在最不该通过的
+    运行上通过（与 field 的 I1 是同一条原则：空声明不得算通过）。
+    """
+    for check_type in ("tier_is", "stop_reason_is"):
+        # 键缺失（None）：旧行为 None == None → 通过
+        missing = run_check(_outcome(tier=None, stop_reason=None), Check(type=check_type))
+        assert not missing.passed, check_type
+        assert "未声明 expected" in missing.detail, check_type
+        # 数据里有值也照样是空声明 —— 修后必须由**守卫**（而不是"恰好不等"）判失败
+        declared = run_check(_outcome(), Check(type=check_type))
+        assert not declared.passed, check_type
+        assert "未声明 expected" in declared.detail, check_type
+
+
 # ── tokens_below ──
 
 

@@ -10,8 +10,9 @@
   ``attach_browser(None)`` + WARNING（诚实降级：tier3 的失败归因到环境而不是任务）。
 - **B 用量/耗时**：``UsageTrackingProvider`` 只从 **chat 的 ``ChatResult.usage``** 累加
   （``structured`` 返回 schema 实例、``stream`` 按 port 只 yield 字符串 —— 两个口都没有 usage 面，
-  这是 P4-T1 的探测结论）；累加器**每场景新建**（不串场景）；拿不到用量则 ``token_usage``
-  **字段缺席** → ``tokens_below`` 照 FAIL（fail-loud：未知不是 0）；耗时 = 整场景墙钟。
+  这是 P4-T1 的探测结论）；累加器**每场景新建**（不串场景）；拿不到用量则 token 键**缺席**
+  （不填 0）→ ``tokens_below`` 照 FAIL（fail-loud：未知不是 0），但**覆盖度照报**（
+  ``chat_calls`` / ``model_calls``：分母不因为"没数字"而少算）；耗时 = 整场景墙钟。
 - **C 多轮**：``follow_up`` 逐轮跑，第 n 轮拿到前几轮的 history（"Q: … / A: …" 摘要，
   与 ``app.main._build_history_entries`` 逐字一致），checks 只评估**最后一轮**的 outcome。
 """
@@ -29,7 +30,7 @@ from browsepilot.agent.tracer import JsonlTracer
 from browsepilot.model.messages import ChatResult, Cost, Message, Usage, UsageInfo
 from browsepilot.model.provider import ModelProvider
 from eval.fake_deps import FakeExecutor, FakeProvider
-from eval.run_eval import _run_scenario
+from eval.run_eval import _run_scenario, _usage_coverage
 from eval.scenarios import Scenario, load_scenarios
 
 SCENARIOS_DIR = Path(__file__).resolve().parent.parent.parent / "eval" / "scenarios"
@@ -320,30 +321,56 @@ async def test_usage_tracking_passes_structured_and_stream_through():
         )
     ]
     assert chunked == ["甲", "乙"]
-    # I2：structured/stream 没有 usage 面，但调用本身进**诚实分母**（model_calls）；
-    # 没有 chat 调用 = 没有可报 token → 快照缺席（不填 0）。
+    # I2：structured/stream 没有 usage 面，但调用本身进**诚实分母**（model_calls）。
     assert (usage.chat_calls, usage.structured_calls, usage.stream_calls) == (0, 1, 1)
     assert usage.model_calls == 2
-    assert usage.snapshot() is None
+    # M2（P4 final review Minor）：没有可报 token ≠ 没有发生调用 —— 覆盖度照发（否则
+    # "只有 structured 调用"的场景整条不进 M，分母少算）；token 键则缺席（不填 0）。
+    snapshot = usage.snapshot()
+    assert snapshot is not None
+    assert "total_tokens" not in snapshot
+    assert (snapshot["chat_calls"], snapshot["model_calls"]) == (0, 2)
 
 
-async def test_usage_snapshot_is_none_when_the_provider_reports_no_usage():
-    """未知 ≠ 0（fail-loud）：provider 没回 usage（estimated）或回全 0 时，快照必须是 ``None``。"""
+async def test_usage_snapshot_reports_coverage_when_no_number_is_available():
+    """未知 ≠ 0：provider 没有可用数字时**不填 token 键**，但调用次数（覆盖度的分母）照报 ——
+    "发生了几次调用"是采集到的**事实**，不因为"没数字"而消失（P4 final review Minor：丢掉分母 =
+    只有 structured 调用的场景发生了调用却不进 M）。
+
+    真正"没什么可报"的情形只有一种：**一次模型调用都没发生**（如全败模板答案路径）→ 字段缺席。
+    """
     estimated = harness.UsageAccumulator()
     await harness.UsageTrackingProvider(_UsageProvider(estimated=True), estimated).chat(
         [Message(role="user", content="hi")]
     )
     assert (estimated.chat_calls, estimated.estimated_calls) == (1, 1)
-    assert estimated.snapshot() is None
+    snapshot = estimated.snapshot()
+    assert snapshot is not None
+    assert "total_tokens" not in snapshot  # 未知不是 0
+    assert (snapshot["chat_calls"], snapshot["estimated_calls"], snapshot["model_calls"]) == (
+        1,
+        1,
+        1,
+    )
 
-    # FakeProvider 的 ChatResult 用默认 UsageInfo（全 0、estimated=False）—— 调用进了分母，
-    # 但没有可用 token 数：同样是"没有数字"，快照缺席（0 不是"未知"）。
+    # FakeProvider 的 ChatResult 用默认 UsageInfo（全 0、estimated=False）：provider 报了、
+    # 但没有可用数字 —— 同样按**未计量**上报（否则 0 token 的调用会被读成"有计量"）。
     silent = harness.UsageAccumulator()
     await harness.UsageTrackingProvider(FakeProvider(), silent).chat(
         [Message(role="user", content="hi")]
     )
     assert silent.chat_calls == 1
-    assert silent.snapshot() is None
+    snapshot = silent.snapshot()
+    assert snapshot is not None
+    assert "total_tokens" not in snapshot
+    assert (snapshot["chat_calls"], snapshot["estimated_calls"], snapshot["model_calls"]) == (
+        1,
+        1,
+        1,
+    )
+
+    # 一次模型调用都没有 → 真的没有可描述的东西：字段缺席
+    assert harness.UsageAccumulator().snapshot() is None
 
 
 async def test_usage_snapshot_omits_split_tokens_the_provider_never_reported():
@@ -387,16 +414,42 @@ async def test_run_scenario_injects_duration_and_token_usage(tmp_path):
     assert all(passed for passed, _ in checks), checks
 
 
-async def test_run_scenario_omits_token_usage_when_it_cannot_be_captured(tmp_path):
-    """采集失败 → 字段**缺席**（而不是填 0）：预算断言必须照实 FAIL，不能假通过。"""
+async def test_run_scenario_carries_coverage_but_no_token_keys_when_capture_fails(tmp_path):
+    """采集失败 → **token 键缺席**（预算断言必须照实 FAIL，不能假通过），但覆盖度还在 ——
+    本场景确实发生过的调用不能因为"没有数字"而从诚实分母里消失（P4 final review Minor）。"""
     scenario = _scenario(id="no-usage", checks=[{"type": "tokens_below", "limit": 500}])
     outcome, checks = await _run_scenario(
         scenario, provider=FakeProvider(), executor=FakeExecutor(), tracer=_tracer(tmp_path)
     )
-    assert "token_usage" not in outcome
+    usage = outcome["token_usage"]
+    assert "total_tokens" not in usage  # 未知不是 0
+    # answer 合成 1 次 chat（无数字）+ 参数提取 1 次 structured（无 usage 面）
+    assert (usage["chat_calls"], usage["model_calls"]) == (1, 2)
+    assert usage["estimated_calls"] == 1  # 无可用数字的 chat 调用按未计量上报 → N=0
+    assert _usage_coverage(usage) == (0, 2)
     assert outcome["duration_ms"] > 0  # 耗时是 harness 自己量的，与 provider 无关
     assert checks[0][0] is False
     assert "no token usage" in checks[0][1]
+
+
+async def test_usage_coverage_counts_structured_only_scenarios(tmp_path):
+    """M2 的实证场景（P4 final review Minor）：链全败 → 模板答案**不调模型**（``chat_calls == 0``），
+    但每一步的参数提取都是 structured 调用，**确实发生了模型调用** —— 快照必须报出 M>0、N=0，
+    而不是整条缺席（缺席 = 这条场景的调用不进"N/M 有计量"的分母）。
+    """
+    scenario = _scenario(
+        id="structured-only",
+        prompt="打开 https://this-domain-does-not-exist.invalid/404 告诉我页面内容",
+        checks=[{"type": "contains_keyword", "keywords": ["无法"]}],
+    )
+    outcome, _ = await _run_scenario(
+        scenario, provider=FakeProvider(), executor=FakeExecutor(), tracer=_tracer(tmp_path)
+    )
+    usage = outcome["token_usage"]
+    assert usage["chat_calls"] == 0  # 全败 → 模板答案路径，没有 chat 调用
+    assert usage["model_calls"] == 2  # fetch_page / browser_open 的参数提取各一次 structured
+    assert "total_tokens" not in usage  # 没有 chat 数字 → token 键缺席（不填 0）
+    assert _usage_coverage(usage) == (0, 2)  # N=0、M=2：分母诚实
 
 
 async def test_usage_does_not_leak_across_scenarios(tmp_path):

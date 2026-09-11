@@ -31,7 +31,8 @@ tier3 场景会**全部**失败，而那是接线问题、不是任务失败（P
                      真的报了才出现（未知不是 0）。自描述（I2）：``usage_source`` =
                      ``"chat_only"``（这组数字只覆盖 chat 调用）、``chat_calls`` /
                      ``model_calls``（后者含 structured/stream，是 token 数的**诚实分母**）。
-                     **拿不到用量时字段缺席**（fail-loud）→ ``tokens_below`` FAIL。
+                     **拿不到 token 数字时数字键缺席**（fail-loud）→ ``tokens_below`` FAIL；
+                     但覆盖度键照发（分母不能少算），**一次模型调用都没有时整条字段缺席**。
 ``duration_ms``      整场景（含全部轮次）的墙钟毫秒。
 ``tool_calls``       ``call()`` 的**全部**工具名（含失败调用）；多轮场景 = 各轮累加。
 ===================  ============================================================
@@ -42,7 +43,9 @@ tier3 场景会**全部**失败，而那是接线问题、不是任务失败（P
 :meth:`UsageAccumulator.snapshot`）。但装饰器看得到**全部**三个口，所以快照把
 ``chat_calls``（有数字的）与 ``model_calls``（实际发生的调用数）分开报 —— token/成本是
 **chat-only 的下界**，必须自描述（P4-T3 审查 I2），否则 T4/T8 发布的数字会被系统性低估
-而读者无从察觉。
+而读者无从察觉。**没有可用数字时快照仍在**（只带覆盖度、不带 token 键）：
+"发生了多少次调用"是采集到的事实，丢了它 → "N/M 有计量" 的分母就少算——链全败的场景
+（模板答案不调模型，但参数提取是 structured 调用）正是 M>0、N=0 的形状（P4 final review Minor）。
 
 **4. 多轮接线（``follow_up``，I4）**：``Scenario.follow_up`` 是第 2..n 轮的 prompt。
 逐轮跑 ``run_task``，第 n 轮带上前几轮的 history —— 格式与 app 完全一致
@@ -118,7 +121,8 @@ class UsageAccumulator:
     - ``model_calls``：本场景实际发生的**全部**模型调用（chat + structured + stream）。
       token/成本只覆盖其中的 chat，它是这份数字的**诚实分母**（比例失真一眼可见）。
 
-    拿不到数字就让它缺席（fail-loud），快照里的 0 只可能是真的 0。
+    拿不到数字就让**数字键**缺席（fail-loud），快照里的 0 只可能是真的 0（而"发生了多少次调用"
+    始终照报：覆盖度的分母不能因为没数字而消失）。
     """
 
     total_tokens: int = 0
@@ -147,28 +151,37 @@ class UsageAccumulator:
         self.cost_usd += usage.cost.total
 
     def snapshot(self) -> dict[str, Any] | None:
-        """可注入 outcome 的用量快照；**一个可用数字都没有时返回 ``None``**（字段缺席）。
+        """可注入 outcome 的用量快照；**一次模型调用都没有时返回 ``None``**（字段缺席）。
 
         - ``total_tokens`` 优先用 provider 报的 total；它缺失（0）时退化为 input+output ——
-          两个分项都在时报的和不是凭空造的。
+          两个分项都在时报的和不是凭空造的。**没有可用数字时 token 键一律不出现**（不填 0）——
+          但快照本身**照发**（见下条）。
         - ``input_tokens`` / ``output_tokens`` 只在两者之和 > 0 时出现：provider 只报 total 时
           分项是**未知**而不是 0（I2；"未知不是 0"是同一条规则）。
-        - ``usage_source`` = ``"chat_only"``：这组数字只覆盖 chat 调用；``chat_calls`` /
-          ``model_calls`` 给出所见调用数（后者含没有 usage 面的 structured/stream）。
+        - ``usage_source`` = ``"chat_only"``：这组数字只覆盖 chat 调用（``chat_calls=0`` 时它同时
+          说明"没有 chat 调用可计量"）。
+        - ``chat_calls`` / ``model_calls``（后者含没有 usage 面的 structured/stream）**只发生过
+          调用就报**：覆盖度的分母不能因为"没有数字"而少算 —— 只有 structured 调用的场景
+          （链全败 → 模板答案不调模型）是 M>0、N=0，而不是整条缺席（P4 final review Minor）。
+        - 没有可用数字时 ``estimated_calls`` = ``chat_calls``：这些 chat 调用如实标成**未计量**
+          （否则 "N/M 有计量" 会把 0 token 的调用算成"有计量"）。
         - ``cost_usd`` 只在 > 0 时出现：0 多半是"litellm 算不出这个模型的价"，
           与"免费"不是一回事，宁可缺席（报告侧按"未提供"读）。
         """
-        if self.chat_calls == 0 or self.estimated_calls == self.chat_calls:
-            return None
-        total = self.total_tokens or (self.input_tokens + self.output_tokens)
-        if total <= 0:
+        if self.model_calls == 0:
+            # 一次模型调用都没有 = 真的没有可描述的东西（如全败模板答案路径不调模型）：字段缺席。
             return None
         data: dict[str, Any] = {
-            "total_tokens": total,
             "usage_source": "chat_only",
             "chat_calls": self.chat_calls,
             "model_calls": self.model_calls,
         }
+        total = self.total_tokens or (self.input_tokens + self.output_tokens)
+        if total <= 0:
+            # 没有可用 token 数字：token 键全部缺席，但发生过的调用仍进诚实分母。
+            data["estimated_calls"] = self.chat_calls
+            return data
+        data["total_tokens"] = total
         if self.input_tokens + self.output_tokens > 0:
             data["input_tokens"] = self.input_tokens
             data["output_tokens"] = self.output_tokens

@@ -21,7 +21,8 @@ Modes:
 具体地，``_run_scenario`` 把一条场景交给 ``harness.run_scenario`` —— 它负责多轮（``follow_up``）
 与三个注入字段：``outcome["tool_calls"]``（v2 的 ``AgentState`` 不写 ``execution_log``，所以
 "图确实调过哪些工具"由 harness 从 ``call()`` 记录；否则 mock 下所有 ``tools_called`` 断言都是假失败）、
-``outcome["token_usage"]``（从 ``ChatResult.usage`` 累加，拿不到就字段缺席）、
+``outcome["token_usage"]``（从 ``ChatResult.usage`` 累加，拿不到数字时 token 键缺席、但覆盖度仍在
+（分母不能少算）；一次模型调用都没发生时整条缺席）、
 ``outcome["duration_ms"]``（整场景墙钟）。字段名/来源见 ``eval/harness.py`` 的模块 docstring。
 
 真实模式（P4 评测体系的前置接线，运维前置见 docs/v2-p3-report.md §十二「P4 评测前置（运维）」）：
@@ -95,8 +96,10 @@ def _usage_coverage(usage: Mapping[str, Any]) -> tuple[int | None, int | None]:
     两者相减 = 真的计进了 token 的调用数；``model_calls``（含没有 usage 面的 structured/stream）
     是**诚实分母**。报告据此把 token 总和读成"N/M 调用有计量"的**下限**（P4-T3 审查 I2）。
 
-    快照缺席（一个数字都没有）或分母拿不到时返回 ``(None, None)`` —— 未知不是 0，
-    也不编造一个分母。
+    快照缺席（一次模型调用都没发生）或分母拿不到时返回 ``(None, None)`` —— 未知不是 0，
+    也不编造一个分母。注意"没有 token 数字"与"没有发生调用"是两件事：前者仍带
+    ``chat_calls`` / ``model_calls``（如链全败的场景：模板答案不调模型、参数提取是 structured 调用
+    → M>0、N=0），后者才真的没有覆盖度可报。
     """
     model_calls = usage.get("model_calls")
     chat_calls = usage.get("chat_calls")

@@ -31,8 +31,8 @@ field          ``result_data[field] == expected``；``kind: number`` 只断言"�
 contains_keyword  ``final_answer`` 含任一 keyword
 not_contains   ``final_answer`` 不含任何 keyword
 tools_called   工具名集合：``mode: contains``（默认，全出现）| ``not_contains`` | ``exact_sequence``（有序子序列）
-tier_is        ``outcome["tier"] == expected``
-stop_reason_is ``outcome["stop_reason"] == expected``
+tier_is        ``outcome["tier"] == expected``；缺 ``expected`` → FAIL（空声明不得算通过）
+stop_reason_is ``outcome["stop_reason"] == expected``；缺 ``expected`` → FAIL（同上）
 tokens_below   token 总量 ≤ ``limit``
 latency_below  总耗时 ≤ ``limit_ms``
 degradation_absent  ``degradation_log`` 为空
@@ -186,11 +186,26 @@ def _is_subsequence(expected: list[str], actual: list[str]) -> bool:
 
 
 def _tier_is(outcome: dict[str, Any], check: Check) -> CheckResult:
+    if check.expected is None:
+        # 漏写 expected 时，"tier 取不到"（None）会与 expected=None 相等 —— 与 field 同一条
+        # 原则：空声明不得算通过，缺失声明时 fail-loud 而不是按"恰好相等"给通过（P4 final review Minor）。
+        return CheckResult(
+            False,
+            "tier_is 未声明 expected（空断言不得算通过；检查 YAML 里的 expected 写法）",
+            "tier_is",
+        )
     actual = outcome.get("tier")
     return CheckResult(actual == check.expected, f"tier={actual!r} expected={check.expected!r}", "tier_is")
 
 
 def _stop_reason_is(outcome: dict[str, Any], check: Check) -> CheckResult:
+    if check.expected is None:
+        # 同 _tier_is：stop_reason 缺失（None）不等于"没写声明"，空声明一律 FAIL（P4 final review Minor）。
+        return CheckResult(
+            False,
+            "stop_reason_is 未声明 expected（空断言不得算通过；检查 YAML 里的 expected 写法）",
+            "stop_reason_is",
+        )
     actual = outcome.get("stop_reason")
     return CheckResult(
         actual == check.expected,
